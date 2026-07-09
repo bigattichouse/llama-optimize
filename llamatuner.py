@@ -22,10 +22,14 @@ import json
 import os
 import re
 import struct
+import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -35,6 +39,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent
 WORKSPACE = PROJECT_ROOT.parent
 DEFAULT_LLAMA_BENCH = WORKSPACE / "llama.cpp" / "build" / "bin" / "llama-bench"
+DEFAULT_LLAMA_SERVER = WORKSPACE / "llama.cpp" / "build" / "bin" / "llama-server"
 # The Taguchi/Morris/Sobol suite is vendored as the `robust` git submodule at
 # ./taguchi. Its internal layout is nested, so locate the python binding by
 # search rather than a fixed path.
@@ -77,7 +82,7 @@ PROFILES = {
     "single": {"n_prompt": 512,  "n_gen": 256, "ctx_floor": 8192,  "driver": "bench"},
     "agents": {"n_prompt": 8192, "n_gen": 256, "ctx_floor": 32768, "driver": "bench"},
     "multi":  {"n_prompt": 1024, "n_gen": 256, "ctx_floor": 8192,  "driver": "server",
-               "parallel": [2, 4, 8]},
+               "parallel": 4},
 }
 
 
@@ -307,6 +312,7 @@ class Config:
     llama_bench: Path
     array: str
     ctx_floor: int
+    llama_server: Path = DEFAULT_LLAMA_SERVER
     reps: int = BENCH_REPS
     n_prompt: int = BENCH_N_PROMPT
     n_gen: int = BENCH_N_GEN
@@ -315,7 +321,7 @@ class Config:
     spec_draft_n_max: int = 2     # --spec-draft-n-max for MTP
     profile: str = "single"       # workload profile (see PROFILES)
     driver: str = "bench"         # "bench" (llama-bench) or "server" (llama-server)
-    parallel: list = field(default_factory=list)  # concurrency levels (multi)
+    parallel: int = 1             # concurrent request streams (server driver)
     factors: dict = field(default_factory=dict)
     hw: dict = field(default_factory=dict)
     env_factor_names: set = field(default_factory=set)  # factors that set env vars
@@ -438,12 +444,16 @@ def server_command(cfg: Config, f: dict, ctx: int) -> str:
         parts.append("-nkvo")
     if "poll" in f:
         parts.append(f"--poll {f['poll']}")
+    par = int(f.get("parallel", cfg.parallel))
+    if par > 1:
+        parts.append(f"--parallel {par}")
     # Multi-token prediction: if the model ships a NextN/MTP head, enable
-    # draft-mtp speculative decoding for extra generation throughput. NOTE: the
-    # sweep's measured t/s does NOT include this boost (llama-bench can't do
-    # speculative decoding); it's an additional multiplier on top.
+    # draft-mtp speculative decoding for extra generation throughput. With the
+    # server driver this speedup IS measured; with llama-bench it is NOT (bench
+    # can't do speculative decoding) and stacks on top of the reported t/s.
     if cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0:
-        parts.append(f"--spec-type draft-mtp --spec-draft-n-max {cfg.spec_draft_n_max}")
+        n_max = f.get("spec_n_max", str(cfg.spec_draft_n_max))
+        parts.append(f"--spec-type draft-mtp --spec-draft-n-max {n_max}")
     cmd = " \\\n    ".join(parts)
     # prepend any winning env-var factor values as an env prefix
     env_prefix = " ".join(f"{n}={f[n]}" for n in sorted(cfg.env_factor_names) if n in f)
@@ -491,7 +501,7 @@ def run_with_progress(cfg: Config, f: dict, timeout: int, prefix: str):
     plain start line so redirected logs stay one-line-in/one-line-out."""
     if not sys.stdout.isatty():
         print("trying " + prefix + " ...", flush=True)
-        return run_one(cfg, f, timeout)
+        return drive_one(cfg, f, timeout)
 
     stop = threading.Event()
     t0 = time.time()
@@ -505,7 +515,7 @@ def run_with_progress(cfg: Config, f: dict, timeout: int, prefix: str):
     th = threading.Thread(target=tick, daemon=True)
     th.start()
     try:
-        return run_one(cfg, f, timeout)
+        return drive_one(cfg, f, timeout)
     finally:
         stop.set()
         th.join(timeout=0.2)
@@ -531,6 +541,142 @@ def run_one(cfg: Config, f: dict, timeout: int):
     if tg is None:
         return {"status": "PARSE_FAIL", "pp_tps": 0.0, "tg_tps": 0.0, "secs": secs}
     return {"status": "OK", "pp_tps": pp or 0.0, "tg_tps": tg, "secs": secs}
+
+
+# ---------------------------------------------------------------------------
+# Server driver: launch llama-server and drive real generation (measures MTP /
+# speculative decoding and real concurrency, which llama-bench cannot).
+# ---------------------------------------------------------------------------
+# Server-only factors (not llama-bench flags).
+SERVER_ONLY = {"parallel", "spec_n_max"}
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def build_server_args(cfg: Config, f: dict, port: int, n_ctx: int) -> list[str]:
+    ub = int(f.get("ubatch", 512))
+    batch = int(f.get("batch", FIXED_BATCH))
+    args = [
+        str(cfg.llama_server), "-m", str(cfg.model),
+        "--host", "127.0.0.1", "--port", str(port),
+        "-c", str(n_ctx), "-fa", "1",
+        "-ngl", f["ngl"], "-t", f["threads"],
+        "-ctk", f["kv_type"], "-ctv", f["kv_type"],
+        "-ub", str(ub), "-b", str(max(batch, ub)),
+    ]
+    if "ncmoe" in f:
+        args += ["-ncmoe", f["ncmoe"]]
+    if f.get("nkvo") == "1":
+        args += ["-nkvo"]
+    if "poll" in f:
+        args += ["--poll", f["poll"]]
+    par = int(f.get("parallel", cfg.parallel))
+    if par > 1:
+        args += ["--parallel", str(par)]
+    if cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0:
+        n_max = f.get("spec_n_max", str(cfg.spec_draft_n_max))
+        args += ["--spec-type", "draft-mtp", "--spec-draft-n-max", n_max]
+    return args
+
+
+def _wait_health(port: int, deadline: float) -> bool:
+    url = f"http://127.0.0.1:{port}/health"
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=2) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def _completion(port: int, prompt_tokens: list[int], n_gen: int, timeout: int) -> dict:
+    body = json.dumps({
+        "prompt": prompt_tokens,
+        "n_predict": n_gen,
+        "temperature": 0,
+        "cache_prompt": False,
+        "timings_per_token": False,
+    }).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/completion", data=body,
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def server_run_one(cfg: Config, f: dict, timeout: int):
+    """Launch llama-server for this config, drive real generation (with the
+    requested concurrency), and report effective pp/tg t/s. Failures to load
+    (OOM etc.) become OOM/ERROR like the bench driver."""
+    par = int(f.get("parallel", cfg.parallel))
+    # prompt length carries the profile prompt plus any n_depth context factor
+    prompt_len = cfg.n_prompt + int(f.get("n_depth", 0))
+    n_ctx = prompt_len + cfg.n_gen + 256
+    if par > 1:
+        n_ctx = n_ctx * par  # each slot needs its own context window
+    port = _free_port()
+    args = build_server_args(cfg, f, port, n_ctx)
+    t0 = time.time()
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, env=run_env(cfg, f))
+    try:
+        if not _wait_health(port, time.time() + timeout):
+            proc.terminate()
+            try:
+                _, err = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                err = ""
+            status = "OOM" if _OOM_PAT.search(err or "") else "ERROR"
+            return {"status": status, "pp_tps": 0.0, "tg_tps": 0.0,
+                    "secs": time.time() - t0}
+
+        prompt = [1234] * prompt_len  # fixed synthetic prompt of exact length
+        try:
+            def one(_):
+                return _completion(port, prompt, cfg.n_gen, timeout)
+            with ThreadPoolExecutor(max_workers=par) as ex:
+                wall0 = time.time()
+                res = list(ex.map(one, range(par)))
+                wall = time.time() - wall0
+        except (urllib.error.URLError, OSError, json.JSONDecodeError):
+            return {"status": "ERROR", "pp_tps": 0.0, "tg_tps": 0.0,
+                    "secs": time.time() - t0}
+
+        # aggregate over the concurrent requests
+        tg_tokens = sum(r.get("timings", {}).get("predicted_n", 0) for r in res)
+        pp_tokens = sum(r.get("timings", {}).get("prompt_n", 0) for r in res)
+        if par == 1:
+            tm = res[0].get("timings", {})
+            pp = tm.get("prompt_per_second", 0.0) or 0.0
+            tg = tm.get("predicted_per_second", 0.0) or 0.0
+        else:
+            # aggregate serving throughput = total tokens / wall clock
+            tg = tg_tokens / wall if wall > 0 else 0.0
+            # approximate aggregate prefill rate similarly
+            pp = pp_tokens / wall if wall > 0 else 0.0
+        return {"status": "OK", "pp_tps": pp, "tg_tps": tg,
+                "secs": time.time() - t0}
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def drive_one(cfg: Config, f: dict, timeout: int):
+    """Dispatch to the configured driver."""
+    if cfg.driver == "server":
+        return server_run_one(cfg, f, timeout)
+    return run_one(cfg, f, timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -649,7 +795,7 @@ def probe_max_context(cfg: Config, base_f: dict, timeout: int, cap: int):
     def try_depth(d):
         f = dict(base_f)
         f["n_depth"] = str(d)
-        r = run_one(cfg, f, timeout)
+        r = drive_one(cfg, f, timeout)
         return r["status"] == "OK", r
 
     good, _ = try_depth(0)
@@ -755,6 +901,13 @@ def main():
                     help="workload profile: single (interactive), agents "
                          "(big-context tool use), multi (concurrent serving); "
                          "sets request shape + objective. default: single")
+    ap.add_argument("--driver", choices=["bench", "server"], default=None,
+                    help="benchmark driver (default: from profile). 'server' "
+                         "measures real generation incl. MTP and concurrency")
+    ap.add_argument("--parallel", type=int, default=None,
+                    help="concurrent request streams for the server driver "
+                         "(default: from profile)")
+    ap.add_argument("--llama-server", type=Path, default=DEFAULT_LLAMA_SERVER)
     ap.add_argument("--ctx-floor", type=int, default=None,
                     help="minimum usable context for BALANCED (default: from profile)")
     ap.add_argument("--probe-ctx", action="store_true",
@@ -802,10 +955,13 @@ def main():
     n_prompt = args.n_prompt if args.n_prompt is not None else prof["n_prompt"]
     n_gen = args.n_gen if args.n_gen is not None else prof["n_gen"]
     ctx_floor = args.ctx_floor if args.ctx_floor is not None else prof["ctx_floor"]
+    driver = args.driver if args.driver is not None else prof["driver"]
+    parallel = args.parallel if args.parallel is not None else prof.get("parallel", 1)
 
     cfg = Config(
         model=args.model.resolve(),
         llama_bench=args.llama_bench,
+        llama_server=args.llama_server,
         array=args.array,
         ctx_floor=ctx_floor,
         reps=args.reps,
@@ -815,21 +971,24 @@ def main():
         emit_mtp=not args.no_mtp,
         spec_draft_n_max=args.spec_draft_n_max,
         profile=args.profile,
-        driver=prof["driver"],
-        parallel=list(prof.get("parallel", [])),
+        driver=driver,
+        parallel=parallel,
         hw={"phys": phys, "logical": logical, "n_layers": n_layers, "vram": vram,
             "n_experts": n_experts, "n_ctx_train": n_ctx_train, "n_nextn": n_nextn},
     )
     cfg.factors = build_factors(cfg)
 
-    # apply --factor overrides / additions (any name in BENCH_FLAG is sweepable)
+    # apply --factor overrides / additions
     for spec in args.factor:
         name, _, vals = spec.partition("=")
         name = name.strip()
         levels = [v.strip() for v in vals.split(",") if v.strip()]
-        if name not in BENCH_FLAG:
+        if name not in BENCH_FLAG and name not in SERVER_ONLY:
             ap.error(f"--factor: unknown factor '{name}' "
-                     f"(sweepable: {sorted(BENCH_FLAG)})")
+                     f"(sweepable: {sorted(set(BENCH_FLAG) | SERVER_ONLY)})")
+        if name in SERVER_ONLY and cfg.driver != "server":
+            ap.error(f"--factor {name} requires the server driver "
+                     "(--driver server or --profile multi)")
         if not levels:
             ap.error(f"--factor {name}: no levels given")
         cfg.factors[name] = levels
@@ -874,17 +1033,21 @@ def main():
 
     if not args.run:
         print("\n--- PLAN ONLY (no GPU used). Re-run with --run to execute. ---")
-        print("\nSample command (run 1):")
+        print(f"\nSample command (run 1, {cfg.driver} driver):")
         f0 = runs[0]["factors"]
-        print("  " + " ".join(bench_command(cfg, f0)))
+        if cfg.driver == "server":
+            n_ctx = cfg.n_prompt + cfg.n_gen + 256
+            print("  " + " ".join(build_server_args(cfg, f0, 8080, n_ctx)))
+        else:
+            print("  " + " ".join(bench_command(cfg, f0)))
         est = len(runs) * 90  # rough 90s/run guess
         print(f"\nAll {len(runs)} runs would execute sequentially "
               f"(~{est // 60} min at a rough 90s/run).")
         return
 
-    if cfg.driver != "bench":
-        ap.error(f"the '{cfg.profile}' profile uses the '{cfg.driver}' driver, "
-                 "which is not implemented yet; use --profile single or agents")
+    if cfg.driver == "server" and not cfg.llama_server.exists():
+        ap.error(f"llama-server not found: {cfg.llama_server} "
+                 "(build it or pass --llama-server)")
 
     # --- execute sweep ---
     rows = []

@@ -68,7 +68,7 @@ shape the sweep measures at and optimizes for:
 |---------|------------------------|-----------|--------|-----|
 | **single** (default) | 512 + 256 | 8192 | bench | interactive chat/coding |
 | **agents** | 8192 + 256 | 32768 | bench | big-context tool use / RAG |
-| **multi** | 1024 + 256 | 8192 | server | concurrent serving (needs server driver) |
+| **multi** | 1024 + 256 | 8192 | server | concurrent serving (`--parallel N`) |
 
 The objective is **effective throughput** for that request —
 `(P + G) / (P/pp_tps + G/tg_tps)` — which weighs prefill and decode the way the
@@ -177,6 +177,9 @@ python3 llamatuner.py MODEL.gguf [options]
 
   --run              actually execute the sweep (default: plan/dry-run, no GPU)
   --profile P        workload profile: single | agents | multi (default: single)
+  --driver bench|server  benchmark driver (default: from profile). 'server'
+                     measures real generation incl. MTP + concurrency
+  --parallel N       concurrent streams for the server driver
   --array L25|L125   Taguchi array (default: L25, or 'auto')
   --ctx-floor N      minimum usable context for BALANCED (default: from profile)
   --probe-ctx        after the sweep, binary-search the largest context that
@@ -231,6 +234,29 @@ roadmap item.
 
 ---
 
+## Two benchmark drivers
+
+- **`bench`** (default) — `llama-bench`. Fast, measures raw prefill/decode. Cannot
+  do speculative decoding or real concurrency.
+- **`server`** — launches `llama-server`, drives real generation over HTTP, and
+  measures actual tokens/sec. This is the **only** way to measure **MTP /
+  speculative decoding** (it auto-adds `--spec-type draft-mtp` for models with a
+  NextN head) and **multi-user concurrency** (`--parallel N`, aggregate
+  throughput). The `multi` profile selects it automatically; force it on any
+  profile with `--driver server` (e.g. to measure MTP on a single-user workload).
+
+```bash
+# measure the real MTP speedup on a single-user workload (UD quant with NextN head)
+python3 llamatuner.py model-UD.gguf --run --driver server
+
+# tune concurrent serving throughput
+python3 llamatuner.py model.gguf --run --profile multi --parallel 8
+
+# tune the MTP aggressiveness knob directly (server driver only)
+python3 llamatuner.py model-UD.gguf --run --driver server \
+  --array auto --factor spec_n_max=1,2,3,4
+```
+
 ## Implemented
 
 - **MoE awareness** — detects `<arch>.expert_count` in GGUF metadata; if the model is
@@ -248,11 +274,6 @@ roadmap item.
 
 ## Roadmap / ideas
 
-- **Server-based benchmark for MTP** — `llama-bench` can't do speculative decoding,
-  so to actually *measure and optimize* MTP we'd spin up `llama-server` with each
-  config, drive real generation through the API, and sweep `--spec-draft-n-max`.
-  This is the only way to capture the acceptance-rate speedup rather than just
-  emitting the flags.
 - **Flash-attn as an outer block** — run the array twice (`-fa 0` / `-fa 1`) to
   quantify flash-attention's effect directly, mindful that quantized KV requires
   `-fa 1`.
