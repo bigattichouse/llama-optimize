@@ -716,9 +716,14 @@ def report(cfg: Config, rows: list[dict]):
         return
 
     if cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0:
-        print("NOTE: model has an MTP head — the server commands below enable "
-              "draft-mtp\n      speculative decoding. Measured t/s below does NOT "
-              "include that boost.")
+        if cfg.driver == "server":
+            print("NOTE: model has an MTP head — these numbers INCLUDE the "
+                  "draft-mtp speculative-decoding speedup (server driver).")
+        else:
+            print("NOTE: model has an MTP head — the server commands enable "
+                  "draft-mtp, but the measured t/s below does NOT include that "
+                  "boost (bench can't do spec decoding). Use --driver server to "
+                  "measure it.")
 
     print(f"objective  : effective t/s for a {cfg.profile} request "
           f"({cfg.n_prompt} prompt + {cfg.n_gen} gen tokens)")
