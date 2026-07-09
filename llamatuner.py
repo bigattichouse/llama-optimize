@@ -623,9 +623,31 @@ def _wait_health(port: int, deadline: float) -> bool:
     return False
 
 
-def _completion(port: int, prompt_tokens: list[int], n_gen: int, timeout: int) -> dict:
+# Varied prose so speculative-decoding acceptance is realistic. A repeated single
+# token is trivially predictable and would inflate the measured MTP speedup.
+_CORPUS = (
+    "The history of computing spans centuries, from mechanical calculators to "
+    "modern processors running billions of operations per second. In distributed "
+    "systems, consensus algorithms such as Raft and Paxos let unreliable machines "
+    "agree on a single value despite failures. Photosynthesis converts sunlight, "
+    "water, and carbon dioxide into glucose and oxygen. The novel opens in a quiet "
+    "coastal town where the protagonist, returning after many years, confronts an "
+    "old rival and a buried secret. Interest-rate decisions ripple through global "
+    "markets as traders reprice risk and adjust their portfolios accordingly. A "
+    "recipe for bread needs flour, water, salt, and time for the dough to rise. "
+)
+
+
+def _realistic_prompt(n_tokens: int) -> str:
+    """A varied-text prompt of roughly n_tokens tokens (~4 chars/token)."""
+    approx_chars = max(1, n_tokens) * 4
+    reps = approx_chars // len(_CORPUS) + 1
+    return (_CORPUS * reps)[:approx_chars]
+
+
+def _completion(port: int, prompt, n_gen: int, timeout: int) -> dict:
     body = json.dumps({
-        "prompt": prompt_tokens,
+        "prompt": prompt,
         "n_predict": n_gen,
         "temperature": 0,
         "cache_prompt": False,
@@ -636,6 +658,15 @@ def _completion(port: int, prompt_tokens: list[int], n_gen: int, timeout: int) -
         headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
+
+
+def _measure_round(port: int, prompt, n_gen: int, par: int, timeout: int):
+    """One round of `par` concurrent completions; returns (responses, wall_s)."""
+    with ThreadPoolExecutor(max_workers=par) as ex:
+        w0 = time.time()
+        res = list(ex.map(lambda _: _completion(port, prompt, n_gen, timeout),
+                          range(par)))
+        return res, time.time() - w0
 
 
 def server_run_one(cfg: Config, f: dict, timeout: int):
@@ -665,30 +696,29 @@ def server_run_one(cfg: Config, f: dict, timeout: int):
             return {"status": status, "pp_tps": 0.0, "tg_tps": 0.0,
                     "secs": time.time() - t0}
 
-        prompt = [1234] * prompt_len  # fixed synthetic prompt of exact length
+        prompt = _realistic_prompt(prompt_len)  # varied text for real acceptance
+        reps = max(1, cfg.reps)
         try:
-            def one(_):
-                return _completion(port, prompt, cfg.n_gen, timeout)
-            with ThreadPoolExecutor(max_workers=par) as ex:
-                wall0 = time.time()
-                res = list(ex.map(one, range(par)))
-                wall = time.time() - wall0
+            _measure_round(port, prompt, cfg.n_gen, par, timeout)  # warmup, discard
+            pps, tps = [], []
+            for _ in range(reps):
+                res, wall = _measure_round(port, prompt, cfg.n_gen, par, timeout)
+                if par == 1:
+                    tm = res[0].get("timings", {})
+                    pps.append(tm.get("prompt_per_second", 0.0) or 0.0)
+                    tps.append(tm.get("predicted_per_second", 0.0) or 0.0)
+                else:
+                    # aggregate serving throughput = total tokens / wall clock
+                    tg_tok = sum(r.get("timings", {}).get("predicted_n", 0) for r in res)
+                    pp_tok = sum(r.get("timings", {}).get("prompt_n", 0) for r in res)
+                    tps.append(tg_tok / wall if wall > 0 else 0.0)
+                    pps.append(pp_tok / wall if wall > 0 else 0.0)
         except (urllib.error.URLError, OSError, json.JSONDecodeError):
             return {"status": "ERROR", "pp_tps": 0.0, "tg_tps": 0.0,
                     "secs": time.time() - t0}
 
-        # aggregate over the concurrent requests
-        tg_tokens = sum(r.get("timings", {}).get("predicted_n", 0) for r in res)
-        pp_tokens = sum(r.get("timings", {}).get("prompt_n", 0) for r in res)
-        if par == 1:
-            tm = res[0].get("timings", {})
-            pp = tm.get("prompt_per_second", 0.0) or 0.0
-            tg = tm.get("predicted_per_second", 0.0) or 0.0
-        else:
-            # aggregate serving throughput = total tokens / wall clock
-            tg = tg_tokens / wall if wall > 0 else 0.0
-            # approximate aggregate prefill rate similarly
-            pp = pp_tokens / wall if wall > 0 else 0.0
+        pp = sum(pps) / len(pps)
+        tg = sum(tps) / len(tps)
         return {"status": "OK", "pp_tps": pp, "tg_tps": tg,
                 "secs": time.time() - t0}
     finally:
@@ -905,6 +935,10 @@ def selftest() -> bool:
         assert abs(effective_tps(512, 256, 1000.0, 100.0)
                    - 768 / (512 / 1000 + 256 / 100)) < 1e-6
         assert set(PROFILES) == {"single", "agents", "multi"}
+
+        # realistic prompt: varied text of ~n*4 chars, not a repeated token
+        assert len(_realistic_prompt(100)) == 400
+        assert len(set(_realistic_prompt(200))) > 20  # genuinely varied
     except AssertionError as e:
         print(f"selftest FAILED: {e}")
         return False
