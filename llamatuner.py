@@ -551,14 +551,22 @@ def taguchi_effects(exp, rows: list[dict]):
         from taguchi import Analyzer
     except Exception:
         return
-    results = {int(r["run_id"]): r["tg_tps"] for r in rows if r["status"] == "OK"}
+    # Feed EVERY run: failed configs (OOM/TIMEOUT/ERROR) carry tg_tps=0.0 as a
+    # penalty. The analyzer requires a complete design, and scoring failures as 0
+    # is the intended "failure is data" behaviour. (Caveat: a 0 from a timeout is
+    # a censored value, so trust the Pareto for the pick and use main-effects only
+    # to rank which factors matter — see README.)
+    results = {int(r["run_id"]): float(r["tg_tps"]) for r in rows}
+    n_failed = sum(1 for r in rows if r["status"] != "OK")
     if len(results) < 3:
-        print("\n(not enough successful runs for main-effects analysis)")
+        print("\n(not enough runs for main-effects analysis)")
         return
     try:
         with Analyzer(exp, metric_name="tg_tps") as an:
             an.add_results_from_dict(results)
             print("\n### Taguchi main effects (tg t/s, higher = better)")
+            if n_failed:
+                print(f"(note: {n_failed} failed run(s) scored as 0 t/s)")
             print(an.summary())
             opt = an.recommend_optimal(higher_is_better=True)
             print("Predicted-optimal levels:", opt)
