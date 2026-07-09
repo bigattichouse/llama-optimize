@@ -158,8 +158,12 @@ Full per-run data is written to `results.csv`.
 
 ## Requirements
 
-- `llama.cpp` built with ROCm/HIP for your GPU, at
-  `../llama.cpp/build/bin/llama-bench` (override with `--llama-bench`).
+- `llama.cpp` built for your GPU (ROCm/HIP, CUDA, Metal, …). Point the tool at it
+  with **`--llama-cpp /path/to/llama.cpp`** (its root or `build/bin` dir); it also
+  reads `$LLAMA_CPP` and `$PATH`, or you can pass `--llama-bench`/`--llama-server`
+  directly. If the binaries can't be found the tool stops with a clear error.
+  (When run from inside this repo's default workspace layout it finds them
+  automatically.)
 - The `robust`/`taguchi` submodule, checked out and built:
   ```bash
   git submodule update --init          # fetch the robust DOE suite

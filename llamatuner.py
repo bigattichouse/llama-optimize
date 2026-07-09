@@ -21,6 +21,7 @@ import csv
 import json
 import os
 import re
+import shutil
 import struct
 import socket
 import subprocess
@@ -34,16 +35,41 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Paths (relative to the workspace layout; override with flags if needed)
+# Paths
 # ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent
 WORKSPACE = PROJECT_ROOT.parent
-DEFAULT_LLAMA_BENCH = WORKSPACE / "llama.cpp" / "build" / "bin" / "llama-bench"
-DEFAULT_LLAMA_SERVER = WORKSPACE / "llama.cpp" / "build" / "bin" / "llama-server"
 # The Taguchi/Morris/Sobol suite is vendored as the `robust` git submodule at
 # ./taguchi. Its internal layout is nested, so locate the python binding by
 # search rather than a fixed path.
 SUBMODULE_DIR = PROJECT_ROOT / "taguchi"
+
+
+def resolve_binary(name: str, explicit: Path | None, hint: Path | None) -> Path:
+    """Locate a llama.cpp binary. Search order: explicit path, --llama-cpp hint
+    (root / build/bin / bin), $LLAMA_CPP, $PATH, then the sibling-workspace
+    default. Returns the first existing match, else a best-guess path (whose
+    non-existence is reported later)."""
+    if explicit is not None:
+        return explicit
+    roots = []
+    if hint is not None:
+        roots.append(hint)
+    env = os.environ.get("LLAMA_CPP")
+    if env:
+        roots.append(Path(env))
+    cands: list[Path] = []
+    for r in roots:
+        cands += [r / name, r / "build" / "bin" / name, r / "bin" / name]
+    on_path = shutil.which(name)
+    if on_path:
+        cands.append(Path(on_path))
+    default = WORKSPACE / "llama.cpp" / "build" / "bin" / name
+    cands.append(default)
+    for c in cands:
+        if c.exists():
+            return c
+    return default  # doesn't exist; caller validates and errors clearly
 
 
 def find_taguchi_binding() -> Path:
@@ -312,7 +338,8 @@ class Config:
     llama_bench: Path
     array: str
     ctx_floor: int
-    llama_server: Path = DEFAULT_LLAMA_SERVER
+    llama_server: Path = field(
+        default_factory=lambda: WORKSPACE / "llama.cpp" / "build" / "bin" / "llama-server")
     reps: int = BENCH_REPS
     n_prompt: int = BENCH_N_PROMPT
     n_gen: int = BENCH_N_GEN
@@ -912,7 +939,12 @@ def main():
     ap.add_argument("--parallel", type=int, default=None,
                     help="concurrent request streams for the server driver "
                          "(default: from profile)")
-    ap.add_argument("--llama-server", type=Path, default=DEFAULT_LLAMA_SERVER)
+    ap.add_argument("--llama-cpp", type=Path, default=None,
+                    help="path to your llama.cpp (its root or build/bin dir). "
+                         "Also read from $LLAMA_CPP or $PATH. Required if the "
+                         "binaries aren't auto-found.")
+    ap.add_argument("--llama-server", type=Path, default=None,
+                    help="explicit path to the llama-server binary")
     ap.add_argument("--ctx-floor", type=int, default=None,
                     help="minimum usable context for BALANCED (default: from profile)")
     ap.add_argument("--probe-ctx", action="store_true",
@@ -933,7 +965,8 @@ def main():
                          "even if the model has an MTP head")
     ap.add_argument("--spec-draft-n-max", type=int, default=2,
                     help="--spec-draft-n-max for MTP speculative decoding (default 2)")
-    ap.add_argument("--llama-bench", type=Path, default=DEFAULT_LLAMA_BENCH)
+    ap.add_argument("--llama-bench", type=Path, default=None,
+                    help="explicit path to the llama-bench binary")
     ap.add_argument("--timeout", type=int, default=1200,
                     help="per-run timeout in seconds")
     ap.add_argument("--results", type=Path, default=Path("results.csv"))
@@ -963,10 +996,13 @@ def main():
     driver = args.driver if args.driver is not None else prof["driver"]
     parallel = args.parallel if args.parallel is not None else prof.get("parallel", 1)
 
+    llama_bench = resolve_binary("llama-bench", args.llama_bench, args.llama_cpp)
+    llama_server = resolve_binary("llama-server", args.llama_server, args.llama_cpp)
+
     cfg = Config(
         model=args.model.resolve(),
-        llama_bench=args.llama_bench,
-        llama_server=args.llama_server,
+        llama_bench=llama_bench,
+        llama_server=llama_server,
         array=args.array,
         ctx_floor=ctx_floor,
         reps=args.reps,
@@ -1053,9 +1089,13 @@ def main():
               f"(~{est // 60} min at a rough 90s/run).")
         return
 
-    if cfg.driver == "server" and not cfg.llama_server.exists():
-        ap.error(f"llama-server not found: {cfg.llama_server} "
-                 "(build it or pass --llama-server)")
+    needed = cfg.llama_server if cfg.driver == "server" else cfg.llama_bench
+    if not needed.exists():
+        ap.error(
+            f"{needed.name} not found (looked at: {needed}).\n"
+            "  Need the path to your llama.cpp build. Pass --llama-cpp "
+            "/path/to/llama.cpp\n  (its build/bin dir), set $LLAMA_CPP, put it on "
+            f"$PATH, or pass --{needed.name} directly.")
 
     # --- execute sweep ---
     rows = []
