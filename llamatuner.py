@@ -1018,6 +1018,9 @@ def main():
         emit = "will add --spec-type draft-mtp to server cmd" if cfg.emit_mtp \
                else "disabled (--no-mtp)"
         print(f"MTP        : yes ({n_nextn} NextN layer(s)) — {emit}")
+        if cfg.driver == "bench":
+            print("             hint: add --driver server to MEASURE the MTP "
+                  "speedup (bench can't); otherwise it's only emitted")
     print(f"profile    : {cfg.profile}  (request {cfg.n_prompt} prompt + "
           f"{cfg.n_gen} gen tokens; driver={cfg.driver})")
     print(f"array      : {cfg.array}   ctx floor: {cfg.ctx_floor}")
