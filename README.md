@@ -33,6 +33,50 @@ python3 llamatuner.py /path/to/model.gguf --run --screen --iterate 3 --html repo
 
 ---
 
+## Setup
+
+You need three things: this repo, the `robust` DOE library (a **git submodule** —
+a second repo nested inside this one), and a `llama.cpp` build for your GPU.
+
+**1. Get the code, including the submodule.** The DOE engines live in a separate
+project (`robust`) that git tracks as a *submodule*: a plain `git clone` leaves the
+`taguchi/` folder empty, so you must pull it in explicitly.
+
+```bash
+# if you're cloning fresh, grab the submodule in one step:
+git clone --recurse-submodules <llamatune-repo-url>
+cd llamatune
+
+# already cloned (or downloaded a zip) without the submodule? fetch it now:
+git submodule update --init
+```
+
+If `taguchi/` is empty, step 1 didn't run — `git submodule update --init` fixes it.
+
+**2. Build `robust`.** It's pure C, no GPU needed, and takes a few seconds. This one
+build produces everything both funnel stages need:
+
+```bash
+make -C taguchi          # builds libtaguchi.so (Taguchi arrays + main-effects)
+                         # and the morris binary (for --screen)
+```
+
+`llamatuner` finds the Taguchi Python binding and the `morris` binary in
+`taguchi/build/bin/` automatically by searching the submodule — no paths to set.
+
+**3. Point it at your `llama.cpp`.** You need `llama.cpp` built for your GPU
+(ROCm/HIP, CUDA, Metal, …). The tool auto-discovers the binaries in the default
+workspace layout; otherwise pass **`--llama-cpp /path/to/llama.cpp`** (its root or
+`build/bin` dir). It also reads `$LLAMA_CPP` and `$PATH`, or you can pass
+`--llama-bench`/`--llama-server` directly. If the binaries can't be found the tool
+stops with a clear error.
+
+**4. Run it** — the commands above (e.g. `python3 llamatuner.py model.gguf --run`).
+Python 3.10+ is the only other requirement (uses `X | None` syntax, standard library
+only). Verify the install with no GPU or model via `python3 llamatuner.py --selftest`.
+
+---
+
 ## Why designed experiments (Morris + Taguchi) instead of a full sweep?
 
 The knobs that matter for llama.cpp throughput interact, and testing every
@@ -290,26 +334,6 @@ finer grid) is usually more informative than a bigger array. If you want raw
 statistical power (replication to average out thermal/measurement noise), force a
 larger array like `--array L125` — but that's a 125-run, overnight job. Randomized
 order (default) plus `--full` reps already averages out most drift.
-
----
-
-## Requirements
-
-- `llama.cpp` built for your GPU (ROCm/HIP, CUDA, Metal, …). Point the tool at it
-  with **`--llama-cpp /path/to/llama.cpp`** (its root or `build/bin` dir); it also
-  reads `$LLAMA_CPP` and `$PATH`, or you can pass `--llama-bench`/`--llama-server`
-  directly. If the binaries can't be found the tool stops with a clear error.
-  (When run from inside this repo's default workspace layout it finds them
-  automatically.)
-- The `robust`/`taguchi` submodule, checked out and built:
-  ```bash
-  git submodule update --init          # fetch the robust DOE suite
-  make -C taguchi                      # build libtaguchi.so + the morris binary (pure C, no GPU)
-  ```
-  This one build covers both funnel stages: `llamatuner` finds the Taguchi Python
-  binding (for the array + main-effects) and the `morris` binary in
-  `taguchi/build/bin/` (for `--screen`) automatically by searching the submodule.
-- Python 3.10+ (uses `X | None` type syntax), standard library only.
 
 ---
 
