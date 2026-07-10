@@ -75,8 +75,23 @@ automates for the *parameter* axis once a quant is chosen.
 
 ## Methodology recap
 
-See the README for full detail. In short: L25 5-level screening → L125 refinement of
-the dominant factors → direct confirmation run. OOM/crash is recorded as data (the
-memory cliff), the recommendation is driven off the measured Pareto frontier, and the
-Taguchi main-effects table is used to rank which knobs matter (with the caveat that
-OOM-as-zero can bias an additive model near the memory boundary).
+See the README for full detail. The tool evolved from a single Taguchi array into a
+**DOE funnel**:
+
+1. **Morris screen** (`--screen`, ~r·(k+1) runs) ranks every knob by importance (μ\*)
+   and flags interactions (σ), dropping the ones that don't matter.
+2. **Taguchi array** on the survivors — orthogonal, so main effects read cleanly.
+3. **Iterative refinement** (`--iterate`) settles low-impact factors and refines the
+   high-impact ones onto finer grids, converging on the optimum.
+4. **Confirmation run** (`--confirm`) verifies the additive prediction (predicted vs
+   actual); a large gap means interactions or thermal drift dominate.
+
+Configs are scored by **effective throughput** for the profile's request shape
+`(P+G)/(P/pp+G/tg)`, not raw decode. OOM/crash is recorded as data (the memory cliff);
+the recommendation is driven off the measured **Pareto frontier**, with main-effects
+used only to *rank* which knobs matter. Two measurement-validity guards proved
+necessary in practice: **realistic prompts** (a repeated token inflates MTP
+acceptance) and **randomized run order** (GPUs like the MI50 thermally throttle over a
+long sweep, which otherwise confounds factor effects). And because some settings can
+hard-reboot the machine, attempts are **journaled with fsync** so a crash-causer is
+skipped on resume rather than retried into a loop.

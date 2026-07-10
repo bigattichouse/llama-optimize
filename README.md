@@ -1,26 +1,31 @@
 # llamatune
 
 Find good `llama.cpp` command-line parameters for a given GGUF model **on your
-machine**, automatically, using a [Taguchi orthogonal-array](taguchi/) sweep
-over `llama-bench`. The Taguchi engine (and its Morris/Sobol siblings) comes from
-the [`robust`](https://github.com/bigattichouse/robust) DOE suite, vendored here as
-a git submodule.
+machine**, automatically, using statistically-designed experiments instead of a
+brute-force sweep. Point it at a model; it detects the hardware, runs a small,
+balanced set of benchmarks, and hands you paste-ready commands for the **best**,
+**longest-context**, and **best-balanced** configuration — plus the speed-vs-context
+Pareto frontier. The DOE engines (Taguchi + Morris) come from the
+[`robust`](https://github.com/bigattichouse/robust) suite, vendored as a submodule.
 
-You point it at a model; it figures out the hardware, runs a small, statistically
-designed set of benchmarks, and hands you paste-ready `llama-server` commands for
-the **fastest**, the **longest-context**, and the **best-balanced** configuration —
-plus the full speed-vs-context Pareto frontier.
+It works on **AMD (ROCm) or NVIDIA (CUDA)**, tunes **every knob llama.cpp exposes**
+(see the [knob reference](#knob-reference-one-stop-shop)), can measure **MTP /
+speculative decoding** and **multi-user concurrency** via a server driver, and is
+**crash-safe** — a setting that reboots the box won't be retried into a loop.
 
 ```bash
 # plan only — prints the experiment matrix and commands, uses NO GPU
 python3 llamatuner.py /path/to/model.gguf
 
-# actually run the sweep (uses the GPU)
+# just tune it — autonomous, one command
 python3 llamatuner.py /path/to/model.gguf --run
 
-# fast screen (1 rep) vs thorough (5 reps); the array is auto-chosen
+# fast screen (1 rep) vs thorough (5 reps + confirm); the array is auto-chosen
 python3 llamatuner.py /path/to/model.gguf --run --quick
 python3 llamatuner.py /path/to/model.gguf --run --full
+
+# the full funnel: screen many knobs → refine the few that matter → confirm + report
+python3 llamatuner.py /path/to/model.gguf --run --screen --iterate 3 --html report.html
 ```
 
 ---
@@ -113,28 +118,32 @@ The tool inspects the box and the model so you don't hand-tune the factor levels
 ## Output
 
 ```
-### FASTEST (max t/s)
-  tg=… t/s  pp=… t/s  depth=…  ngl=…  t=…  kv=…  ub=…
+### BEST (max effective t/s)
+  eff=… t/s  (tg=…  pp=…)  depth=…  ngl=…  t=…  kv=…  ub=…
   suggested llama-server command:
     ./llama-server -m model.gguf -ngl … -t … -c … -ctk … -ctv … -ub … -b 2048 -fa 1
 
-### BALANCED (max t/s with context >= 16384)
+### BALANCED (best with context >= …)
   …
 
 ### LONGEST CONTEXT
   …
 
-### Pareto frontier (context vs t/s)
-  depth=  4096  tg=…  ngl=…  kv=…  ub=…
-  depth= 16384  tg=…  …
-  …
+### Pareto frontier (context vs effective t/s)
+  depth=  4096  eff=…  (tg=…)  ngl=…  kv=…  ub=…
+  depth= 12288  eff=…  …
 
-### Taguchi main effects (tg t/s, higher = better)
-  <per-factor level means + which factors dominate>
+### Taguchi main effects (effective t/s, higher = better)
+  <per-factor level means, ranked by impact>
   Predicted-optimal levels: {…}
+
+### Confirmation run (predicted-optimal config)     # with --confirm/--full
+  predicted eff: … t/s   measured eff: … t/s   prediction error: …%
 ```
 
-Full per-run data is written to `results.csv`.
+The objective is **effective throughput** for the profile's request shape,
+`(P+G)/(P/pp+G/tg)`. Full per-run data is written to `results.csv` (incrementally,
+so it survives a crash — see below).
 
 ### Reading the results correctly
 
@@ -266,10 +275,12 @@ python3 llamatuner.py MODEL.gguf [options]
                      model (predicted vs actual; implied by --full)
   --html PATH        also write a visual HTML report (Pareto + main effects)
   --selftest         run offline logic checks and exit (no GPU, no model)
-  --reps N           llama-bench repetitions per config (default: 3)
-  --n-prompt N       prompt tokens per measurement (default: 512)
-  --n-gen N          generated tokens per measurement (default: 128)
+  --reps N           repetitions per config (default: 3, or --quick=1/--full=5)
+  --n-prompt N       prompt tokens per measurement (default: from profile)
+  --n-gen N          generated tokens per measurement (default: from profile)
   --max-depth N      cap the n_depth factor levels (memory/time budget)
+  --factor NAME=v1,v2,...   sweep/override a knob (repeatable; see Knob reference)
+  --env NAME=v1,v2,...      sweep an environment variable as a factor (repeatable)
   --no-mtp           don't add draft-mtp flags to the server command
   --spec-draft-n-max N  MTP draft tokens for the server command (default: 2)
   --llama-bench PATH path to the llama-bench binary
@@ -395,18 +406,24 @@ python3 llamatuner.py model-UD.gguf --run --driver server \
 
 ## Implemented
 
-- **MoE awareness** — detects `<arch>.expert_count` in GGUF metadata; if the model is
-  MoE, promotes `-ncmoe` (CPU-offload of experts) to a swept factor (the biggest
-  RAM/VRAM lever on MoE). If dense, keeps the spare L25 column for error estimation.
-- **Max-context probe** (`--probe-ctx`) — after the sweep, binary-searches the largest
-  context that loads for the fastest config, capped at the model's native context.
-- **Offline self-test** (`--selftest`) — verifies the core logic without a GPU.
-- **MTP awareness** — detects a NextN/multi-token-prediction head (`<arch>.nextn_predict_layers`,
-  present in e.g. Unsloth Dynamic quants) and appends `--spec-type draft-mtp
-  --spec-draft-n-max N` to the emitted `llama-server` command. **Caveat:** the swept
-  `tg` numbers do *not* include the MTP speedup — `llama-bench` can't do speculative
-  decoding, so MTP is an additional multiplier on top of the measured throughput.
-  See Roadmap for measuring it directly. Toggle with `--no-mtp` / `--spec-draft-n-max`.
+- **Autonomous** — auto-detects CPU cores, VRAM (AMD *and* NVIDIA), model layers,
+  MoE (`expert_count`), MTP (`nextn_predict_layers`), and native context; picks the
+  array; generates sensible per-model factor levels. Zero flags required.
+- **Two drivers** — `bench` (fast, raw pp/tg) and `server` (real generation:
+  **measures MTP** and **multi-user concurrency**), with server reuse across runs.
+- **Workload profiles** (`--profile single|agents|multi`) + an **effective-throughput**
+  objective that weighs prefill vs decode as the workload experiences them.
+- **The funnel** — `--screen` (Morris: rank knobs by μ\*, flag interactions by σ,
+  drop the negligible) → `--iterate N` (auto-refine the survivors) → `--confirm`
+  (verify the prediction) → `--html` report.
+- **One-stop knob registry** — every llama.cpp lever is sweepable (`--factor`),
+  including MTP/spec dials, `-ot` placement, CPU affinity, and env vars (`--env`);
+  MoE/MTP knobs auto-enabled by model.
+- **Trustworthy measurement** — realistic prompts, warmup + rep averaging,
+  **randomized run order** + `--cooldown` to fight thermal drift.
+- **Robust** — incremental save + `--resume`; **crash journal** so a config that
+  reboots the machine is skipped, not retried (`--retry-crashed` to override);
+  clear errors; `--selftest` (no GPU); `--probe-ctx` for max loadable context.
 
 ## Roadmap / ideas
 
