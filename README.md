@@ -285,6 +285,8 @@ python3 llamatuner.py MODEL.gguf [options]
   --spec-draft-n-max N  MTP draft tokens for the server command (default: 2)
   --llama-bench PATH path to the llama-bench binary
   --timeout SECS     per-run timeout (default: 1200)
+  --server-start-timeout SECS  give up on a config if llama-server doesn't load
+                     in this long (default: 180; also fails fast if it dies)
   --results PATH     results CSV output (default: results.csv)
   --resume           skip runs already in --results (rows save incrementally,
                      so an interrupted sweep can be resumed)

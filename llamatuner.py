@@ -1529,6 +1529,10 @@ def morris_screen(cfg: Config, args, ap, trajectories: int):
     design = list(csv.DictReader(out.stdout.splitlines()))
     print(f"\n{'#' * 70}\n# MORRIS SCREEN — {trajectories} trajectories, "
           f"{len(design)} runs (r*(k+1)={trajectories}*{len(cfg.factors) + 1})\n{'#' * 70}")
+    if cfg.driver == "server":
+        print("note: screening on the server driver reloads the model for every "
+              "point (slow).\n      For base knobs, screen on the bench driver; "
+              "reserve the server driver for MTP/concurrency knobs.")
 
     def map_point(row):
         f = {}
