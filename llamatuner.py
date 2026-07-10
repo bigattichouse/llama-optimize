@@ -192,6 +192,60 @@ def detect_vram_mib() -> int | None:
     return None
 
 
+def vram_used_mib() -> int | None:
+    """Currently-used VRAM in MiB (AMD then NVIDIA); None if unavailable."""
+    try:
+        out = subprocess.run(["rocm-smi", "--showmeminfo", "vram", "--json"],
+                             capture_output=True, text=True, timeout=10)
+        if out.returncode == 0:
+            for card in json.loads(out.stdout).values():
+                for k, v in card.items():
+                    if "vram" in k.lower() and "used" in k.lower():
+                        return int(v) // (1024 * 1024)
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10)
+        if out.returncode == 0 and out.stdout.strip():
+            return int(float(out.stdout.strip().splitlines()[0]))
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+class VRAMSampler:
+    """Polls used VRAM in a background thread, tracking the peak during a run.
+    (rocm-smi is slow, so polling is coarse; captures the config's footprint.)"""
+
+    def __init__(self, interval: float = 1.0):
+        self.peak = 0
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread = None
+
+    def __enter__(self):
+        def poll():
+            while not self._stop.wait(self.interval):
+                v = vram_used_mib()
+                if v:
+                    self.peak = max(self.peak, v)
+        # one immediate sample so short runs still get a reading
+        v = vram_used_mib()
+        if v:
+            self.peak = v
+        self._thread = threading.Thread(target=poll, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=self.interval + 1)
+        return False
+
+
 # --- Minimal GGUF metadata reader (header only, no tensor data) -------------
 _GGUF_MAGIC = b"GGUF"
 # value type ids
@@ -395,6 +449,7 @@ class Config:
     driver: str = "bench"         # "bench" (llama-bench) or "server" (llama-server)
     parallel: int = 1             # concurrent request streams (server driver)
     server_start_timeout: int = 180  # max seconds to wait for llama-server to load
+    measure_vram: bool = False       # sample peak VRAM used during each run
     factors: dict = field(default_factory=dict)
     hw: dict = field(default_factory=dict)
     env_factor_names: set = field(default_factory=set)  # factors that set env vars
@@ -699,21 +754,27 @@ def run_with_progress(cfg: Config, f: dict, timeout: int, prefix: str):
 def run_one(cfg: Config, f: dict, timeout: int):
     cmd = bench_command(cfg, f)
     t0 = time.time()
+    status, pp, tg = "OK", 0.0, 0.0
+    sampler = VRAMSampler().__enter__() if cfg.measure_vram else None
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
                               env=run_env(cfg, f))
+        combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        if proc.returncode != 0 or _OOM_PAT.search(combined):
+            status = "OOM" if _OOM_PAT.search(combined) else "ERROR"
+        else:
+            pp_, tg_ = parse_bench_json(proc.stdout)
+            if tg_ is None:
+                status = "PARSE_FAIL"
+            else:
+                pp, tg = pp_ or 0.0, tg_
     except subprocess.TimeoutExpired:
-        return {"status": "TIMEOUT", "pp_tps": 0.0, "tg_tps": 0.0,
-                "secs": time.time() - t0}
-    secs = time.time() - t0
-    combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
-    if proc.returncode != 0 or _OOM_PAT.search(combined):
-        status = "OOM" if _OOM_PAT.search(combined) else "ERROR"
-        return {"status": status, "pp_tps": 0.0, "tg_tps": 0.0, "secs": secs}
-    pp, tg = parse_bench_json(proc.stdout)
-    if tg is None:
-        return {"status": "PARSE_FAIL", "pp_tps": 0.0, "tg_tps": 0.0, "secs": secs}
-    return {"status": "OK", "pp_tps": pp or 0.0, "tg_tps": tg, "secs": secs}
+        status = "TIMEOUT"
+    finally:
+        if sampler:
+            sampler.__exit__()
+    return {"status": status, "pp_tps": pp, "tg_tps": tg,
+            "secs": time.time() - t0, "vram_mib": sampler.peak if sampler else 0}
 
 
 # ---------------------------------------------------------------------------
@@ -927,15 +988,21 @@ def measure_in_session(cfg: Config, f: dict, session, timeout: int) -> dict:
     if session is None or not session.ok:
         err = session.err if session else ""
         status = "OOM" if _OOM_PAT.search(err or "") else "ERROR"
-        return {"status": status, "pp_tps": 0.0, "tg_tps": 0.0, "secs": 0.0}
+        return {"status": status, "pp_tps": 0.0, "tg_tps": 0.0, "secs": 0.0,
+                "vram_mib": 0}
     prompt_len = cfg.n_prompt + int(f.get("n_depth", 0))
     par = int(f.get("parallel", cfg.parallel))
+    sampler = VRAMSampler().__enter__() if cfg.measure_vram else None
+    status, pp, tg = "OK", 0.0, 0.0
     try:
         pp, tg = session.measure(prompt_len, cfg.n_gen, par, cfg.reps, timeout)
     except (urllib.error.URLError, OSError, json.JSONDecodeError):
-        return {"status": "ERROR", "pp_tps": 0.0, "tg_tps": 0.0,
-                "secs": time.time() - t0}
-    return {"status": "OK", "pp_tps": pp, "tg_tps": tg, "secs": time.time() - t0}
+        status = "ERROR"
+    finally:
+        if sampler:
+            sampler.__exit__()
+    return {"status": status, "pp_tps": pp, "tg_tps": tg,
+            "secs": time.time() - t0, "vram_mib": sampler.peak if sampler else 0}
 
 
 def server_run_one(cfg: Config, f: dict, timeout: int):
@@ -1116,30 +1183,47 @@ def _nice_ticks(vmax: float, n: int = 4) -> list:
     return [step * i for i in range(k + 1)]
 
 
-def _svg_pareto(rows: list[dict]) -> str:
-    """Inline SVG: effective t/s (y) vs context (x), all OK runs as faint dots,
-    the Pareto frontier as a highlighted line. Theme-neutral colors."""
+def _svg_pareto(rows: list[dict], vram_total: float = 0) -> str:
+    """Inline SVG: effective t/s (left y) vs context (x), all OK runs as faint dots,
+    the Pareto frontier as a highlighted line. If runs carry measured VRAM, overlay
+    the VRAM curve on a right-hand axis plus the physical-ceiling line. Theme-neutral."""
     ok = [r for r in rows if r["status"] == "OK" and score_of(r) > 0]
     if len(ok) < 2:
         return ""
     pts = [(int(r["n_depth"]), score_of(r)) for r in ok]
     front = [(int(r["n_depth"]), score_of(r)) for r in pareto_frontier(rows)]
-    W, H, ml, mr, mt, mb = 680, 340, 62, 16, 14, 46
+    # measured VRAM per run (only if --vram was used and values are present)
+    vpts = sorted((int(r["n_depth"]), float(r.get("vram_mib") or 0))
+                  for r in ok if float(r.get("vram_mib") or 0) > 0)
+    have_vram = len(vpts) >= 2
+    W, H, ml, mt, mb = 680, 340, 62, 14, 46
+    mr = 58 if have_vram else 16
     xmax = max((x for x, _ in pts), default=1) or 1
-    ymax = (max((y for _, y in pts), default=1) or 1) * 1.08
+    ys = [y for _, y in pts]
+    # zoom the left y-axis to ~10% around the data (NOT from 0) so small variation is
+    # visible — otherwise a near-flat throughput curve looks like a straight line
+    ylo, yhi = min(ys) * 0.9, max(ys) * 1.1
+    if yhi - ylo < 1e-6:
+        ylo, yhi = ylo - 1, yhi + 1
+    # right VRAM axis: from 0 to the physical ceiling (or headroom above peak)
+    vhi = max([v for _, v in vpts] + [vram_total]) * 1.05 if have_vram else 1
 
     def sx(x):
         return ml + (x / xmax) * (W - ml - mr)
 
     def sy(y):
-        return H - mb - (y / ymax) * (H - mt - mb)
+        return H - mb - ((y - ylo) / (yhi - ylo)) * (H - mt - mb)
+
+    def sv(v):                               # right axis -> pixels
+        return H - mb - (v / vhi) * (H - mt - mb)
 
     g = []
     for x in _nice_ticks(xmax):
         gx = sx(x)
         g.append(f"<line x1='{gx:.0f}' y1='{mt}' x2='{gx:.0f}' y2='{H - mb}' class='grid'/>")
         g.append(f"<text x='{gx:.0f}' y='{H - mb + 16}' class='ax xt'>{int(x)}</text>")
-    for y in _nice_ticks(ymax):
+    for i in range(5):                       # 5 ticks across the zoomed y-range
+        y = ylo + (yhi - ylo) * i / 4
         gy = sy(y)
         g.append(f"<line x1='{ml}' y1='{gy:.0f}' x2='{W - mr}' y2='{gy:.0f}' class='grid'/>")
         g.append(f"<text x='{ml - 6}' y='{gy + 4:.0f}' class='ax yt'>{y:.0f}</text>")
@@ -1148,19 +1232,42 @@ def _svg_pareto(rows: list[dict]) -> str:
     poly = " ".join(f"{sx(x):.1f},{sy(y):.1f}" for x, y in front)
     fdots = "".join(f"<circle cx='{sx(x):.1f}' cy='{sy(y):.1f}' r='4' class='fdot'/>"
                     for x, y in front)
+    vram_svg = ""
+    if have_vram:
+        for i in range(5):                   # right-axis ticks in GiB
+            v = vhi * i / 4
+            g.append(f"<text x='{W - mr + 6}' y='{sv(v) + 4:.0f}' class='ax vt'>"
+                     f"{v / 1024:.1f}</text>")
+        vpoly = " ".join(f"{sx(x):.1f},{sv(v):.1f}" for x, v in vpts)
+        vdots = "".join(f"<circle cx='{sx(x):.1f}' cy='{sv(v):.1f}' r='3' class='vdot'/>"
+                        for x, v in vpts)
+        vram_svg = f"<polyline points='{vpoly}' class='vline'/>{vdots}"
+        if vram_total > 0:                   # physical VRAM ceiling
+            cy0 = sv(vram_total)
+            vram_svg += (
+                f"<line x1='{ml}' y1='{cy0:.0f}' x2='{W - mr}' y2='{cy0:.0f}' "
+                f"class='ceil'/><text x='{ml + 6}' y='{cy0 - 5:.0f}' class='clbl'>"
+                f"VRAM ceiling {vram_total / 1024:.0f} GiB</text>")
     cy = (mt + H - mb) / 2
+    vaxis = (f"<text x='{W - 14}' y='{cy:.0f}' class='albl vaxlbl' "
+             f"transform='rotate(90 {W - 14} {cy:.0f})'>VRAM used (GiB)</text>"
+             if have_vram else "")
     return (
         f"<svg viewBox='0 0 {W} {H}' class='chart' role='img' "
-        f"aria-label='effective throughput versus context'>"
+        f"aria-label='effective throughput and VRAM versus context'>"
         "<style>.chart .grid{stroke:#8883} .chart .ax{fill:#888;font:11px system-ui}"
-        ".chart .xt{text-anchor:middle} .chart .yt{text-anchor:end}"
+        ".chart .xt{text-anchor:middle} .chart .yt{text-anchor:end} .chart .vt{text-anchor:start}"
         ".chart .dot{fill:#8887} .chart .fline{fill:none;stroke:#2ca88f;stroke-width:2.5}"
         ".chart .fdot{fill:#2ca88f} .chart .albl{fill:#888;font:12px system-ui;"
-        "text-anchor:middle}</style>"
-        f"{''.join(g)}<polyline points='{poly}' class='fline'/>{dots}{fdots}"
+        "text-anchor:middle}"
+        ".chart .vline{fill:none;stroke:#e0993e;stroke-width:2;stroke-dasharray:1}"
+        ".chart .vdot{fill:#e0993e} .chart .vaxlbl{fill:#e0993e}"
+        ".chart .ceil{stroke:#d1495b;stroke-width:1.5;stroke-dasharray:5 4}"
+        ".chart .clbl{fill:#d1495b;font:11px system-ui}</style>"
+        f"{''.join(g)}<polyline points='{poly}' class='fline'/>{dots}{fdots}{vram_svg}"
         f"<text x='{(ml + W - mr) / 2:.0f}' y='{H - 6}' class='albl'>context (tokens)</text>"
         f"<text x='16' y='{cy:.0f}' class='albl' transform='rotate(-90 16 {cy:.0f})'>"
-        "effective t/s</text></svg>")
+        f"effective t/s</text>{vaxis}</svg>")
 
 
 def write_html_report(cfg: Config, rows: list[dict], path: Path):
@@ -1264,7 +1371,7 @@ th{{color:#888;font-weight:600}} tr.bad{{opacity:.5}}
 <div class=cards>{card('Best', best)}{card(f'Balanced (≥{cfg.ctx_floor})', balanced)}{card('Longest context', longest)}</div>
 <h2>What matters (main effects, by impact)</h2>{''.join(fx_html)}
 <h2>Pareto frontier (context vs effective t/s)</h2>
-{_svg_pareto(rows)}
+{_svg_pareto(rows, cfg.hw.get("vram", 0) if cfg.measure_vram else 0)}
 <table><tr><th>context</th><th>eff t/s</th><th>tg</th><th>ngl</th><th>kv</th><th>ubatch</th></tr>{par_rows}</table>
 <h2>All runs</h2><table><tr>{head}</tr>{body}</table>
 """
@@ -1493,6 +1600,8 @@ def build_child_argv(args, cfg: Config, factors: dict, results_path: Path,
             "--results-dir", ".", "--results", str(results_path)]
     if args.no_mtp:
         argv.append("--no-mtp")
+    if cfg.measure_vram:
+        argv.append("--vram")
     if args.no_shuffle:
         argv.append("--no-shuffle")
     if args.seed is not None:
@@ -1790,6 +1899,10 @@ def main():
                          "finished (suspected machine crash/hang); default skips them")
     ap.add_argument("--html", type=Path, default=None,
                     help="also write a visual HTML report (Pareto + main effects)")
+    ap.add_argument("--vram", action="store_true",
+                    help="measure actual peak VRAM used per run (polls "
+                         "rocm-smi/nvidia-smi); records vram_mib and draws the "
+                         "VRAM curve + physical ceiling on the Pareto chart")
     ap.add_argument("--no-shuffle", action="store_true",
                     help="run configs in array order (default: randomized to "
                          "decorrelate thermal/background drift from factors)")
@@ -1877,6 +1990,7 @@ def main():
         profile=args.profile,
         driver=driver,
         parallel=parallel,
+        measure_vram=args.vram,
         server_start_timeout=args.server_start_timeout,
         hw={"phys": phys, "logical": logical, "n_layers": n_layers, "vram": vram,
             "n_experts": n_experts, "n_ctx_train": n_ctx_train, "n_nextn": n_nextn},
@@ -2044,7 +2158,8 @@ def main():
 
     # --- execute sweep ---
     cols = (["run_id"] + list(cfg.factors.keys())
-            + ["pp_tps", "tg_tps", "eff_tps", "status", "secs"])
+            + ["pp_tps", "tg_tps", "eff_tps", "status", "secs"]
+            + (["vram_mib"] if cfg.measure_vram else []))
 
     # Resume keys on run_id (unique per array row), not config values, because
     # orthogonal arrays can repeat a config across rows (intentional replication).

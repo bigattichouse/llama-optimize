@@ -281,6 +281,9 @@ python3 llamatuner.py MODEL.gguf [options]
   --confirm          run the predicted-optimal config to verify the additive
                      model (predicted vs actual; implied by --full)
   --html PATH        also write a visual HTML report (Pareto + main effects)
+  --vram             measure actual peak VRAM per run (polls rocm-smi/nvidia-smi);
+                     records vram_mib and overlays the VRAM curve + physical
+                     ceiling on the Pareto chart
   --selftest         run offline logic checks and exit (no GPU, no model)
   --reps N           repetitions per config (default: 3, or --quick=1/--full=5)
   --n-prompt N       prompt tokens per measurement (default: from profile)
