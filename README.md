@@ -280,6 +280,8 @@ python3 llamatuner.py MODEL.gguf [options]
   --n-prompt N       prompt tokens per measurement (default: from profile)
   --n-gen N          generated tokens per measurement (default: from profile)
   --max-depth N      cap the n_depth factor levels (memory/time budget)
+  --min-kv TYPE      KV-cache quality floor (default q8_0, near-lossless); never
+                     recommends a lossier KV. 'any' to explore all (q5/q4)
   --factor NAME=v1,v2,...   sweep/override a knob (repeatable; see Knob reference)
   --env NAME=v1,v2,...      sweep an environment variable as a factor (repeatable)
   --no-mtp           don't add draft-mtp flags to the server command

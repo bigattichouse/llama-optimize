@@ -347,6 +347,21 @@ DEFAULT_MAX_DEPTH = 65536
 DEFAULT_KV_LEVELS = ["f16", "q8_0", "q5_1", "q4_1", "q4_0"]
 DEFAULT_UBATCH_LEVELS = [128, 256, 512, 1024, 2048]
 
+# KV cache types ordered best-quality -> lossiest. q8_0 is near-lossless; below it
+# quality degrades and errors compound over context. --min-kv floors this.
+KV_QUALITY = ["f32", "f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "iq4_nl"]
+
+
+def kv_at_or_above(levels: list, floor: str) -> list:
+    """Keep only KV types at least as high-quality as `floor` (order in
+    KV_QUALITY). floor 'any'/'none'/'' disables the filter."""
+    if not floor or floor.lower() in ("any", "none"):
+        return list(levels)
+    fi = KV_QUALITY.index(floor) if floor in KV_QUALITY else len(KV_QUALITY) - 1
+    kept = [l for l in levels
+            if l not in KV_QUALITY or KV_QUALITY.index(l) <= fi]
+    return kept or [floor]  # never empty
+
 
 def depth_levels(n_ctx_train: int | None, override_max: int | None = None) -> list[int]:
     """Five n_depth levels spanning 0..min(native ctx, cap). Adaptive so we
@@ -1363,6 +1378,11 @@ def selftest() -> bool:
         assert factor_flags(cfg_s, {"nkvo": "1"}, "server", 512) == [["-nkvo"]]  # bare
         assert factor_flags(cfg_s, {"nkvo": "1"}, "bench", 512) == [["-nkvo", "1"]]
 
+        # KV quality floor
+        assert kv_at_or_above(["f16", "q8_0", "q5_1", "q4_0"], "q8_0") == ["f16", "q8_0"]
+        assert kv_at_or_above(["f16", "q8_0", "q4_0"], "any") == ["f16", "q8_0", "q4_0"]
+        assert kv_at_or_above(["q4_0"], "q8_0") == ["q8_0"]  # never empty -> floor
+
         # morris analyze table parsing
         mtxt = ("Factor  mu*  sigma  note\n------  ----  -----  ----\n"
                 "ubatch  96  0\nngl  32  0.001  \n\nRanked by mu* ...\n")
@@ -1415,6 +1435,7 @@ def build_child_argv(args, cfg: Config, factors: dict, results_path: Path,
         argv += ["--seed", str(args.seed)]
     if args.max_depth is not None:
         argv += ["--max-depth", str(args.max_depth)]
+    argv += ["--min-kv", "any"]   # parent already applied the floor; don't re-filter
     for name, levels in factors.items():
         flag = "--env" if name in cfg.env_factor_names else "--factor"
         argv += [flag, f"{name}={','.join(str(x) for x in levels)}"]
@@ -1665,6 +1686,10 @@ def main():
                     help="generated tokens per measurement (default: from profile)")
     ap.add_argument("--max-depth", type=int, default=None,
                     help="cap n_depth factor levels (memory/time budget)")
+    ap.add_argument("--min-kv", default="q8_0", metavar="TYPE",
+                    help="KV-cache quality floor: never consider a KV type lossier "
+                         "than this (default q8_0, near-lossless). 'any' explores "
+                         "all; e.g. --min-kv q4_0 to allow aggressive quantization")
     ap.add_argument("--no-mtp", action="store_true",
                     help="don't add draft-mtp flags to the emitted server command "
                          "even if the model has an MTP head")
@@ -1783,6 +1808,16 @@ def main():
             ap.error(f"--env expects NAME=v1,v2,... (got '{spec}')")
         cfg.factors[name] = levels
         cfg.env_factor_names.add(name)
+
+    # apply the KV quality floor (quality is essentially only KV-type deep here;
+    # MTP is lossless, other knobs don't affect quality)
+    if "kv_type" in cfg.factors:
+        kept = kv_at_or_above(cfg.factors["kv_type"], args.min_kv)
+        dropped = [l for l in cfg.factors["kv_type"] if l not in kept]
+        cfg.factors["kv_type"] = kept
+        if dropped:
+            print(f"KV quality floor --min-kv {args.min_kv}: dropping {dropped} "
+                  f"(keeping {kept})")
 
     # funnel stage 1: Morris pre-screen (reduces cfg.factors to the ones that
     # matter) before the Taguchi sweep / iterate. Runs in the parent, not children.
