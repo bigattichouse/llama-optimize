@@ -546,3 +546,10 @@ surrogate over a mixed continuous/categorical space, where a weak fit gives
 confidently-wrong indices. Not worth it.
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) for the background and tuning hypotheses.
+
+## License
+
+`llamatune` is released under the [MIT License](LICENSE). The bundled
+[`robust`](https://github.com/bigattichouse/robust) DOE suite (the `taguchi/`
+submodule) is dedicated to the public domain under CC0-1.0 — so the whole thing is
+free to use, modify, and redistribute.
