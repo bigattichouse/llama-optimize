@@ -271,32 +271,60 @@ timeout never loses completed runs — rerun with `--resume` to finish the rest.
 Run `python3 llamatuner.py --selftest` to verify the JSON parser, OOM detection,
 factor-level generation, MoE detection, and Pareto logic without a GPU or model.
 
-## Advanced: extra factors and environment sweeps
+## Knob reference (one-stop-shop)
 
-Beyond the default five factors, any llama-bench parameter in the `BENCH_FLAG`
-map can be swept with `--factor`, and any environment variable with `--env`
-(each becomes an orthogonal factor in the design). Both are opt-in, so pick an
-array that fits the new factor count (`--array`, or `auto`).
+Every tunable the sweep understands. **swept** = in the default design; **opt-in**
+= add with `--factor NAME=v1,v2,...`. Any **environment variable** can also be a
+factor via `--env NAME=v1,v2` (applied per process; the winning value is prepended
+to the recommended command). Adding a new knob is one entry in the `FACTORS`
+registry in `llamatuner.py`.
+
+| knob | flag(s) | driver | kind | when | effect |
+|---|---|---|---|---|---|
+| `ngl` | `-ngl` | both | num | swept | layers offloaded to GPU (dominant lever) |
+| `n_depth` | `-d` | bench | num | swept | context depth (KV prefill); speed-vs-context axis |
+| `threads` | `-t` | both | num | swept | CPU threads for decode |
+| `kv_type` | `-ctk -ctv` | both | cat | swept | KV cache precision (buys context) |
+| `ubatch` | `-ub` | both | num | swept | physical micro-batch |
+| `ncmoe` | `-ncmoe` | both | num | opt-in¹ | MoE expert layers kept on CPU |
+| `batch` | `-b` | both | num | opt-in | logical batch |
+| `nkvo` | `-nkvo` | both | bool | opt-in | keep KV in RAM vs VRAM |
+| `poll` | `--poll` | both | num | opt-in | CPU polling level |
+| `numa` | `--numa` | both | cat | opt-in | NUMA optimization mode |
+| `fa` | `-fa` | both | cat | opt-in² | flash attention on/off |
+| `ot` | `-ot` | both | cat | opt-in | per-tensor placement — the VRAM-fit lever (named patterns below) |
+| `threads_batch` | `-tb` | server | num | opt-in | CPU threads for prompt processing |
+| `parallel` | `--parallel` | server | num | opt-in | concurrent request streams (multi) |
+| `spec_n_max` | `--spec-draft-n-max` | server | num | opt-in | MTP draft tokens (max) |
+| `spec_n_min` | `--spec-draft-n-min` | server | num | opt-in | MTP draft tokens (min) |
+| `spec_p_min` | `--spec-draft-p-min` | server | float | opt-in | MTP acceptance-probability threshold |
+| `spec_p_split` | `--spec-draft-p-split` | server | float | opt-in | MTP split probability |
+| `rope_scaling` | `--rope-scaling` | server | cat | opt-in | RoPE scaling: none/linear/yarn |
+| `yarn_factor` | `--yarn-ext-factor` | server | float | opt-in | YaRN extrapolation (context **beyond** native) |
+
+¹ auto-added when the model is MoE.  ² fixed on unless swept (precondition for KV-quant).
+
+**`-ot` named patterns** (translate to real tensor regexes): `none`, `ffn_cpu`,
+`ffn_up_cpu`, `exps_cpu`, `attn_cpu`.
 
 ```bash
-# sweep KV offload location and CPU polling alongside a focused ngl/kv sweep
-python3 llamatuner.py model.gguf --run --array auto \
-  --factor ngl=56,60,64 --factor kv_type=f16,q4_0 \
-  --factor nkvo=0,1 --factor poll=0,50
+# offload placement + CPU polling + KV location
+python3 llamatuner.py model.gguf --run \
+  --factor ngl=56,60,64 --factor ot=none,ffn_cpu --factor nkvo=0,1 --factor poll=0,50
 
-# gfx906 / ROCm environment tuning (the "10-30%" knobs) as sweepable factors
-python3 llamatuner.py model.gguf --run --array auto \
+# tune the MTP surface (server driver)
+python3 llamatuner.py model-UD.gguf --run --driver server \
+  --factor spec_n_max=2,3,4,5 --factor spec_p_min=0.0,0.1,0.2
+
+# gfx906 / ROCm environment knobs (the "10-30%")
+python3 llamatuner.py model.gguf --run \
   --env GGML_CUDA_FORCE_MMQ=0,1 --env GGML_CUDA_FORCE_CUBLAS=0,1
 ```
 
-Env-var factors are applied to each benchmark process (not the command line),
-and the winning values are prepended to the recommended `llama-server` command
-as an env prefix. Sweepable llama-bench factors currently include: `ngl`,
-`n_depth`, `threads`, `kv_type`, `ubatch`, `ncmoe`, `batch`, `nkvo`, `poll`.
-
-**Note:** MTP / speculative decoding is *not* reachable from llama-bench (it has
-no draft/spec support), so it can't be swept here — see the server-benchmark
-roadmap item.
+**Notes.** MTP/spec and concurrency knobs need `--driver server` (llama-bench can't
+do them). Keep the number of levels-per-factor uniform where you can — mixing 2- and
+5-level factors forces a much larger array. `--iterate` refines numeric knobs on a
+finer grid and keeps the top levels of categorical ones.
 
 ---
 
@@ -343,9 +371,6 @@ python3 llamatuner.py model-UD.gguf --run --driver server \
 
 ## Roadmap / ideas
 
-- **Flash-attn as an outer block** — run the array twice (`-fa 0` / `-fa 1`) to
-  quantify flash-attention's effect directly, mindful that quantized KV requires
-  `-fa 1`.
 - **Morris/Sobol pre-screen** — the vendored `robust` suite ships `morris` and `sobol`
   binaries. Use Morris to screen which factors matter (μ\* importance, σ interaction
   flag) before committing to the full Taguchi bench, and Sobol for variance/interaction
