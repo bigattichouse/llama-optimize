@@ -257,6 +257,8 @@ python3 llamatuner.py MODEL.gguf [options]
 
   --run              actually execute the sweep (default: plan/dry-run, no GPU)
   --profile P        workload profile: single | agents | multi (default: single)
+  --thinking         tune for reasoning workloads (long decode, n_gen~2048);
+                     default is non-thinking / short answers
   --quick            fast screen: 1 rep/config (noisier, ~1/3 the time)
   --full             thorough: 5 reps/config (steadier, slower)
   --driver bench|server  benchmark driver (default: from profile). 'server'
@@ -295,7 +297,7 @@ python3 llamatuner.py MODEL.gguf [options]
   --server-start-timeout SECS  give up on a config if llama-server doesn't load
                      in this long (default: 180; also fails fast if it dies)
   --results-dir DIR  directory for all output (default: results/, gitignored)
-  --results NAME     results CSV name inside --results-dir (default: results.csv)
+  --results NAME     results CSV name inside --results-dir (default: <model>.csv)
   --resume           skip runs already in --results (rows save incrementally,
                      so an interrupted sweep can be resumed)
   --retry-crashed    on resume, also retry configs that were started but never

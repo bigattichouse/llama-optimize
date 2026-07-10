@@ -1102,6 +1102,67 @@ def refine_factors(cfg: Config, rows: list[dict]) -> dict:
     return new
 
 
+def _nice_ticks(vmax: float, n: int = 4) -> list:
+    import math
+    if vmax <= 0:
+        return [0]
+    step = vmax / n
+    mag = 10 ** math.floor(math.log10(step))
+    for m in (1, 2, 2.5, 5, 10):
+        if step <= m * mag:
+            step = m * mag
+            break
+    k = int(vmax / step) + 1
+    return [step * i for i in range(k + 1)]
+
+
+def _svg_pareto(rows: list[dict]) -> str:
+    """Inline SVG: effective t/s (y) vs context (x), all OK runs as faint dots,
+    the Pareto frontier as a highlighted line. Theme-neutral colors."""
+    ok = [r for r in rows if r["status"] == "OK" and score_of(r) > 0]
+    if len(ok) < 2:
+        return ""
+    pts = [(int(r["n_depth"]), score_of(r)) for r in ok]
+    front = [(int(r["n_depth"]), score_of(r)) for r in pareto_frontier(rows)]
+    W, H, ml, mr, mt, mb = 680, 340, 62, 16, 14, 46
+    xmax = max((x for x, _ in pts), default=1) or 1
+    ymax = (max((y for _, y in pts), default=1) or 1) * 1.08
+
+    def sx(x):
+        return ml + (x / xmax) * (W - ml - mr)
+
+    def sy(y):
+        return H - mb - (y / ymax) * (H - mt - mb)
+
+    g = []
+    for x in _nice_ticks(xmax):
+        gx = sx(x)
+        g.append(f"<line x1='{gx:.0f}' y1='{mt}' x2='{gx:.0f}' y2='{H - mb}' class='grid'/>")
+        g.append(f"<text x='{gx:.0f}' y='{H - mb + 16}' class='ax xt'>{int(x)}</text>")
+    for y in _nice_ticks(ymax):
+        gy = sy(y)
+        g.append(f"<line x1='{ml}' y1='{gy:.0f}' x2='{W - mr}' y2='{gy:.0f}' class='grid'/>")
+        g.append(f"<text x='{ml - 6}' y='{gy + 4:.0f}' class='ax yt'>{y:.0f}</text>")
+    dots = "".join(f"<circle cx='{sx(x):.1f}' cy='{sy(y):.1f}' r='3' class='dot'/>"
+                   for x, y in pts)
+    poly = " ".join(f"{sx(x):.1f},{sy(y):.1f}" for x, y in front)
+    fdots = "".join(f"<circle cx='{sx(x):.1f}' cy='{sy(y):.1f}' r='4' class='fdot'/>"
+                    for x, y in front)
+    cy = (mt + H - mb) / 2
+    return (
+        f"<svg viewBox='0 0 {W} {H}' class='chart' role='img' "
+        f"aria-label='effective throughput versus context'>"
+        "<style>.chart .grid{stroke:#8883} .chart .ax{fill:#888;font:11px system-ui}"
+        ".chart .xt{text-anchor:middle} .chart .yt{text-anchor:end}"
+        ".chart .dot{fill:#8887} .chart .fline{fill:none;stroke:#2ca88f;stroke-width:2.5}"
+        ".chart .fdot{fill:#2ca88f} .chart .albl{fill:#888;font:12px system-ui;"
+        "text-anchor:middle}</style>"
+        f"{''.join(g)}<polyline points='{poly}' class='fline'/>{dots}{fdots}"
+        f"<text x='{(ml + W - mr) / 2:.0f}' y='{H - 6}' class='albl'>context (tokens)</text>"
+        f"<text x='16' y='{cy:.0f}' class='albl' transform='rotate(-90 16 {cy:.0f})'>"
+        "effective t/s</text></svg>")
+
+
 def write_html_report(cfg: Config, rows: list[dict], path: Path):
     import html as _html
 
@@ -1195,6 +1256,7 @@ h2{{margin:26px 0 12px;font-size:16px;border-bottom:1px solid #8883;padding-bott
 table{{border-collapse:collapse;width:100%;font-size:13px}}
 th,td{{text-align:left;padding:4px 8px;border-bottom:1px solid #8882;font-variant-numeric:tabular-nums}}
 th{{color:#888;font-weight:600}} tr.bad{{opacity:.5}}
+.chart{{max-width:100%;height:auto;display:block;margin:6px 0 18px}}
 </style>
 <h1>llamatune report</h1>
 <div class=meta>{meta}<br>objective: effective t/s for a {esc(cfg.profile)} request
@@ -1202,6 +1264,7 @@ th{{color:#888;font-weight:600}} tr.bad{{opacity:.5}}
 <div class=cards>{card('Best', best)}{card(f'Balanced (≥{cfg.ctx_floor})', balanced)}{card('Longest context', longest)}</div>
 <h2>What matters (main effects, by impact)</h2>{''.join(fx_html)}
 <h2>Pareto frontier (context vs effective t/s)</h2>
+{_svg_pareto(rows)}
 <table><tr><th>context</th><th>eff t/s</th><th>tg</th><th>ngl</th><th>kv</th><th>ubatch</th></tr>{par_rows}</table>
 <h2>All runs</h2><table><tr>{head}</tr>{body}</table>
 """
@@ -1426,7 +1489,8 @@ def build_child_argv(args, cfg: Config, factors: dict, results_path: Path,
             "--spec-draft-n-max", str(cfg.spec_draft_n_max),
             "--llama-bench", str(cfg.llama_bench),
             "--llama-server", str(cfg.llama_server),
-            "--results", str(results_path)]
+            # results_path already includes the dir; make the child's join a no-op
+            "--results-dir", ".", "--results", str(results_path)]
     if args.no_mtp:
         argv.append("--no-mtp")
     if args.no_shuffle:
@@ -1654,6 +1718,10 @@ def main():
                     help="workload profile: single (interactive), agents "
                          "(big-context tool use), multi (concurrent serving); "
                          "sets request shape + objective. default: single")
+    ap.add_argument("--thinking", action="store_true",
+                    help="tune for a reasoning/thinking workload — long generations "
+                         "(decode-heavy). Sets n_gen to a reasoning length (~2048); "
+                         "default (no flag) is non-thinking / short answers")
     ap.add_argument("--driver", choices=["bench", "server"], default=None,
                     help="benchmark driver (default: from profile). 'server' "
                          "measures real generation incl. MTP and concurrency")
@@ -1711,9 +1779,9 @@ def main():
                          "giving up on a config (default 180)")
     ap.add_argument("--results-dir", type=Path, default=Path("results"),
                     help="directory for all output (default: results/)")
-    ap.add_argument("--results", type=Path, default=Path("results.csv"),
-                    help="results CSV name, placed in --results-dir (the journal, "
-                         "HTML, and per-pass files land beside it)")
+    ap.add_argument("--results", type=Path, default=None,
+                    help="results CSV name, in --results-dir (default: the model's "
+                         "name, e.g. <model>.csv; journal/HTML/pass files land beside)")
     ap.add_argument("--resume", action="store_true",
                     help="skip configs already present in --results (rows are "
                          "saved incrementally, so an interrupted sweep resumes)")
@@ -1751,7 +1819,9 @@ def main():
     if not args.model.exists():
         ap.error(f"model not found: {args.model}")
 
-    # place relative output names inside --results-dir; absolute paths are honored
+    # default results name from the model; place relative names in --results-dir
+    if args.results is None:
+        args.results = Path(f"{args.model.stem}.csv")
     if not args.results.is_absolute():
         args.results = args.results_dir / args.results
     if args.html is not None and not args.html.is_absolute():
@@ -1781,7 +1851,9 @@ def main():
     # resolve request shape from the profile, allowing explicit overrides
     prof = PROFILES[args.profile]
     n_prompt = args.n_prompt if args.n_prompt is not None else prof["n_prompt"]
-    n_gen = args.n_gen if args.n_gen is not None else prof["n_gen"]
+    # thinking = long reasoning generation (decode-heavy); non-thinking = short
+    n_gen = (args.n_gen if args.n_gen is not None
+             else 2048 if args.thinking else prof["n_gen"])
     ctx_floor = args.ctx_floor if args.ctx_floor is not None else prof["ctx_floor"]
     driver = args.driver if args.driver is not None else prof["driver"]
     parallel = args.parallel if args.parallel is not None else prof.get("parallel", 1)
