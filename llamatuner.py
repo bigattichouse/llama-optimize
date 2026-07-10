@@ -678,12 +678,12 @@ def _realistic_prompt(n_tokens: int) -> str:
     return (_CORPUS * reps)[:approx_chars]
 
 
-def _completion(port: int, prompt, n_gen: int, timeout: int) -> dict:
+def _completion(port: int, prompt, n_gen: int, timeout: int, cache: bool = False) -> dict:
     body = json.dumps({
         "prompt": prompt,
         "n_predict": n_gen,
         "temperature": 0,
-        "cache_prompt": False,
+        "cache_prompt": cache,
         "timings_per_token": False,
     }).encode()
     req = urllib.request.Request(
@@ -693,12 +693,12 @@ def _completion(port: int, prompt, n_gen: int, timeout: int) -> dict:
         return json.loads(r.read())
 
 
-def _measure_round(port: int, prompt, n_gen: int, par: int, timeout: int):
+def _measure_round(port: int, prompt, n_gen: int, par: int, timeout: int, cache=False):
     """One round of `par` concurrent completions; returns (responses, wall_s)."""
     with ThreadPoolExecutor(max_workers=par) as ex:
         w0 = time.time()
-        res = list(ex.map(lambda _: _completion(port, prompt, n_gen, timeout),
-                          range(par)))
+        res = list(ex.map(
+            lambda _: _completion(port, prompt, n_gen, timeout, cache), range(par)))
         return res, time.time() - w0
 
 
@@ -727,19 +727,28 @@ class ServerSession:
 
     def measure(self, prompt_len, n_gen, par, reps, timeout):
         prompt = _realistic_prompt(prompt_len)
+        if par == 1:
+            # Single stream: prefill once (warm request → real pp + primes the KV
+            # cache), then reuse the cached prompt so each rep measures pure decode
+            # (tg) without re-prefilling — much faster at high context, and a
+            # cleaner decode number.
+            warm = _completion(self.port, prompt, n_gen, timeout, cache=True)
+            pp = warm.get("timings", {}).get("prompt_per_second", 0.0) or 0.0
+            tps = []
+            for _ in range(max(1, reps)):
+                r = _completion(self.port, prompt, n_gen, timeout, cache=True)
+                tps.append(r.get("timings", {}).get("predicted_per_second", 0.0) or 0.0)
+            return pp, sum(tps) / len(tps)
+        # Concurrency: realistic serving — every request prefills; aggregate over
+        # the streams. Warmup once, then average per-round throughput over reps.
         _measure_round(self.port, prompt, n_gen, par, timeout)  # warmup, discard
         pps, tps = [], []
         for _ in range(max(1, reps)):
             res, wall = _measure_round(self.port, prompt, n_gen, par, timeout)
-            if par == 1:
-                tm = res[0].get("timings", {})
-                pps.append(tm.get("prompt_per_second", 0.0) or 0.0)
-                tps.append(tm.get("predicted_per_second", 0.0) or 0.0)
-            else:
-                tg_tok = sum(r.get("timings", {}).get("predicted_n", 0) for r in res)
-                pp_tok = sum(r.get("timings", {}).get("prompt_n", 0) for r in res)
-                tps.append(tg_tok / wall if wall > 0 else 0.0)
-                pps.append(pp_tok / wall if wall > 0 else 0.0)
+            tg_tok = sum(r.get("timings", {}).get("predicted_n", 0) for r in res)
+            pp_tok = sum(r.get("timings", {}).get("prompt_n", 0) for r in res)
+            tps.append(tg_tok / wall if wall > 0 else 0.0)
+            pps.append(pp_tok / wall if wall > 0 else 0.0)
         return sum(pps) / len(pps), sum(tps) / len(tps)
 
     def close(self):
