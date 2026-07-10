@@ -101,8 +101,8 @@ def find_taguchi_binding() -> Path:
     if not hits:
         raise SystemExit(
             f"taguchi python binding not found under {SUBMODULE_DIR}.\n"
-            "Run:  git submodule update --init  &&  make -C taguchi/<...>  "
-            "(build libtaguchi.so)."
+            f"Run:  git submodule update --init  &&  make -C {SUBMODULE_DIR}\n"
+            "(builds libtaguchi.so + the morris binary; see the README's Setup section)."
         )
     return hits[0].parents[1]  # .../bindings/python
 
