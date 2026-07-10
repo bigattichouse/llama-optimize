@@ -268,6 +268,8 @@ python3 llamatuner.py MODEL.gguf [options]
   --no-probe         skip the max-context probe (runs by default: binary-searches
                      the physical context ceiling for the furthest-reaching config,
                      then prints a ready command at ~90% of it)
+  --ctx-scan         probe the ceiling FIRST, then set the n_depth axis to fractions
+                     of it (0, ¼, ½, ¾, 0.9×) so the Pareto spans your full range
   --screen [R]       Morris pre-screen (R trajectories, default 6): rank knobs by
                      importance, drop the negligible ones, then sweep the rest
   --iterate N        run N auto-refining passes (screen -> refine -> ...): settle

@@ -1727,6 +1727,10 @@ def main():
                     help="Morris pre-screen with R trajectories (default 6) to rank "
                          "knobs by importance and drop the negligible ones before the "
                          "sweep — cheap (~R*(k+1) runs). Great with many --factor knobs.")
+    ap.add_argument("--ctx-scan", action="store_true",
+                    help="probe the physical context ceiling FIRST, then set the "
+                         "n_depth axis to fractions of it (0, ¼, ½, ¾, 0.9×) so the "
+                         "sweep/Pareto span your full usable context range")
     args = ap.parse_args()
 
     if args.selftest:
@@ -1818,6 +1822,34 @@ def main():
         if dropped:
             print(f"KV quality floor --min-kv {args.min_kv}: dropping {dropped} "
                   f"(keeping {kept})")
+
+    # --ctx-scan: probe the physical ceiling first, then make the context axis
+    # fractions of it, so the sweep spans the full usable range on THIS hardware.
+    if args.ctx_scan and not os.environ.get("LLAMATUNE_CHILD"):
+        if not args.run:
+            ap.error("--ctx-scan needs --run")
+        needed = cfg.llama_server if cfg.driver == "server" else cfg.llama_bench
+        if not needed.exists():
+            ap.error(f"{needed.name} not found ({needed}); pass --llama-cpp")
+        # base config = full offload + most context-efficient allowed KV (lossiest
+        # allowed = smallest KV = furthest reach) + first level of the rest
+        base = {k: v[0] for k, v in cfg.factors.items()}
+        if "ngl" in cfg.factors:
+            base["ngl"] = max(cfg.factors["ngl"], key=lambda x: int(x))
+        if "kv_type" in cfg.factors:
+            base["kv_type"] = max(cfg.factors["kv_type"],
+                                  key=lambda k: KV_QUALITY.index(k) if k in KV_QUALITY else 0)
+        cap = cfg.hw.get("n_ctx_train") or 131072
+        print(f"### Context scan — probing the physical ceiling first "
+              f"(ngl={base.get('ngl')} kv={base.get('kv_type')}, cap={cap})...")
+        res = probe_max_context(cfg, base, args.timeout, cap)
+        if not res:
+            ap.error("--ctx-scan: base config failed to load even at depth 0")
+        ceiling = res[0]
+        depths = sorted({max(0, int(ceiling * fr) // 1024 * 1024)
+                         for fr in (0.0, 0.25, 0.5, 0.75, 0.9)})
+        cfg.factors["n_depth"] = [str(d) for d in depths]
+        print(f"physical ceiling ~{ceiling} tokens → n_depth axis: {depths}\n")
 
     # funnel stage 1: Morris pre-screen (reduces cfg.factors to the ones that
     # matter) before the Taguchi sweep / iterate. Runs in the parent, not children.
