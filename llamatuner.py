@@ -899,6 +899,51 @@ def factor_level_means(rows: list[dict], factor: str) -> dict:
     return means
 
 
+def refine_numeric(vals: list[int], best: int) -> list[str]:
+    """Finer grid of levels bracketing `best` (its neighbours in the current
+    grid), for the next refinement pass."""
+    vals = sorted(set(vals))
+    if len(vals) <= 1:
+        return [str(v) for v in vals] or [str(best)]
+    i = vals.index(best) if best in vals else min(range(len(vals)),
+                                                  key=lambda k: abs(vals[k] - best))
+    lo = vals[i - 1] if i > 0 else vals[i]
+    hi = vals[i + 1] if i < len(vals) - 1 else vals[i]
+    if lo == hi:
+        step = max(1, (vals[-1] - vals[0]) // len(vals))
+        lo, hi = max(0, best - step), best + step
+    return [str(x) for x in five_levels_span(lo, hi)]
+
+
+def refine_factors(cfg: Config, rows: list[dict]) -> dict:
+    """Produce the next pass's factor levels: settle low-impact factors at their
+    winning level, and refine high-impact factors onto a finer grid around their
+    best value (numeric) or their top levels (categorical)."""
+    ranges, bests = {}, {}
+    for name in cfg.factors:
+        means = factor_level_means(rows, name)
+        if not means:
+            ranges[name], bests[name] = 0.0, cfg.factors[name][0]
+            continue
+        bests[name] = max(means, key=means.get)
+        ranges[name] = max(means.values()) - min(means.values()) if len(means) > 1 else 0.0
+    max_range = max(ranges.values(), default=0.0) or 1.0
+
+    new = {}
+    for name, cur in cfg.factors.items():
+        rng, best = ranges[name], bests[name]
+        active = len(cur) > 1 and rng >= 0.25 * max_range
+        if not active:
+            new[name] = [str(best)]                       # settle at the winner
+        elif name == "kv_type" or name in cfg.env_factor_names:
+            means = factor_level_means(rows, name)         # categorical: keep top few
+            ranked = sorted(means, key=means.get, reverse=True)
+            new[name] = ranked[:3] if len(ranked) >= 3 else ranked
+        else:
+            new[name] = refine_numeric([int(x) for x in cur], int(best))  # numeric grid
+    return new
+
+
 def write_html_report(cfg: Config, rows: list[dict], path: Path):
     import html as _html
 
@@ -1151,11 +1196,111 @@ def selftest() -> bool:
         # a fixed (1-level) factor among 3-level ones still picks a 3-level array
         assert choose_array({"t": ["8"], "a": ["1", "2", "3"],
                              "b": ["1", "2", "3"]}) == "L9"
+
+        # refinement: settle the flat factor, refine the high-impact one
+        assert refine_numeric([20, 40, 60], 60) == ["40", "45", "50", "55", "60"]
+        cfg_r = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
+                       ctx_floor=8192)
+        cfg_r.factors = {"ngl": ["20", "40", "60"], "kv_type": ["f16", "q8_0"]}
+        rr = [{"status": "OK", "ngl": a, "kv_type": k, "eff_tps": e} for a, k, e in
+              [("20", "f16", 10.), ("40", "q8_0", 50.), ("60", "f16", 90.),
+               ("20", "q8_0", 11.), ("60", "q8_0", 89.), ("40", "f16", 49.)]]
+        ref = refine_factors(cfg_r, rr)
+        assert ref["kv_type"] == ["q8_0"]          # flat factor settled at winner
+        assert ref["ngl"] == ["40", "45", "50", "55", "60"]  # refined near best (60)
     except AssertionError as e:
         print(f"selftest FAILED: {e}")
         return False
     print("selftest: all checks passed")
     return True
+
+
+# ---------------------------------------------------------------------------
+# Iterative refinement: run N passes, each a subprocess of the single-pass tool,
+# refining the factor set between passes. Keeps the tested execution path intact.
+# ---------------------------------------------------------------------------
+def load_results_csv(path: Path, factors: dict) -> list[dict]:
+    rows = []
+    if not path.exists():
+        return rows
+    with open(path, newline="") as fh:
+        for r in csv.DictReader(fh):
+            for c in ("pp_tps", "tg_tps", "eff_tps", "secs"):
+                try:
+                    r[c] = float(r[c])
+                except (KeyError, ValueError, TypeError):
+                    r[c] = 0.0
+            rows.append(r)
+    return rows
+
+
+def build_child_argv(args, cfg: Config, factors: dict, results_path: Path,
+                     final: bool) -> list[str]:
+    """One pass's command line for the single-pass tool (explicit everything so
+    the child reproduces the resolved config)."""
+    argv = [str(args.model), "--run",
+            "--driver", cfg.driver, "--profile", args.profile, "--array", "auto",
+            "--reps", str(cfg.reps), "--n-prompt", str(cfg.n_prompt),
+            "--n-gen", str(cfg.n_gen), "--ctx-floor", str(cfg.ctx_floor),
+            "--parallel", str(cfg.parallel), "--timeout", str(args.timeout),
+            "--cooldown", str(args.cooldown),
+            "--spec-draft-n-max", str(cfg.spec_draft_n_max),
+            "--llama-bench", str(cfg.llama_bench),
+            "--llama-server", str(cfg.llama_server),
+            "--results", str(results_path)]
+    if args.no_mtp:
+        argv.append("--no-mtp")
+    if args.no_shuffle:
+        argv.append("--no-shuffle")
+    if args.seed is not None:
+        argv += ["--seed", str(args.seed)]
+    if args.max_depth is not None:
+        argv += ["--max-depth", str(args.max_depth)]
+    for name, levels in factors.items():
+        flag = "--env" if name in cfg.env_factor_names else "--factor"
+        argv += [flag, f"{name}={','.join(str(x) for x in levels)}"]
+    if final:
+        if args.confirm or args.full:
+            argv.append("--confirm")
+        if args.html:
+            argv += ["--html", str(args.html)]
+        if args.probe_ctx:
+            argv.append("--probe-ctx")
+    return argv
+
+
+def run_iterations(args, cfg: Config):
+    base = args.results
+    suffix = base.suffix or ".csv"
+    factors = dict(cfg.factors)
+    for p in range(1, args.iterate + 1):
+        final = p == args.iterate
+        rp = base.with_name(f"{base.stem}.pass{p}{suffix}")
+        print("\n" + "#" * 70)
+        print(f"# PASS {p}/{args.iterate}  "
+              + ", ".join(f"{k}={'/'.join(str(x) for x in v)}"
+                          for k, v in factors.items()))
+        print("#" * 70, flush=True)
+        argv = build_child_argv(args, cfg, factors, rp, final)
+        env = {**os.environ, "LLAMATUNE_CHILD": "1"}
+        rc = subprocess.call([sys.executable, os.path.abspath(__file__), *argv], env=env)
+        if rc != 0:
+            print(f"\npass {p} exited with code {rc}; stopping iteration.")
+            return
+        if final:
+            break
+        rows = load_results_csv(rp, factors)
+        if not rows:
+            print("no results to refine from; stopping.")
+            return
+        cfg.factors = factors
+        refined = refine_factors(cfg, rows)
+        if refined == factors or all(len(v) == 1 for v in refined.values()):
+            print("\nfactors converged — stopping refinement early.")
+            return
+        factors = refined
+    print(f"\nAll passes complete. Final report + results: "
+          f"{base.with_name(f'{base.stem}.pass{args.iterate}{suffix}')}")
 
 
 # ---------------------------------------------------------------------------
@@ -1237,6 +1382,10 @@ def main():
     ap.add_argument("--cooldown", type=float, default=0,
                     help="seconds to pause between runs so the GPU can cool "
                          "(reduces thermal-throttling drift; default 0)")
+    ap.add_argument("--iterate", type=int, default=1, metavar="N",
+                    help="run N refinement passes: each settles the low-impact "
+                         "factors at their winner and refines the high-impact ones "
+                         "onto a finer grid (screen -> refine -> ...). default 1")
     args = ap.parse_args()
 
     if args.selftest:
@@ -1314,6 +1463,13 @@ def main():
             ap.error(f"--env expects NAME=v1,v2,... (got '{spec}')")
         cfg.factors[name] = levels
         cfg.env_factor_names.add(name)
+
+    # iterative refinement: orchestrate N passes as subprocesses of this tool
+    if args.iterate > 1 and not os.environ.get("LLAMATUNE_CHILD"):
+        if not args.run:
+            ap.error("--iterate needs --run")
+        run_iterations(args, cfg)
+        return
 
     # resolve the array now that the factor set is final
     if str(cfg.array).lower() == "auto":

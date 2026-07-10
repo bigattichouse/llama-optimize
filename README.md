@@ -156,8 +156,17 @@ Full per-run data is written to `results.csv`.
 
 ## Recommended workflow (staged / iterative refinement)
 
-Rather than one giant sweep, refine in passes — each pass spends its runs where the
-last one showed the most leverage:
+**Automatic:** let the tool do the staging for you —
+```bash
+python3 llamatuner.py model.gguf --run --iterate 3
+```
+`--iterate N` runs N passes: pass 1 screens coarsely, then each pass **settles the
+low-impact factors at their winner and refines the high-impact ones onto a finer
+grid** around their best value, converging on the optimum (stops early if factors
+converge). Each pass writes `results.passN.csv`; the final pass gets `--confirm`/
+`--html` if requested. This *is* the loop below, automated.
+
+**Manual** (if you want to steer each pass yourself) — the same idea, by hand:
 
 1. **Screen** — a quick coarse sweep to rank the knobs:
    ```bash
@@ -227,6 +236,8 @@ python3 llamatuner.py MODEL.gguf [options]
   --ctx-floor N      minimum usable context for BALANCED (default: from profile)
   --probe-ctx        after the sweep, binary-search the largest context that
                      loads for the fastest config (needs --run)
+  --iterate N        run N auto-refining passes (screen -> refine -> ...): settle
+                     low-impact factors, refine high-impact ones on a finer grid
   --confirm          run the predicted-optimal config to verify the additive
                      model (predicted vs actual; implied by --full)
   --html PATH        also write a visual HTML report (Pareto + main effects)
