@@ -9,6 +9,7 @@ venv/
 results.csv
 *.results.csv
 *.html
+*.journal
 
 # Models (never commit multi-GB GGUFs)
 *.gguf

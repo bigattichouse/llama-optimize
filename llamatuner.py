@@ -148,19 +148,29 @@ def detect_physical_cores() -> int:
 
 
 def detect_vram_mib() -> int | None:
-    """Best-effort VRAM total in MiB via rocm-smi; None if unavailable."""
-    for cmd in (["rocm-smi", "--showmeminfo", "vram", "--json"],):
-        try:
-            out = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-            if out.returncode != 0:
-                continue
+    """Best-effort total VRAM in MiB. Tries AMD (rocm-smi) then NVIDIA
+    (nvidia-smi); None if neither is available."""
+    # AMD / ROCm
+    try:
+        out = subprocess.run(["rocm-smi", "--showmeminfo", "vram", "--json"],
+                             capture_output=True, text=True, timeout=15)
+        if out.returncode == 0:
             data = json.loads(out.stdout)
             for card in data.values():
                 for k, v in card.items():
                     if "vram" in k.lower() and "total" in k.lower():
                         return int(v) // (1024 * 1024)
-        except (OSError, ValueError, json.JSONDecodeError):
-            continue
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+    # NVIDIA / CUDA
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=15)
+        if out.returncode == 0 and out.stdout.strip():
+            return int(float(out.stdout.strip().splitlines()[0]))  # already MiB
+    except (OSError, ValueError):
+        pass
     return None
 
 
@@ -472,6 +482,9 @@ FACTORS = {
     "threads_batch": {"bench": None, "server": ("-tb",), "kind": "num", "server_only": True},
     "poll":         {"bench": ("--poll",), "server": ("--poll",), "kind": "num"},
     "numa":         {"bench": ("--numa",), "server": ("--numa",), "kind": "cat"},
+    "cpu_mask":     {"bench": ("-C",), "server": ("-C",), "kind": "cat"},        # hex affinity mask
+    "cpu_strict":   {"bench": ("--cpu-strict",), "server": ("--cpu-strict",), "kind": "cat"},  # 0/1
+    "cpu_range":    {"bench": None, "server": ("-Cr",), "kind": "cat", "server_only": True},  # lo-hi
     # --- attention ---
     "fa":           {"bench": ("-fa",), "server": ("-fa",), "kind": "cat"},
     # --- context (request-time) ---
@@ -818,6 +831,45 @@ class ServerSession:
 def load_key(cfg: Config, f: dict):
     """Server launch identity: every factor except the request-time n_depth."""
     return tuple((k, f.get(k)) for k in cfg.factors if k != "n_depth")
+
+
+def load_key_str(cfg: Config, f: dict) -> str:
+    return "|".join(f"{k}={v}" for k, v in load_key(cfg, f))
+
+
+# ---------------------------------------------------------------------------
+# Crash journal: a config that hard-hangs or reboots the machine writes no
+# result. We record "about to try X" and fsync it to disk BEFORE launching, so
+# on restart a started-but-never-finished config is a suspected killer and is
+# skipped instead of retried (which would reboot again). Two risk phases:
+# "load" (server model load into VRAM, per group) and "run" (a measurement).
+# ---------------------------------------------------------------------------
+def journal_write(jh, *fields):
+    jh.write("\t".join(str(x) for x in fields) + "\n")
+    jh.flush()
+    os.fsync(jh.fileno())  # durable before the risky operation begins
+
+
+def read_journal(path: Path):
+    """Return (tried_load{key:cfg}, ok_load{keys}, tried_run{run_id:cfg})."""
+    tried_load, ok_load, tried_run = {}, set(), {}
+    if not path.exists():
+        return tried_load, ok_load, tried_run
+    for line in path.read_text().splitlines():
+        p = line.split("\t")
+        if len(p) >= 3 and p[0] == "TRY" and p[1] == "load":
+            try:
+                tried_load[p[2]] = json.loads(p[3]) if len(p) > 3 else {}
+            except json.JSONDecodeError:
+                tried_load[p[2]] = {}
+        elif len(p) >= 3 and p[0] == "OK" and p[1] == "load":
+            ok_load.add(p[2])
+        elif len(p) >= 3 and p[0] == "TRY" and p[1] == "run":
+            try:
+                tried_run[p[2]] = json.loads(p[3]) if len(p) > 3 else {}
+            except json.JSONDecodeError:
+                tried_run[p[2]] = {}
+    return tried_load, ok_load, tried_run
 
 
 def measure_in_session(cfg: Config, f: dict, session, timeout: int) -> dict:
@@ -1440,6 +1492,9 @@ def main():
     ap.add_argument("--resume", action="store_true",
                     help="skip configs already present in --results (rows are "
                          "saved incrementally, so an interrupted sweep resumes)")
+    ap.add_argument("--retry-crashed", action="store_true",
+                    help="on resume, also retry configs that were started but never "
+                         "finished (suspected machine crash/hang); default skips them")
     ap.add_argument("--html", type=Path, default=None,
                     help="also write a visual HTML report (Pareto + main effects)")
     ap.add_argument("--no-shuffle", action="store_true",
@@ -1635,6 +1690,34 @@ def main():
         writer.writeheader()
         fh.flush()
 
+    # Crash journal (see helpers): configs started but never finished on a prior
+    # run likely hung/rebooted the machine — mark CRASH and skip, don't retry.
+    journal_path = Path(str(args.results) + ".journal")
+    if args.resume and not args.retry_crashed:
+        tried_load, ok_load, tried_run = read_journal(journal_path)
+        crashed_loads = set(tried_load) - ok_load
+        crashed = {str(rid): fac for rid, fac in tried_run.items()
+                   if str(rid) not in done}
+        for run in runs:                       # runs whose server load crashed
+            rid = str(run.get("run_id"))
+            if rid not in done and load_key_str(cfg, run["factors"]) in crashed_loads:
+                crashed.setdefault(rid, run["factors"])
+        for rid, fac in crashed.items():
+            crow = {"run_id": rid, **{k: fac.get(k, "") for k in cfg.factors},
+                    "pp_tps": 0.0, "tg_tps": 0.0, "eff_tps": 0.0,
+                    "status": "CRASH", "secs": 0.0}
+            rows.append(crow)
+            writer.writerow(crow)
+            done.add(rid)
+        fh.flush()
+        if crashed:
+            ids = sorted(crashed, key=lambda x: (len(x), x))
+            print(f"⚠  {len(crashed)} config(s) were started but never finished "
+                  "on a prior run — suspected machine crash/hang.")
+            print(f"   Marked CRASH and NOT retrying: runs {ids}")
+            print("   (use --retry-crashed to attempt them again once addressed)")
+    journal = open(journal_path, "w" if fresh else "a")
+
     # Execution plan. The server driver groups configs that share load-time
     # params (only the request — prompt length via n_depth — differs) so one
     # server serves the whole group. The bench driver runs each config solo.
@@ -1679,9 +1762,13 @@ def main():
                     n_ctx *= par
                 lp = (f"server launch: ngl={launch['ngl']} kv={launch['kv_type']} "
                       f"ub={launch['ubatch']} ctx={n_ctx}")
+                lk = load_key_str(cfg, launch)
+                journal_write(journal, "TRY", "load", lk, json.dumps(launch))
                 session = with_ticker(
                     lp, args.timeout,
                     lambda lf=launch, nc=n_ctx: ServerSession(cfg, lf, nc, args.timeout))
+                if getattr(session, "ok", False):
+                    journal_write(journal, "OK", "load", lk)  # load survived
             try:
                 for run in group:
                     i += 1
@@ -1695,6 +1782,7 @@ def main():
                               f"{f['ngl']}/{nl} layers on GPU, {f['threads']} threads, "
                               f"{f['kv_type']} KV cache, {f['n_depth']}-token context, "
                               f"ubatch {f['ubatch']}")
+                    journal_write(journal, "TRY", "run", rid, json.dumps(f))  # durable
                     if cfg.driver == "server":
                         res = with_ticker(
                             prefix, args.timeout,
@@ -1722,6 +1810,7 @@ def main():
                     session.close()
     finally:
         fh.close()
+        journal.close()
     print(f"\nwrote {args.results}")
 
     report(cfg, rows)

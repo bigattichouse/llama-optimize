@@ -101,7 +101,9 @@ The tool inspects the box and the model so you don't hand-tune the factor levels
 - **Physical / logical cores** — unique `(physical id, core id)` pairs from
   `/proc/cpuinfo` (fallback: `logical / 2`). Thread levels bracket the physical-core
   count, where llama.cpp throughput usually peaks.
-- **VRAM** — via `rocm-smi` (best-effort; informational).
+- **VRAM** — via `rocm-smi` (AMD) or `nvidia-smi` (NVIDIA); best-effort,
+  informational. Everything else is vendor-agnostic — the tool just drives
+  `llama-bench`/`llama-server`, so it works on ROCm, CUDA, or Metal builds alike.
 - **Model layer count** — a minimal, dependency-free GGUF metadata reader parses
   `<arch>.block_count` from the header (no tensors loaded), so `-ngl`'s top level is
   the model's real layer count.
@@ -253,6 +255,8 @@ python3 llamatuner.py MODEL.gguf [options]
   --results PATH     results CSV output (default: results.csv)
   --resume           skip runs already in --results (rows save incrementally,
                      so an interrupted sweep can be resumed)
+  --retry-crashed    on resume, also retry configs that were started but never
+                     finished (suspected crash/hang); default skips them
   --no-shuffle       run in array order (default: randomized, see below)
   --seed N           seed the randomized order (reproducibility)
   --cooldown SECS    pause between runs so the GPU can cool (thermal drift)
@@ -261,6 +265,16 @@ python3 llamatuner.py MODEL.gguf [options]
 
 Results are written **incrementally** (one row per run, flushed), so a crash or
 timeout never loses completed runs — rerun with `--resume` to finish the rest.
+
+**Crash-safe (reboot protection).** Some configs can hard-hang or spontaneously
+reboot the machine (driver faults, OOM at the kernel level, flaky GPUs). Before
+each run — and before each server model-load — the tool writes a durable,
+`fsync`-ed record to `<results>.journal`. On `--resume`, any config that was
+*started but never produced a result* is treated as the suspected culprit,
+recorded as `CRASH`, and **skipped instead of retried** — so a bad setting can't
+put you in a reboot loop. Use `--retry-crashed` to attempt those again once you've
+addressed the cause. (Server *load-time* crashes blacklist the whole shared-launch
+group, since the fault is in the launch config, not one request.)
 
 > **Note on run time.** Deep-context configs at low `-ngl` prefill their KV cache
 > on the CPU, which is slow (tens of seconds to minutes per run on a big model).
@@ -291,6 +305,9 @@ registry in `llamatuner.py`.
 | `nkvo` | `-nkvo` | both | bool | opt-in | keep KV in RAM vs VRAM |
 | `poll` | `--poll` | both | num | opt-in | CPU polling level |
 | `numa` | `--numa` | both | cat | opt-in | NUMA optimization mode |
+| `cpu_mask` | `-C` | both | cat | opt-in | CPU affinity mask (hex, e.g. `0xFF`) |
+| `cpu_strict` | `--cpu-strict` | both | cat | opt-in | strict CPU placement (0/1) |
+| `cpu_range` | `-Cr` | server | cat | opt-in | CPU affinity range (`lo-hi`) |
 | `fa` | `-fa` | both | cat | opt-in² | flash attention on/off |
 | `ot` | `-ot` | both | cat | opt-in | per-tensor placement — the VRAM-fit lever (named patterns below) |
 | `threads_batch` | `-tb` | server | num | opt-in | CPU threads for prompt processing |
