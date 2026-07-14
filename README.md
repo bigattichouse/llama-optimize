@@ -381,8 +381,9 @@ python3 llama-optimize.py model.gguf --run --iterate 3
 `--iterate N` runs N passes: pass 1 screens coarsely, then each pass **settles the
 low-impact factors at their winner and refines the high-impact ones onto a finer
 grid** around their best value, converging on the optimum (stops early if factors
-converge). Each pass writes `results.passN.csv`; the final pass gets `--confirm`/
-`--html` if requested. This *is* the loop below, automated.
+converge). Each pass writes `results.passN.csv`; the final pass also runs
+**pick verification** (medians over re-measurements), the **max-context probe**,
+and `--confirm`/`--html` if requested. This *is* the loop below, automated.
 
 Every pass after the first also **merges all earlier passes' rows into its
 report, picks, and Pareto** (`--merge-results`, added automatically), so the
@@ -419,6 +420,12 @@ table still use only the current pass's balanced design.
    config directly and reports predicted-vs-actual — a small gap means the additive
    model held; a large gap means interactions (or thermal drift) dominate, so trust
    the Pareto pick. Add `--html report.html` for a visual report.
+
+4. **Revisit anytime, no GPU** — `--report-only` rebuilds the full report (and
+   `--html`) from the results CSVs, including the probed ceiling and verified
+   medians via their sidecars (`<results>.probe.json` / `.verify.json`); use
+   `--merge-results` for the other passes. `--diff old.csv new.csv` compares two
+   sweeps of the same factor space after a llama.cpp upgrade or quant swap.
 
 **Expanding the array vs. more runs.** More *levels* on the wide-window factors (a
 finer grid) is usually more informative than a bigger array. If you want raw
