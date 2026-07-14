@@ -1319,7 +1319,7 @@ def kv_downgrade_hint(r: dict) -> str | None:
             "headroom, at a small decode-speed cost.")
 
 
-def report(cfg: Config, rows: list[dict]):
+def report(cfg: Config, rows: list[dict], probe: dict | None = None):
     ok = [r for r in rows if r["status"] == "OK"]
     print("\n" + "=" * 70)
     print(f"RESULTS: {len(ok)}/{len(rows)} configs succeeded")
@@ -1373,6 +1373,22 @@ def report(cfg: Config, rows: list[dict]):
     show("FASTEST (max speed, usable context)", fastest)
     show(f"BALANCED (best with context >= {cfg.ctx_floor})", balanced)
     show("MAX CONTEXT", longest)
+
+    if probe:
+        r, depth, tps = probe["row"], probe["depth"], probe["tg_tps"]
+        kind = ("the model's native limit" if probe["at_cap"]
+                else "an OOM boundary")
+        print("\n### PROBED CEILING (largest -c that loads — beyond the "
+              "swept range)")
+        print(f"  ~{depth} tokens ({kind})"
+              + (f"  tg={tps:.1f} t/s spot-check there" if tps else "")
+              + f"  ngl={r['ngl']}  kv={r['kv_type']}  ub={r['ubatch']}")
+        print(f"  suggested llama-server command (-c {probe['safe_ctx']}, "
+              "~10% headroom under the ceiling):")
+        print("    " + server_command(cfg, r, probe["safe_ctx"]))
+        hint = kv_downgrade_hint(r)
+        if hint:
+            print("  " + hint)
 
     kind = "effective" if cfg.score == "eff" else "generation"
     print(f"\n### Pareto frontier (context vs {kind} t/s)")
@@ -1548,7 +1564,8 @@ def _svg_pareto(rows: list[dict], vram_total: float = 0,
         f"{ylabel}</text>{vaxis}</svg>")
 
 
-def write_html_report(cfg: Config, rows: list[dict], path: Path):
+def write_html_report(cfg: Config, rows: list[dict], path: Path,
+                      probe: dict | None = None):
     import html as _html
 
     def esc(x):
@@ -1573,6 +1590,23 @@ def write_html_report(cfg: Config, rows: list[dict], path: Path):
                 f"depth {esc(r['n_depth'])} · ngl {esc(r['ngl'])} · kv {esc(r['kv_type'])} · "
                 f"ub {esc(r['ubatch'])} · t {esc(r['threads'])}</div>"
                 f"<pre>{cmd}</pre>{tip}</div>")
+
+    probe_card = ""
+    if probe:
+        r = probe["row"]
+        cmd = esc(server_command(cfg, r, probe["safe_ctx"]))
+        kind = "model's native limit" if probe["at_cap"] else "OOM boundary"
+        tps = probe["tg_tps"]
+        probe_card = (
+            f"<div class=card><h3>Probed ceiling (beyond swept range)</h3>"
+            f"<div class=big>{probe['depth']:,} <span class=unit>tokens</span></div>"
+            f"<div class=muted>{kind}"
+            + (f" · tg {tps:.1f} t/s spot-check" if tps else "")
+            + f" · ngl {esc(r['ngl'])} · kv {esc(r['kv_type'])} · "
+            f"ub {esc(r['ubatch'])} · t {esc(r['threads'])}</div>"
+            f"<pre>{cmd}</pre>"
+            f"<div class=muted>largest context that loads (binary search); "
+            f"speed there is a single measurement, not swept</div></div>")
 
     # main-effects bars, factors ordered by range (impact) descending
     effects = []
@@ -1651,7 +1685,7 @@ th{{color:#888;font-weight:600}} tr.bad{{opacity:.5}}
 <div class=meta>{meta}<br>objective: {"effective t/s" if blend else
  "generation t/s (pp reported, not scored)"} for a {esc(cfg.profile)} request
  ({cfg.n_prompt} prompt + {cfg.n_gen} gen tokens) — {len(ok)}/{len(rows)} configs OK</div>
-<div class=cards>{card('Fastest (usable)', best)}{card(f'Balanced (≥{cfg.ctx_floor})', balanced)}{card('Max context', longest)}</div>
+<div class=cards>{card('Fastest (usable)', best)}{card(f'Balanced (≥{cfg.ctx_floor})', balanced)}{card('Max context', longest)}{probe_card}</div>
 <h2>What matters (main effects, by impact)</h2>{''.join(fx_html)}
 <h2>Pareto frontier (context vs {"effective" if blend else "generation"} t/s)</h2>
 {_svg_pareto(rows, cfg.hw.get("vram", 0) if cfg.measure_vram else 0,
@@ -1746,6 +1780,42 @@ def probe_max_context(cfg: Config, base_f: dict, timeout: int, cap: int,
         else:
             hi = mid
     return lo, best_tps
+
+
+def run_probe_stage(cfg: Config, all_rows: list[dict], timeout: int,
+                    thermal_baseline: float | None):
+    """Run the max-context probe from the deepest-reaching OK config and package
+    the result for the report: dict(row, depth, tg_tps, safe_ctx, at_cap) or
+    None. The probe searches BEYOND the swept depth grid (up to the model's
+    native context / --max-context), so its ceiling is an extrapolation the
+    sweep never benchmarked — the report labels it as such."""
+    ok = [r for r in all_rows if r["status"] == "OK"]
+    if not ok:
+        return None
+    # Probe the config that reaches FURTHEST (max measured depth, then
+    # fastest) — the memory-lightest good config — so this is the true
+    # physical ceiling, not the fastest config's (which may fit less).
+    base_row = max(ok, key=lambda r: (int(r["n_depth"]), score_of(r)))
+    cap = cfg.hw.get("n_ctx_train") or 131072
+    if cfg.max_depth:                          # --max-context caps the search
+        cap = min(cap, cfg.max_depth)
+    base = {k: base_row[k] for k in cfg.factors}
+    print(f"\n### Max-context probe  (config: ngl={base_row.get('ngl')} "
+          f"kv={base_row.get('kv_type')} ub={base_row.get('ubatch')}, "
+          f"cap={cap})")
+    res = probe_max_context(cfg, base, timeout, cap, thermal_baseline)
+    if not res:
+        print("  even depth 0 failed to load — check the config")
+        return None
+    depth, tps = res
+    print(f"  largest context that loads: ~{depth} tokens"
+          + (f"  (tg={tps:.1f} t/s there)" if tps else ""))
+    # Turn the ceiling into a usable command: run just under it so there's
+    # headroom for runtime allocation/fragmentation (living at the exact edge
+    # risks an OOM mid-session), rounded to a tidy size.
+    safe = max(4096, int(depth * 0.9) // 1024 * 1024)
+    return {"row": base_row, "depth": depth, "tg_tps": tps,
+            "safe_ctx": safe, "at_cap": depth >= cap}
 
 
 # ---------------------------------------------------------------------------
@@ -2145,6 +2215,56 @@ def merge_result_rows(cfg: Config, rows: list[dict],
               if folded else
               f"merge: no new rows from {mpath.name} (duplicates or unusable)")
     return rows + list(merged.values())
+
+
+def probe_sidecar(results: Path) -> Path:
+    """Where a sweep persists its max-context probe result (JSON) so
+    --report-only can re-show the PROBED CEILING section without a GPU."""
+    return Path(str(results) + ".probe.json")
+
+
+def report_from_results(cfg: Config, args, ap):
+    """--report-only: rebuild the terminal report (and --html) from a finished
+    sweep's results CSV — no GPU and no llama.cpp binaries. The factor columns
+    are whatever the CSV header carries beyond the measurement columns
+    (RESULT_COLS), so the picks/Pareto see exactly what the sweep recorded;
+    --merge-results folds in further CSVs (e.g. other --iterate passes). The
+    PROBED CEILING section appears if the sweep saved a probe sidecar
+    (<results>.probe.json); probing anew needs the GPU."""
+    path = args.results
+    if not path.exists():
+        ap.error(f"--report-only: results file not found: {path}")
+    rows = load_results_csv(path, {})
+    if not rows:
+        ap.error(f"--report-only: no rows in {path}")
+    names = [c for c in rows[0] if c not in RESULT_COLS]
+    if not names:
+        ap.error(f"--report-only: no factor columns in {path}")
+
+    def lvl_key(v):
+        try:
+            return (0, int(v), "")
+        except ValueError:
+            return (1, 0, v)
+
+    cfg.factors = {n: sorted({str(r.get(n, "")) for r in rows}, key=lvl_key)
+                   for n in names}
+    cfg.measure_vram = "vram_mib" in rows[0]
+    for r in rows:      # re-score under the CURRENT --score mode
+        r["eff_tps"] = objective_tps(cfg, r["pp_tps"], r["tg_tps"])
+    all_rows = merge_result_rows(cfg, rows, args.merge_results)
+    probe = None
+    pf = probe_sidecar(path)
+    if pf.exists():
+        try:
+            probe = json.loads(pf.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"(ignoring unreadable {pf.name}: {e})")
+    print(f"report-only: {len(rows)} row(s) from {path} (no GPU used)"
+          + ("" if probe else " — no probe sidecar, PROBED CEILING omitted"))
+    report(cfg, all_rows, probe)
+    if args.html:
+        write_html_report(cfg, all_rows, args.html, probe)
 
 
 def diff_results(old_path: Path, new_path: Path) -> dict | None:
@@ -2606,6 +2726,12 @@ def main():
                          "default: single")
     ap.add_argument("--quick", action="store_true",
                     help="fast screen: 1 rep per config (noisier, ~1/3 the time)")
+    ap.add_argument("--report-only", action="store_true",
+                    help="rebuild the report from an existing results CSV — no GPU, "
+                         "no llama.cpp: reads --results (default: the model's CSV in "
+                         "--results-dir), folds in --merge-results, honors --score "
+                         "and --html. PROBED CEILING is included when the sweep "
+                         "saved its probe result (<results>.probe.json).")
     ap.add_argument("--reps", type=int, default=None,
                     help="repetitions per config (default: 3, or --quick=1/--full=5)")
     ap.add_argument("--results", type=Path, default=None,
@@ -2675,7 +2801,12 @@ def main():
     if args.results is None:
         args.results = Path(f"{args.model.stem}.csv")
     if not args.results.is_absolute():
-        args.results = args.results_dir / args.results
+        prefixed = args.results_dir / args.results
+        # --report-only reads an existing file: a CWD-relative path that exists
+        # wins over the --results-dir prefix (users paste the path they see)
+        if not (args.report_only and args.results.exists()
+                and not prefixed.exists()):
+            args.results = prefixed
     if args.html is not None and not args.html.is_absolute():
         args.html = args.results_dir / args.html
     if args.run:  # ensure the output directory exists
@@ -2792,6 +2923,13 @@ def main():
         if dropped:
             print(f"KV quality floor --min-kv {args.min_kv}: dropping {dropped} "
                   f"(keeping {kept})")
+
+    # --report-only: rebuild the report from the results CSV and exit — no GPU
+    if args.report_only:
+        if args.run:
+            ap.error("--report-only doesn't run anything; drop --run")
+        report_from_results(cfg, args, ap)
+        return
 
     # Thermal baseline: capture the idle GPU temperature ONCE, before any GPU
     # work (--ctx-scan/--screen/pass 1 all heat the card), and thread it through
@@ -3108,11 +3246,20 @@ def main():
 
     all_rows = merge_result_rows(cfg, rows, args.merge_results)
 
-    report(cfg, all_rows)
+    # Stage-2 probe runs BEFORE the report so its ceiling appears alongside
+    # the picks (fixed context via --ctx-size: no ceiling search). The result
+    # is persisted next to the results CSV so --report-only can re-show it.
+    probe = None
+    if not args.no_probe and args.ctx_size is None:
+        probe = run_probe_stage(cfg, all_rows, args.timeout, thermal_baseline)
+        if probe:
+            probe_sidecar(args.results).write_text(json.dumps(probe, indent=1))
+
+    report(cfg, all_rows, probe)
     opt, predicted = taguchi_effects(cfg, exp, rows)
 
     if args.html:
-        write_html_report(cfg, all_rows, args.html)
+        write_html_report(cfg, all_rows, args.html, probe)
 
     if (args.confirm or args.full) and opt:
         # Run the predicted-optimal config directly to check the additive model
@@ -3138,35 +3285,6 @@ def main():
             verdict = ("additive model holds — trust the prediction" if err <= 15
                        else "LARGE gap: interactions likely — trust the Pareto pick")
             print(f"  prediction error: {err:.0f}%  → {verdict}")
-
-    if not args.no_probe and args.ctx_size is None:   # fixed context: no ceiling search
-        ok = [r for r in all_rows if r["status"] == "OK"]
-        if ok:
-            # Probe the config that reaches FURTHEST (max measured depth, then
-            # fastest) — the memory-lightest good config — so this is the true
-            # physical ceiling, not the fastest config's (which may fit less).
-            base_row = max(ok, key=lambda r: (int(r["n_depth"]), score_of(r)))
-            cap = cfg.hw.get("n_ctx_train") or 131072
-            if cfg.max_depth:                          # --max-context caps the search
-                cap = min(cap, cfg.max_depth)
-            base = {k: base_row[k] for k in cfg.factors}
-            print(f"\n### Max-context probe  (config: ngl={base_row.get('ngl')} "
-                  f"kv={base_row.get('kv_type')} ub={base_row.get('ubatch')}, "
-                  f"cap={cap})")
-            res = probe_max_context(cfg, base, args.timeout, cap, thermal_baseline)
-            if res:
-                depth, tps = res
-                print(f"  largest context that loads: ~{depth} tokens"
-                      + (f"  (tg={tps:.1f} t/s there)" if tps else ""))
-                # Turn the ceiling into a usable command: run just under it so
-                # there's headroom for runtime allocation/fragmentation (living at
-                # the exact edge risks an OOM mid-session), rounded to a tidy size.
-                safe = max(4096, int(depth * 0.9) // 1024 * 1024)
-                print(f"  → max-context command (-c {safe}, ~10% headroom under "
-                      f"the ceiling):")
-                print("    " + server_command(cfg, base_row, safe))
-            else:
-                print("  even depth 0 failed to load — check the config")
 
 
 if __name__ == "__main__":

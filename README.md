@@ -246,28 +246,78 @@ The tool inspects the box and the model so you don't hand-tune the factor levels
 
 ## Output
 
-```
-### FASTEST (max speed, usable context)
-  tg=… t/s  (pp=…)  depth=…  ngl=…  t=…  kv=…  ub=…
-  suggested llama-server command:
-    ./llama-server -m model.gguf -ngl … -t … -c … -ctk … -ctv … -ub … -b 2048 -fa 1
+The samples below are real (trimmed) output from a 3-pass sweep of a 31B Q6_K
+model, so you know what to expect from each section.
 
-### BALANCED (best with context >= …)
-  …
+**During the sweep** — one line per config as it finishes, with a running ETA:
+
+```
+[23/25] run 15: 58/60 layers on GPU, 5 threads, q8_0 KV cache, 65536-token context, ubatch 512 -> OK tg=7.4 t/s (pp=122.0) (125s)  [23/25 done, elapsed 1h41m, ETA ~8m49s]
+```
+
+**The three picks** — each with a copy-paste `llama-server` command, its `-c`
+sized to what the sweep actually verified for that config:
+
+```
+RESULTS: 72/72 configs succeeded
+
+### FASTEST (max speed, usable context)
+  tg=10.8 t/s  (pp=134.1)  depth=32768  ngl=60  t=6  kv=q8_0  ub=512
+  suggested llama-server command:
+    ./llama-server -m gemma-4-31B-it-UD-Q6_K_XL.gguf -c 33792 -fa 1 -ngl 60 \
+      -t 6 -ctk q8_0 -ctv q8_0 -ub 512 -nkvo --poll 50 -b 2048
+
+### BALANCED (best with context >= 8192)
+  tg=10.8 t/s  (pp=134.1)  depth=32768  ngl=60  t=6  kv=q8_0  ub=512
+  suggested llama-server command: …
 
 ### MAX CONTEXT
-  …
+  tg=7.4 t/s  (pp=122.0)  depth=65536  ngl=58  t=5  kv=q8_0  ub=512
+  suggested llama-server command: …
+```
 
+**Probed ceiling** — stage 2 binary-searches how large `-c` can go before the
+model fails to load. This deliberately goes *beyond* the swept depth grid, so
+the t/s there is a single spot-check, not a swept measurement:
+
+```
+### PROBED CEILING (largest -c that loads — beyond the swept range)
+  ~262144 tokens (the model's native limit)  tg=6.6 t/s spot-check there  ngl=58  kv=q8_0  ub=512
+  suggested llama-server command (-c 235520, ~10% headroom under the ceiling): …
+```
+
+**Pareto frontier** — the speed↔context trade-off curve: the configs where no
+other measured config is both deeper *and* faster:
+
+```
 ### Pareto frontier (context vs generation t/s)
-  depth=  4096  tg=…  ngl=…  kv=…  ub=…
-  depth= 12288  tg=…  …
+  depth= 32768  tg=  10.8 t/s  ngl= 60  kv=q8_0  ub= 512
+  depth= 49152  tg=   8.7 t/s  ngl= 60  kv=q8_0  ub= 512
+  depth= 65536  tg=   7.4 t/s  ngl= 58  kv=q8_0  ub= 512
+```
 
-### Taguchi main effects (generation t/s, higher = better)
-  <per-factor level means, ranked by impact>
-  Predicted-optimal levels: {…}
+**Taguchi main effects** — which knobs actually matter, ranked by impact (here
+tensor-offload dominates, `ngl` is worth ~1 t/s, threads barely matter):
 
-### Confirmation run (predicted-optimal config)     # with --confirm/--full
-  predicted tg: … t/s   measured tg: … t/s   prediction error: …%
+```
+Main Effects (sorted by range, descending):
+  ot                   range=  6.2910  means=[7.8980, 3.2560, 1.6070]
+  ngl                  range=  1.1230  means=[4.3730, 4.5460, 4.5780, 4.9240, 5.4950]
+  n_depth              range=  0.7410  means=[4.6590, 4.6410, 5.3010, 4.7540, 4.5600]
+  threads              range=  0.3680  means=[4.6150, 4.9830, 4.7200]
+
+Predicted-optimal levels: {'ngl': '60', 'n_depth': '32768', 'threads': '5', 'ot': 'none'}
+```
+
+**Confirmation run** (`--confirm`/`--full`) — re-measures the predicted-optimal
+config; a large gap means factor interactions or thermal drift, so trust the
+measured Pareto picks over the additive prediction:
+
+```
+### Confirmation run (predicted-optimal config)
+  predicted tg: 9.3 t/s
+  measured  tg: 7.7 t/s  (pp=109.6, status=OK)
+  prediction error: 17%  → LARGE gap: interactions likely — trust the Pareto pick
 ```
 
 The objective is **generation t/s** by default; with `--score eff` the reports
@@ -427,6 +477,10 @@ python3 llama-optimize.py MODEL.gguf [options]
   --parallel N       concurrent streams for the server driver
   --profile P        workload profile: single | agents | multi (default: single)
   --quick            fast screen: 1 rep/config (noisier, ~1/3 the time)
+  --report-only      rebuild the report (and --html) from an existing results
+                     CSV — no GPU, no llama.cpp. Reads --results, folds in
+                     --merge-results; PROBED CEILING is included when the sweep
+                     saved its probe result (<results>.probe.json)
   --reps N           repetitions per config (default: 3, or --quick=1/--full=5)
   --results NAME     results CSV name inside --results-dir (default: <model>.csv)
   --results-dir DIR  directory for all output (default: results/, gitignored)
