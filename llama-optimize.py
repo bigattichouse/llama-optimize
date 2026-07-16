@@ -544,6 +544,7 @@ class Config:
     n_gen: int = BENCH_N_GEN
     max_depth: int | None = None  # cap n_depth levels (memory/time budget)
     emit_mtp: bool = True         # add draft-mtp flags to server cmd if supported
+    ngram: bool = False           # enable ngram self-speculative decoding sweep
     spec_draft_n_max: int = 2     # --spec-draft-n-max for MTP
     profile: str = "single"       # workload profile (see PROFILES)
     driver: str = "bench"         # "bench" (llama-bench) or "server" (llama-server)
@@ -625,6 +626,31 @@ def build_factors(cfg: Config):
         factors["spec_n_min"] = ["1", "2"]
         factors["spec_p_min"] = ["0.0", "0.25", "0.5", "0.75", "0.9"]
         factors["spec_p_split"] = ["0.1", "0.3", "0.5"]
+    # ngram self-speculative decoding: when enabled on the server driver, sweep
+    # all ngram variants and their tunable parameters. ngram needs no draft
+    # model — it finds patterns in the token history — so it works with any model
+    # and complements MTP when both are active (the --spec-type values combine).
+    # --spec-draft-n-max is shared with MTP via spec_n_max; only add it if MTP
+    # didn't already.
+    if cfg.driver == "server" and cfg.ngram:
+        factors["ngram"] = ["none", "ngram-simple", "ngram-mod", "ngram-map-k",
+                            "ngram-map-k4v"]
+        if "spec_n_max" not in factors:
+            factors["spec_n_max"] = ["1", "2", "4", "8", "16"]
+        # ngram-simple / map-k / map-k4v shared structure
+        factors["ngram_simple_size_n"] = ["4", "8", "12", "16", "24"]
+        factors["ngram_simple_size_m"] = ["8", "16", "32", "48", "64"]
+        factors["ngram_simple_min_hits"] = ["1", "2", "3", "5"]
+        factors["ngram_map_k_size_n"] = ["4", "8", "12", "16", "24"]
+        factors["ngram_map_k_size_m"] = ["8", "16", "32", "48", "64"]
+        factors["ngram_map_k_min_hits"] = ["1", "2", "3", "5"]
+        factors["ngram_map_k4v_size_n"] = ["4", "8", "12", "16", "24"]
+        factors["ngram_map_k4v_size_m"] = ["8", "16", "32", "48", "64"]
+        factors["ngram_map_k4v_min_hits"] = ["1", "2", "3", "5"]
+        # ngram-mod params (different structure from the map variants)
+        factors["ngram_mod_n_match"] = ["8", "16", "24", "32", "48"]
+        factors["ngram_mod_n_min"] = ["16", "32", "48", "64", "96"]
+        factors["ngram_mod_n_max"] = ["32", "48", "64", "96", "128"]
     return factors
 
 
@@ -757,6 +783,26 @@ FACTORS = {
     "spec_n_min":   {"bench": None, "server": ("--spec-draft-n-min",), "kind": "num", "server_only": True},
     "spec_p_min":   {"bench": None, "server": ("--spec-draft-p-min",), "kind": "float", "server_only": True},
     "spec_p_split": {"bench": None, "server": ("--spec-draft-p-split",), "kind": "float", "server_only": True},
+    "ngram":             {"bench": None, "server": ("--spec-type",), "kind": "cat", "server_only": True,
+                          "translate": {"none": "", "ngram-simple": "ngram-simple", "ngram-mod": "ngram-mod",
+                                        "ngram-map-k": "ngram-map-k", "ngram-map-k4v": "ngram-map-k4v"}},
+    # NOTE: --spec-draft-n-max is shared with MTP via the existing `spec_n_max`
+    # factor. When ngram is active, build_factors() adds spec_n_max unless MTP
+    # already did — never two factors mapping to the same flag.
+    # ngram-simple / ngram-map-k / ngram-map-k4v shared-size params
+    "ngram_simple_size_n":   {"bench": None, "server": ("--spec-ngram-simple-size-n",), "kind": "num", "server_only": True},
+    "ngram_simple_size_m":   {"bench": None, "server": ("--spec-ngram-simple-size-m",), "kind": "num", "server_only": True},
+    "ngram_simple_min_hits": {"bench": None, "server": ("--spec-ngram-simple-min-hits",), "kind": "num", "server_only": True},
+    "ngram_map_k_size_n":    {"bench": None, "server": ("--spec-ngram-map-k-size-n",), "kind": "num", "server_only": True},
+    "ngram_map_k_size_m":    {"bench": None, "server": ("--spec-ngram-map-k-size-m",), "kind": "num", "server_only": True},
+    "ngram_map_k_min_hits":  {"bench": None, "server": ("--spec-ngram-map-k-min-hits",), "kind": "num", "server_only": True},
+    "ngram_map_k4v_size_n":  {"bench": None, "server": ("--spec-ngram-map-k4v-size-n",), "kind": "num", "server_only": True},
+    "ngram_map_k4v_size_m":  {"bench": None, "server": ("--spec-ngram-map-k4v-size-m",), "kind": "num", "server_only": True},
+    "ngram_map_k4v_min_hits":{"bench": None, "server": ("--spec-ngram-map-k4v-min-hits",), "kind": "num", "server_only": True},
+    # ngram-mod params
+    "ngram_mod_n_match":{"bench": None, "server": ("--spec-ngram-mod-n-match",), "kind": "num", "server_only": True},
+    "ngram_mod_n_min":  {"bench": None, "server": ("--spec-ngram-mod-n-min",), "kind": "num", "server_only": True},
+    "ngram_mod_n_max":  {"bench": None, "server": ("--spec-ngram-mod-n-max",), "kind": "num", "server_only": True},
     # --- concurrency (server only) ---
     "parallel":     {"bench": None, "server": ("--parallel",), "kind": "num", "server_only": True},
     # --- context extension / capability (server only) ---
@@ -832,6 +878,48 @@ def run_env(cfg: Config, f: dict) -> dict:
     return env
 
 
+
+
+def _merge_spec_type_parts(parts: list[str]) -> list[str]:
+    """Combine multiple --spec-type <value> entries in a string-parts list
+    into a single comma-separated --spec-type <v1,v2> entry. llama.cpp accepts
+    comma-separated spec types and the orthogonal array may emit one --spec-type
+    from the mtp factor and another from the ngram factor simultaneously."""
+    kept: list[str] = []
+    vals: list[str] = []
+    for p in parts:
+        if p.startswith("--spec-type "):
+            v = p.split(None, 1)[1].strip()
+            if v:
+                vals.append(v)
+        else:
+            kept.append(p)
+    if vals:
+        kept.append("--spec-type " + ",".join(vals))
+    return kept
+
+
+def _merge_spec_type_args(args: list[str]) -> list[str]:
+    """Combine multiple --spec-type / value flag-pairs in a flat arg list
+    into a single --spec-type / v1,v2 pair."""
+    result: list[str] = []
+    vals: list[str] = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--spec-type" and i + 1 < len(args):
+            v = args[i + 1]
+            if v:
+                vals.append(v)
+            i += 2
+        else:
+            result.append(args[i])
+            i += 1
+    if vals:
+        result.append("--spec-type")
+        result.append(",".join(vals))
+    return result
+
+
 def server_command(cfg: Config, f: dict, ctx: int) -> str:
     ub = int(f.get("ubatch", 512))
     parts = [f"-m {cfg.model.name}", f"-c {ctx}"]
@@ -854,6 +942,21 @@ def server_command(cfg: Config, f: dict, ctx: int) -> str:
             parts.append("--spec-type draft-mtp")
         if "spec_n_max" not in f:
             parts.append(f"--spec-draft-n-max {cfg.spec_draft_n_max}")
+    # ngram self-speculation: pattern-matching decoding that needs no draft
+    # model. When enabled server-side, activate a sensible default variant
+    # (ngram-mod) unless the sweep explores the ngram dimension.
+    # ngram self-speculation: pattern-matching decoding that needs no draft
+    # model. When enabled server-side, activate a sensible default variant
+    # (ngram-mod) unless the sweep explores the ngram dimension.
+    # --spec-draft-n-max is shared with MTP via spec_n_max; only set if
+    # neither MTP nor ngram sweeps it.
+    if cfg.ngram:
+        if "ngram" not in f:
+            parts.append("--spec-type ngram-mod")
+        if "spec_n_max" not in f and not (cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0):
+            parts.append("--spec-draft-n-max 16")
+    # into a single comma-separated value.
+    parts = _merge_spec_type_parts(parts)
     cmd = " \\\n    ".join(["./llama-server"] + parts)
     # prepend any winning env-var factor values as an env prefix
     env_prefix = " ".join(f"{n}={f[n]}" for n in sorted(cfg.env_factor_names) if n in f)
@@ -865,7 +968,6 @@ _OOM_PAT = re.compile(
     r"cudaErrorMemoryAllocation|ggml_backend_.*failed",
     re.IGNORECASE,
 )
-
 
 def parse_bench_json(stdout: str):
     """Return (pp_tps, tg_tps) from llama-bench JSON output, or (None, None)."""
@@ -983,6 +1085,16 @@ def build_server_args(cfg: Config, f: dict, port: int, n_ctx: int) -> list[str]:
             args += ["--spec-type", "draft-mtp"]
         if "spec_n_max" not in f:                  # default n_max if not swept
             args += ["--spec-draft-n-max", str(cfg.spec_draft_n_max)]
+    # ngram self-speculation: enable ngram-mod by default when ngram is on but
+    # not swept; --spec-draft-n-max is shared with MTP (spec_n_max) — only set
+    # if neither MTP nor ngram sweeps it.
+    if cfg.ngram:
+        if "ngram" not in f:
+            args += ["--spec-type", "ngram-mod"]
+        if "spec_n_max" not in f and not (cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0):
+            args += ["--spec-draft-n-max", "16"]
+    # Merge duplicate --spec-type entries (MTP + ngram) into one comma-sep value
+    args = _merge_spec_type_args(args)
     return args
 
 
@@ -2234,6 +2346,58 @@ def selftest() -> bool:
         assert all(k not in fs for k in ("mtp", "spec_n_max", "spec_n_min",
                                          "spec_p_min", "spec_p_split",
                                          "threads_batch"))  # server-only
+
+        # ngram as a swept factor: translate maps variant names, "none" omits
+        assert factor_flags(cfg_s, {"ngram": "ngram-mod"}, "server", 512) == \
+            [["--spec-type", "ngram-mod"]]
+        assert factor_flags(cfg_s, {"ngram": "none"}, "server", 512) == []
+        assert factor_flags(cfg_s, {"ngram": "ngram-simple"}, "server", 512) == \
+            [["--spec-type", "ngram-simple"]]
+        assert factor_flags(cfg_s, {"ngram": "ngram-mod"}, "bench", 512) == []
+        # Actually check that all ngram factors ARE server-only
+        for nf in ("ngram", "ngram_simple_size_n",
+                   "ngram_simple_size_m", "ngram_simple_min_hits",
+                   "ngram_map_k_size_n", "ngram_map_k_size_m", "ngram_map_k_min_hits",
+                   "ngram_map_k4v_size_n", "ngram_map_k4v_size_m", "ngram_map_k4v_min_hits",
+                   "ngram_mod_n_match", "ngram_mod_n_min", "ngram_mod_n_max"):
+            assert FACTORS[nf].get("server_only"), f"{nf} should be server_only"
+
+        # ngram builds include the ngram factors on the server driver
+        cfg_n = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
+                       ctx_floor=8192, driver="server", ngram=True,
+                       hw={"phys": 8, "logical": 16, "n_layers": 32,
+                           "n_ctx_train": 32768, "n_experts": 0, "n_nextn": 0})
+        nfs = build_factors(cfg_n)
+        assert "ngram" in nfs, f"ngram not in {list(nfs)}"
+        assert "spec_n_max" in nfs
+        assert "ngram_simple_size_n" in nfs
+
+        # spec-type merging: mtp + ngram both present → comma-separated
+        merged = _merge_spec_type_parts(["--spec-type draft-mtp", "--spec-type ngram-mod"])
+        assert merged == ["--spec-type draft-mtp,ngram-mod"], f"got {merged}"
+        merged = _merge_spec_type_args(["--spec-type", "draft-mtp", "--spec-type", "ngram-mod"])
+        assert merged == ["--spec-type", "draft-mtp,ngram-mod"], f"got {merged}"
+        # only one spec-type → unchanged
+        assert _merge_spec_type_parts(["--spec-type draft-mtp"]) == ["--spec-type draft-mtp"]
+        assert _merge_spec_type_args(["--spec-type", "draft-mtp"]) == ["--spec-type", "draft-mtp"]
+        # no spec-type → no change
+        assert _merge_spec_type_parts(["-ngl 64"]) == ["-ngl 64"]
+        assert _merge_spec_type_args(["-ngl", "64"]) == ["-ngl", "64"]
+
+        # build_server_args with ngram: when ngram swept off, no spec-type;
+        cfg_ns = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
+                        ctx_floor=8192, driver="server",
+                        hw={"phys": 8, "logical": 16, "n_layers": 32,
+                            "n_ctx_train": 32768, "n_experts": 0, "n_nextn": 0},
+                        ngram=True)
+        sa = build_server_args(cfg_ns, {"ngram": "none", "ubatch": "512"}, 8080, 4096)
+        assert "--spec-type" not in sa, f"ngram=none should suppress spec-type, got {sa}"
+        sa = build_server_args(cfg_ns, {"ubatch": "512"}, 8080, 4096)
+        # ngram fixed on (not swept): should emit --spec-type ngram-mod
+        assert "--spec-type" in sa
+        idx = sa.index("--spec-type")
+        val = sa[idx + 1]
+        assert val == "ngram-mod", f"expected ngram-mod, got {val}"
         cfg_m.hw["n_experts"] = 64
         fs = build_factors(cfg_m)
         assert "ncmoe" in fs and "ot" not in fs            # MoE
@@ -2295,7 +2459,6 @@ def selftest() -> bool:
     except AssertionError as e:
         print(f"selftest FAILED: {e}")
         return False
-    print("selftest: all checks passed")
     return True
 
 
@@ -2554,6 +2717,8 @@ def build_child_argv(args, cfg: Config, factors: dict, results_path: Path,
             "--results-dir", ".", "--results", str(results_path)]
     if args.no_mtp:
         argv.append("--no-mtp")
+    if cfg.ngram:
+        argv.append("--ngram")
     if cfg.measure_vram:
         argv.append("--vram")
     if args.no_shuffle:
@@ -2864,6 +3029,10 @@ def main():
     ap.add_argument("--no-mtp", action="store_true",
                     help="don't add draft-mtp flags to the emitted server command "
                          "even if the model has an MTP head")
+    ap.add_argument("--ngram", action="store_true",
+                    help="enable ngram self-speculative decoding (server only): "
+                         "sweeps all ngram variants and their parameters to find "
+                         "the optimal pattern-matching speculation for your workload")
     ap.add_argument("--no-probe", action="store_true",
                     help="skip the max-context probe (which runs by default after "
                          "the sweep: binary-searches the physical context ceiling)")
@@ -3023,11 +3192,17 @@ def main():
     # cannot do speculative decoding, so on bench the MTP speedup is neither
     # measured nor tunable (its knobs are server-only). An explicit --driver or
     # --use-case still wins, as does --no-mtp; needs llama-server built.
+    # ngram self-speculation is also server-only.
     if (driver == "bench" and args.driver is None and uc.get("driver") is None
             and (n_nextn or 0) > 0 and not args.no_mtp and llama_server.exists()):
         driver = "server"
         print("note: model has an MTP head — driver auto-switched to server so "
               "the sweep measures and tunes MTP (--driver bench to override)")
+    if (driver == "bench" and args.driver is None and uc.get("driver") is None
+            and args.ngram and llama_server.exists()):
+        driver = "server"
+        print("note: ngram speculation requested — driver auto-switched to server "
+              "(--driver bench to override)")
 
     cfg = Config(
         model=args.model.resolve(),
@@ -3040,6 +3215,7 @@ def main():
         n_gen=n_gen,
         max_depth=args.max_depth,
         emit_mtp=not args.no_mtp,
+        ngram=args.ngram,
         spec_draft_n_max=args.spec_draft_n_max,
         profile=profile,
         driver=driver,
@@ -3177,6 +3353,10 @@ def main():
         if cfg.driver == "bench":
             print("             hint: add --driver server to MEASURE the MTP "
                   "speedup (bench can't); otherwise it's only emitted")
+    if cfg.ngram:
+        emit = ("swept as factors (ngram type + params)" if "ngram" in cfg.factors
+                else "will add --spec-type ngram-mod to server cmd")
+        print(f"ngram      : yes — {emit}")
     print(f"profile    : {cfg.profile}  (request {cfg.n_prompt} prompt + "
           f"{cfg.n_gen} gen tokens; driver={cfg.driver})")
     print("objective  : " + ("eff (effective t/s: blends pp + tg)"
