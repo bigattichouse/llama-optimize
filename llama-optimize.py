@@ -580,6 +580,8 @@ def objective_tps(cfg: Config, pp: float, tg: float) -> float:
 
 
 def build_factors(cfg: Config):
+    reg_errors = validate_factor_registry()
+    assert not reg_errors, "FACTORS registry invalid: " + "; ".join(reg_errors)
     phys = cfg.hw["phys"]
     logical = cfg.hw["logical"]
     n_layers = cfg.hw.get("n_layers")
@@ -630,31 +632,25 @@ def build_factors(cfg: Config):
         factors["spec_n_min"] = ["1", "2"]
         factors["spec_p_min"] = ["0.0", "0.25", "0.5", "0.75", "0.9"]
         factors["spec_p_split"] = ["0.1", "0.3", "0.5"]
-    # ngram self-speculative decoding: when enabled on the server driver, sweep
-    # all ngram variants and their tunable parameters. ngram needs no draft
-    # model — it finds patterns in the token history — so it works with any model
-    # and complements MTP when both are active (the --spec-type values combine).
-    # --spec-draft-n-max is shared with MTP via spec_n_max; only add it if MTP
-    # didn't already.
+    # ngram self-speculative decoding (server only): sweep the --spec-type variant
+    # plus each variant's CONDITIONAL tuning knobs (active_when — see
+    # docs/CONDITIONAL-FACTORS.md). ngram needs no draft model (it matches patterns
+    # in the token history) and complements MTP when both are active (--spec-type
+    # values combine). The map/simple variants share one collapsed knob set
+    # (flag_for resolves the variant spelling); ngram-mod has its own. Levels
+    # bracket llama.cpp's defaults within the documented bounds. spec_n_max is NOT
+    # added: --spec-draft-n-max is a draft-model/MTP knob, inert for ngram.
     if cfg.driver == "server" and cfg.ngram:
         factors["ngram"] = ["none", "ngram-simple", "ngram-mod", "ngram-map-k",
                             "ngram-map-k4v"]
-        if "spec_n_max" not in factors:
-            factors["spec_n_max"] = ["1", "2", "4", "8", "16"]
-        # ngram-simple / map-k / map-k4v shared structure
-        factors["ngram_simple_size_n"] = ["4", "8", "12", "16", "24"]
-        factors["ngram_simple_size_m"] = ["8", "16", "32", "48", "64"]
-        factors["ngram_simple_min_hits"] = ["1", "2", "3", "5"]
-        factors["ngram_map_k_size_n"] = ["4", "8", "12", "16", "24"]
-        factors["ngram_map_k_size_m"] = ["8", "16", "32", "48", "64"]
-        factors["ngram_map_k_min_hits"] = ["1", "2", "3", "5"]
-        factors["ngram_map_k4v_size_n"] = ["4", "8", "12", "16", "24"]
-        factors["ngram_map_k4v_size_m"] = ["8", "16", "32", "48", "64"]
-        factors["ngram_map_k4v_min_hits"] = ["1", "2", "3", "5"]
-        # ngram-mod params (different structure from the map variants)
+        # shared map/simple knobs (llama.cpp defaults: size_n=12, size_m=48, min_hits=1)
+        factors["ngram_size_n"]   = ["4", "8", "12", "16", "24"]
+        factors["ngram_size_m"]   = ["8", "16", "32", "48", "64"]
+        factors["ngram_min_hits"] = ["1", "2", "3", "5"]
+        # ngram-mod knobs (defaults: n_match=24, n_min=48, n_max=64)
         factors["ngram_mod_n_match"] = ["8", "16", "24", "32", "48"]
-        factors["ngram_mod_n_min"] = ["16", "32", "48", "64", "96"]
-        factors["ngram_mod_n_max"] = ["32", "48", "64", "96", "128"]
+        factors["ngram_mod_n_min"]   = ["16", "32", "48", "64", "96"]
+        factors["ngram_mod_n_max"]   = ["32", "48", "64", "96", "128"]
     return factors
 
 
@@ -744,6 +740,11 @@ OT_PATTERNS = {
     "attn_cpu": r"\.attn_.*=CPU",
 }
 
+# ngram --spec-type variants that share one {size-n, size-m, min-hits} knob
+# structure (differing only in the flag's variant token). ngram-mod has its own
+# {n-match, n-min, n-max}. See docs/ngram-design.md.
+NGRAM_MAP_VARIANTS = frozenset({"ngram-simple", "ngram-map-k", "ngram-map-k4v"})
+
 # ---------------------------------------------------------------------------
 # Unified knob registry — the one place to add a tunable. Each factor declares
 # how it maps onto each driver.
@@ -755,6 +756,17 @@ OT_PATTERNS = {
 #   server_only  : only meaningful with the server driver
 #   request      : request-time (n_depth) — not a server launch arg
 #   translate    : map named level -> real value ("" ⇒ omit the flag)
+#   active_when  : (gate_factor, {live values}) — a CONDITIONAL factor that only
+#                  participates when factor `gate_factor` resolves to one of the
+#                  live values (e.g. an ngram-mod knob is live only when the
+#                  `ngram` gate == "ngram-mod"). Outside its live set the factor is
+#                  inert: no flag is emitted (I2) and it is not scored (I3). See
+#                  docs/CONDITIONAL-FACTORS.md.
+#   flag_for     : gate_value -> flag tuple. For a conditional factor whose flag
+#                  spelling depends on the live gate value (collapses several
+#                  same-shaped knobs into one, e.g. ngram size-n across variants).
+#                  Resolved at emission via the row's gate value; takes the place
+#                  of a static `server`/`bench` tuple.
 # ---------------------------------------------------------------------------
 FACTORS = {
     # --- offload / placement ---
@@ -790,23 +802,29 @@ FACTORS = {
     "ngram":             {"bench": None, "server": ("--spec-type",), "kind": "cat", "server_only": True,
                           "translate": {"none": "", "ngram-simple": "ngram-simple", "ngram-mod": "ngram-mod",
                                         "ngram-map-k": "ngram-map-k", "ngram-map-k4v": "ngram-map-k4v"}},
-    # NOTE: --spec-draft-n-max is shared with MTP via the existing `spec_n_max`
-    # factor. When ngram is active, build_factors() adds spec_n_max unless MTP
-    # already did — never two factors mapping to the same flag.
-    # ngram-simple / ngram-map-k / ngram-map-k4v shared-size params
-    "ngram_simple_size_n":   {"bench": None, "server": ("--spec-ngram-simple-size-n",), "kind": "num", "server_only": True},
-    "ngram_simple_size_m":   {"bench": None, "server": ("--spec-ngram-simple-size-m",), "kind": "num", "server_only": True},
-    "ngram_simple_min_hits": {"bench": None, "server": ("--spec-ngram-simple-min-hits",), "kind": "num", "server_only": True},
-    "ngram_map_k_size_n":    {"bench": None, "server": ("--spec-ngram-map-k-size-n",), "kind": "num", "server_only": True},
-    "ngram_map_k_size_m":    {"bench": None, "server": ("--spec-ngram-map-k-size-m",), "kind": "num", "server_only": True},
-    "ngram_map_k_min_hits":  {"bench": None, "server": ("--spec-ngram-map-k-min-hits",), "kind": "num", "server_only": True},
-    "ngram_map_k4v_size_n":  {"bench": None, "server": ("--spec-ngram-map-k4v-size-n",), "kind": "num", "server_only": True},
-    "ngram_map_k4v_size_m":  {"bench": None, "server": ("--spec-ngram-map-k4v-size-m",), "kind": "num", "server_only": True},
-    "ngram_map_k4v_min_hits":{"bench": None, "server": ("--spec-ngram-map-k4v-min-hits",), "kind": "num", "server_only": True},
-    # ngram-mod params
-    "ngram_mod_n_match":{"bench": None, "server": ("--spec-ngram-mod-n-match",), "kind": "num", "server_only": True},
-    "ngram_mod_n_min":  {"bench": None, "server": ("--spec-ngram-mod-n-min",), "kind": "num", "server_only": True},
-    "ngram_mod_n_max":  {"bench": None, "server": ("--spec-ngram-mod-n-max",), "kind": "num", "server_only": True},
+    # ngram tuning knobs are CONDITIONAL on the --spec-type variant (active_when):
+    # emitted and scored only in rows whose `ngram` gate selects the owning
+    # variant. The map/simple variants share one {size-n, size-m, min-hits}
+    # structure differing only in the flag's variant token, so they collapse to
+    # one factor each via flag_for. ngram-mod carries its own {n-match, n-min,
+    # n-max}. Defaults/bounds: llama.cpp common/common.h (see docs/ngram-design.md).
+    # NOTE: --spec-draft-n-max (`spec_n_max`) is a draft-model/MTP knob and has NO
+    # effect on ngram — it is deliberately not an ngram factor.
+    "ngram_size_n":   {"bench": None, "kind": "num", "server_only": True,
+                       "active_when": ("ngram", NGRAM_MAP_VARIANTS),
+                       "flag_for": lambda v: (f"--spec-{v}-size-n",)},
+    "ngram_size_m":   {"bench": None, "kind": "num", "server_only": True,
+                       "active_when": ("ngram", NGRAM_MAP_VARIANTS),
+                       "flag_for": lambda v: (f"--spec-{v}-size-m",)},
+    "ngram_min_hits": {"bench": None, "kind": "num", "server_only": True,
+                       "active_when": ("ngram", NGRAM_MAP_VARIANTS),
+                       "flag_for": lambda v: (f"--spec-{v}-min-hits",)},
+    "ngram_mod_n_match": {"bench": None, "server": ("--spec-ngram-mod-n-match",), "kind": "num",
+                          "server_only": True, "active_when": ("ngram", {"ngram-mod"})},
+    "ngram_mod_n_min":   {"bench": None, "server": ("--spec-ngram-mod-n-min",), "kind": "num",
+                          "server_only": True, "active_when": ("ngram", {"ngram-mod"})},
+    "ngram_mod_n_max":   {"bench": None, "server": ("--spec-ngram-mod-n-max",), "kind": "num",
+                          "server_only": True, "active_when": ("ngram", {"ngram-mod"})},
     # --- concurrency (server only) ---
     "parallel":     {"bench": None, "server": ("--parallel",), "kind": "num", "server_only": True},
     # --- context extension / capability (server only) ---
@@ -815,44 +833,126 @@ FACTORS = {
 }
 
 
-# Each ngram sub-parameter applies only to a single --spec-type variant. The
-# orthogonal array assigns all of them independently of the selected variant,
-# so a given row can carry (say) ngram-simple sizes while the active variant is
-# ngram-mod. Those values are inert for that variant and must not be emitted as
-# flags — llama.cpp would receive options that don't belong to the running spec
-# type. Map each param-name prefix to the variant it belongs to.
-NGRAM_PARAM_VARIANT = {
-    "ngram_simple_":   "ngram-simple",
-    "ngram_map_k4v_":  "ngram-map-k4v",
-    "ngram_map_k_":    "ngram-map-k",
-    "ngram_mod_":      "ngram-mod",
-}
+# ---------------------------------------------------------------------------
+# Conditional (nested) factors — see docs/CONDITIONAL-FACTORS.md.
+# A factor with `active_when: (gate, {values})` participates only when factor
+# `gate` resolves to one of `values` in the assignment (a run row or a pinned
+# config). `is_active` is the single source of truth for emission (I2) and
+# effect-estimation (I3); the stage planner uses it to keep every OA column live
+# (I1). A factor without `active_when` is unconditional (always active).
+# ---------------------------------------------------------------------------
+def is_active(name: str, assignment: dict) -> bool:
+    """Whether factor `name` participates under `assignment`. Unconditional
+    factors (and unknown names) are always active; a conditional factor is active
+    iff its gate is present in the assignment with a value in its live set."""
+    spec = FACTORS.get(name)
+    if not spec:
+        return True
+    cond = spec.get("active_when")
+    if cond is None:
+        return True
+    gate, live = cond
+    return assignment.get(gate) in live
 
 
-def _ngram_param_inactive(name: str, f: dict) -> bool:
-    """True if `name` is an ngram sub-parameter whose variant is not the one
-    selected in row `f`, meaning its flag must be suppressed. Non-ngram factors
-    and rows where the matching variant is active return False."""
-    for prefix, variant in NGRAM_PARAM_VARIANT.items():
-        if name.startswith(prefix):
-            return f.get("ngram") != variant
-    return False
+def active_factors(names, assignment: dict) -> list:
+    """The subset of `names` active under `assignment` (a gate value map)."""
+    return [n for n in names if is_active(n, assignment)]
+
+
+def conditional_flags(name: str, gate_value) -> tuple | None:
+    """Server flag tuple for a conditional factor, resolved from the live gate
+    value via `flag_for` when the flag spelling is variant-dependent. Falls back
+    to the static `server` tuple. None if the factor emits nothing here."""
+    spec = FACTORS.get(name, {})
+    ff = spec.get("flag_for")
+    if ff is not None:
+        return ff(gate_value)
+    return spec.get("server")
+
+
+def validate_factor_registry(factors: dict = FACTORS) -> list:
+    """Return a list of registry errors (empty ⇒ valid). Checks that every
+    conditional factor's gate exists, its live values are real gate levels (when
+    the gate enumerates them via `translate`), `flag_for` is total over the live
+    set, the factor can emit a flag, and the gate graph is acyclic. Run in
+    selftest and asserted at build_factors time so a bad registry fails fast."""
+    errors: list[str] = []
+    edges: dict[str, str] = {}          # factor -> its gate (for cycle check)
+    for name, spec in factors.items():
+        cond = spec.get("active_when")
+        if cond is None:
+            continue
+        try:
+            gate, live = cond
+            live = set(live)
+        except (TypeError, ValueError):
+            errors.append(f"{name}: active_when must be (gate, {{values}})")
+            continue
+        edges[name] = gate
+        if gate not in factors:
+            errors.append(f"{name}: active_when gate '{gate}' is not a factor")
+        else:
+            tr = factors[gate].get("translate")
+            if tr is not None:
+                unknown = live - set(tr)
+                if unknown:
+                    errors.append(f"{name}: active_when values "
+                                  f"{sorted(unknown)} are not levels of gate '{gate}'")
+        ff = spec.get("flag_for")
+        if ff is not None:
+            for v in sorted(live):
+                try:
+                    out = ff(v)
+                except Exception as e:                       # noqa: BLE001
+                    errors.append(f"{name}: flag_for({v!r}) raised {e!r}")
+                    continue
+                if not out or not all(isinstance(x, str) and x for x in out):
+                    errors.append(f"{name}: flag_for({v!r}) must return a "
+                                  f"non-empty flag tuple, got {out!r}")
+        elif spec.get("server") is None and spec.get("bench") is None:
+            errors.append(f"{name}: conditional factor has no flag mapping "
+                          f"(need server/bench tuple or flag_for)")
+    # cycle detection over factor -> gate edges (must be a DAG)
+    WHITE, GREY, BLACK = 0, 1, 2
+    color = {n: WHITE for n in edges}
+
+    def visit(n: str) -> bool:                               # True ⇒ cycle found
+        color[n] = GREY
+        g = edges.get(n)
+        if g in edges:
+            if color[g] == GREY or (color[g] == WHITE and visit(g)):
+                return True
+        color[n] = BLACK
+        return False
+
+    for n in edges:
+        if color[n] == WHITE and visit(n):
+            errors.append(f"active_when gate graph has a cycle through '{n}'")
+            break
+    return errors
 
 
 def factor_flags(cfg: Config, f: dict, driver: str, ub: int) -> list[list[str]]:
     """Argument groups for the sweepable factors in `f` on the given driver, e.g.
     [["-ngl","64"], ["-nkvo"], ["-ctk","f16"]]. Skips env factors, request-time
-    factors (n_depth), and factors unsupported on the driver. Handles kv (two
-    flags), booleans, batch clamp, and named -ot patterns."""
+    factors (n_depth), factors unsupported on the driver, and conditional factors
+    whose gate isn't selected in this row (I2). Handles kv (two flags), booleans,
+    batch clamp, named -ot patterns, and variant-dependent flag_for spellings."""
     groups = []
     for name, val in f.items():
         spec = FACTORS.get(name)
-        if spec is None or name in cfg.env_factor_names:
+        if spec is None or name in cfg.env_factor_names or spec.get("request"):
             continue
-        flags = spec.get(driver)
-        if flags is None or spec.get("request"):
+        if not is_active(name, f):                 # conditional factor inactive here
             continue
-        if _ngram_param_inactive(name, f):         # variant not selected this row
+        if spec.get("flag_for") is not None:       # variant-dependent flag spelling
+            if driver != "server":                 # flag_for factors are server-only
+                continue
+            flags = conditional_flags(name, f.get(spec["active_when"][0]))
+        else:
+            flags = spec.get(driver)
+        if flags is None:
             continue
         if spec.get("translate") is not None:
             val = spec["translate"].get(str(val), str(val))
@@ -972,16 +1072,12 @@ def server_command(cfg: Config, f: dict, ctx: int) -> str:
             parts.append("--spec-type draft-mtp")
         if "spec_n_max" not in f:
             parts.append(f"--spec-draft-n-max {cfg.spec_draft_n_max}")
-    # ngram self-speculation: pattern-matching decoding that needs no draft
-    # model. When enabled server-side, activate a sensible default variant
-    # (ngram-mod) unless the sweep explores the ngram dimension.
-    # --spec-draft-n-max is shared with MTP via spec_n_max; only set if
-    # neither MTP nor ngram sweeps it.
-    if cfg.ngram:
-        if "ngram" not in f:
-            parts.append("--spec-type ngram-mod")
-        if "spec_n_max" not in f and not (cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0):
-            parts.append("--spec-draft-n-max 16")
+    # ngram self-speculation: pattern-matching decoding that needs no draft model.
+    # When enabled but not swept, activate a sensible default variant (ngram-mod);
+    # its own draft length is ngram-mod's default, not --spec-draft-n-max (a
+    # draft-model/MTP knob that has no effect on ngram).
+    if cfg.ngram and "ngram" not in f:
+        parts.append("--spec-type ngram-mod")
     # MTP + ngram can both emit --spec-type; merge into one comma-separated value.
     parts = _merge_spec_type_parts(parts)
     cmd = " \\\n    ".join(["./llama-server"] + parts)
@@ -1113,14 +1209,11 @@ def build_server_args(cfg: Config, f: dict, port: int, n_ctx: int) -> list[str]:
             args += ["--spec-type", "draft-mtp"]
         if "spec_n_max" not in f:                  # default n_max if not swept
             args += ["--spec-draft-n-max", str(cfg.spec_draft_n_max)]
-    # ngram self-speculation: enable ngram-mod by default when ngram is on but
-    # not swept; --spec-draft-n-max is shared with MTP (spec_n_max) — only set
-    # if neither MTP nor ngram sweeps it.
-    if cfg.ngram:
-        if "ngram" not in f:
-            args += ["--spec-type", "ngram-mod"]
-        if "spec_n_max" not in f and not (cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0):
-            args += ["--spec-draft-n-max", "16"]
+    # ngram self-speculation: enable ngram-mod by default when ngram is on but not
+    # swept. ngram's draft length is ngram-mod's own default, not --spec-draft-n-max
+    # (a draft-model/MTP knob with no effect on ngram).
+    if cfg.ngram and "ngram" not in f:
+        args += ["--spec-type", "ngram-mod"]
     # Merge duplicate --spec-type entries (MTP + ngram) into one comma-sep value
     args = _merge_spec_type_args(args)
     return args
@@ -1565,8 +1658,10 @@ def report(cfg: Config, rows: list[dict], probe: dict | None = None):
 
 def factor_level_means(rows: list[dict], factor: str) -> dict:
     """Mean objective score per level of a factor (OK runs only) — the Taguchi
-    main effect for a balanced design."""
-    ok = [r for r in rows if r["status"] == "OK"]
+    main effect for a balanced design. A conditional factor (active_when) is
+    scored only over rows where it was active (I3): rows where its gate selected
+    a different variant are inert and carry no information about its effect."""
+    ok = [r for r in rows if r["status"] == "OK" and is_active(factor, r)]
     means = {}
     levels = sorted(set(str(r[factor]) for r in ok if factor in r),
                     key=lambda x: (len(x), x))
@@ -2094,6 +2189,48 @@ def selftest() -> bool:
         assert ngl_levels(64)[0] == 0 and ngl_levels(64)[-1] == 64
         assert len(thread_levels(8, 16)) >= 3
 
+        # --- conditional-factor core (docs/CONDITIONAL-FACTORS.md) ---
+        # the real registry is valid
+        assert validate_factor_registry() == [], validate_factor_registry()
+        # is_active: unconditional always active; conditional gated on its gate
+        assert is_active("ngl", {}) is True                  # unconditional
+        assert is_active("does_not_exist", {}) is True       # unknown → active
+        synth = {
+            "G":     {"server": ("--g",), "kind": "cat", "translate": {"a": "a", "b": "b", "c": "c"}},
+            "A":     {"server": ("--a",), "kind": "num"},                    # unconditional
+            "Pa":    {"server": ("--pa",), "kind": "num", "active_when": ("G", {"a"})},
+            "Pshare":{"kind": "num", "active_when": ("G", {"a", "b"}),
+                      "flag_for": lambda v: (f"--p-{v}",)},
+        }
+        _saved = dict(FACTORS)
+        FACTORS.clear(); FACTORS.update(synth)
+        try:
+            assert is_active("Pa", {"G": "a"}) is True
+            assert is_active("Pa", {"G": "b"}) is False       # gate ≠ live value
+            assert is_active("Pa", {}) is False               # gate absent
+            assert is_active("Pshare", {"G": "b"}) is True
+            assert is_active("Pshare", {"G": "c"}) is False
+            assert active_factors(["A", "Pa", "Pshare"], {"G": "a"}) == ["A", "Pa", "Pshare"]
+            assert active_factors(["A", "Pa", "Pshare"], {"G": "b"}) == ["A", "Pshare"]
+            # flag_for resolves the variant-dependent spelling
+            assert conditional_flags("Pshare", "b") == ("--p-b",)
+            assert conditional_flags("Pa", "a") == ("--pa",)   # static fallback
+            assert validate_factor_registry() == []            # synth is valid
+            # validator catches: missing gate, bad live value, flag_for gap, cycle
+            bad = {"X": {"kind": "num", "active_when": ("Nope", {"z"})}}
+            assert validate_factor_registry(bad)
+            badval = {"G": synth["G"], "X": {"server": ("--x",), "kind": "num",
+                                             "active_when": ("G", {"zzz"})}}
+            assert any("not levels" in e for e in validate_factor_registry(badval))
+            badff = {"G": synth["G"], "X": {"kind": "num", "active_when": ("G", {"a"}),
+                                            "flag_for": lambda v: ()}}
+            assert any("non-empty" in e for e in validate_factor_registry(badff))
+            cyc = {"G": {"server": ("--g",), "kind": "cat", "active_when": ("H", {"x"})},
+                   "H": {"server": ("--h",), "kind": "cat", "active_when": ("G", {"y"})}}
+            assert any("cycle" in e for e in validate_factor_registry(cyc))
+        finally:
+            FACTORS.clear(); FACTORS.update(_saved)
+
         # MoE metadata
         assert model_expert_count({"llama.expert_count": 8}) == 8
         assert model_expert_count({}) == 0
@@ -2390,37 +2527,55 @@ def selftest() -> bool:
         assert factor_flags(cfg_s, {"ngram": "ngram-simple"}, "server", 512) == \
             [["--spec-type", "ngram-simple"]]
         assert factor_flags(cfg_s, {"ngram": "ngram-mod"}, "bench", 512) == []
-        # Actually check that all ngram factors ARE server-only
-        for nf in ("ngram", "ngram_simple_size_n",
-                   "ngram_simple_size_m", "ngram_simple_min_hits",
-                   "ngram_map_k_size_n", "ngram_map_k_size_m", "ngram_map_k_min_hits",
-                   "ngram_map_k4v_size_n", "ngram_map_k4v_size_m", "ngram_map_k4v_min_hits",
+        # all ngram factors are server-only
+        for nf in ("ngram", "ngram_size_n", "ngram_size_m", "ngram_min_hits",
                    "ngram_mod_n_match", "ngram_mod_n_min", "ngram_mod_n_max"):
             assert FACTORS[nf].get("server_only"), f"{nf} should be server_only"
 
-        # ngram sub-params are gated by the selected variant: only the active
-        # variant's params are emitted; others (inert for that row) are suppressed
-        # so llama-server never receives options for a spec type it isn't running.
+        # conditional ngram knobs: emitted only for their active variant (I2), and
+        # the collapsed shared knob resolves the variant-specific flag via flag_for.
         gated = _flat(factor_flags(cfg_s, {"ngram": "ngram-mod",
                                            "ngram_mod_n_match": "16",
-                                           "ngram_simple_size_n": "8"}, "server", 512))
+                                           "ngram_size_n": "8"}, "server", 512))
         assert "--spec-ngram-mod-n-match" in gated, f"got {gated}"
         assert "--spec-ngram-simple-size-n" not in gated, f"got {gated}"
-        assert not _ngram_param_inactive("ngl", {"ngram": "none"})  # non-ngram unaffected
-        # ngram=none → variant flag omitted AND every sub-param suppressed
-        assert factor_flags(cfg_s, {"ngram": "none",
-                                    "ngram_mod_n_match": "16",
-                                    "ngram_simple_size_n": "8"}, "server", 512) == []
+        # same shared knob, different variant → different flag spelling
+        for variant in ("ngram-simple", "ngram-map-k", "ngram-map-k4v"):
+            g = _flat(factor_flags(cfg_s, {"ngram": variant, "ngram_size_m": "32",
+                                           "ngram_mod_n_max": "64"}, "server", 512))
+            assert f"--spec-{variant}-size-m" in g, f"{variant}: {g}"
+            assert "--spec-ngram-mod-n-max" not in g          # mod knob inactive here
+        # ngram=none → variant flag omitted AND every conditional knob suppressed
+        assert factor_flags(cfg_s, {"ngram": "none", "ngram_mod_n_match": "16",
+                                    "ngram_size_n": "8"}, "server", 512) == []
 
-        # ngram builds include the ngram factors on the server driver
+        # ngram builds include the collapsed knobs, and NOT spec_n_max (a
+        # draft-model knob, inert for ngram)
         cfg_n = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
                        ctx_floor=8192, driver="server", ngram=True,
                        hw={"phys": 8, "logical": 16, "n_layers": 32,
                            "n_ctx_train": 32768, "n_experts": 0, "n_nextn": 0})
         nfs = build_factors(cfg_n)
         assert "ngram" in nfs, f"ngram not in {list(nfs)}"
-        assert "spec_n_max" in nfs
-        assert "ngram_simple_size_n" in nfs
+        assert "spec_n_max" not in nfs, "spec_n_max must not be an ngram factor"
+        assert "ngram_size_n" in nfs and "ngram_mod_n_max" in nfs
+        assert not any(k.startswith("ngram_simple_") or k.startswith("ngram_map_")
+                       for k in nfs)          # collapsed away
+
+        # I3: a conditional knob is scored only over rows where it was active.
+        # ngram_size_n really matters within ngram-simple (best at "24"); rows on
+        # a different variant carry a DECOY best ("4") that must be ignored.
+        cond_rows = (
+            [{"status": "OK", "ngram": "ngram-simple", "ngram_size_n": sz,
+              "pp_tps": 100.0, "tg_tps": v, "n_prompt": 0, "n_gen": 128}
+             for sz, v in (("4", 10.0), ("12", 20.0), ("24", 30.0))] +
+            [{"status": "OK", "ngram": "ngram-mod", "ngram_size_n": sz,
+              "pp_tps": 100.0, "tg_tps": v, "n_prompt": 0, "n_gen": 128}
+             for sz, v in (("4", 90.0), ("12", 5.0), ("24", 5.0))]
+        )
+        cond_means = factor_level_means(cond_rows, "ngram_size_n")
+        assert max(cond_means, key=cond_means.get) == "24", cond_means   # true best
+        assert "90.0" not in [f"{v}" for v in cond_means.values()]        # decoy row excluded
 
         # spec-type merging: mtp + ngram both present → comma-separated
         merged = _merge_spec_type_parts(["--spec-type draft-mtp", "--spec-type ngram-mod"])
