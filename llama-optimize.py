@@ -46,9 +46,11 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent
 WORKSPACE = PROJECT_ROOT.parent
 # The Taguchi/Morris/Sobol suite is vendored as the `robust` git submodule at
-# ./taguchi. Its internal layout is nested, so locate the python binding by
-# search rather than a fixed path.
-SUBMODULE_DIR = PROJECT_ROOT / "taguchi"
+# ./robust (its internal layout is nested, so locate the python binding by
+# search rather than a fixed path). Older checkouts used ./taguchi; fall back to
+# it so the tool keeps working before a `git submodule sync`.
+SUBMODULE_DIR = next((p for p in (PROJECT_ROOT / "robust", PROJECT_ROOT / "taguchi")
+                      if p.exists()), PROJECT_ROOT / "robust")
 
 
 def resolve_binary(name: str, explicit: Path | None, hint: Path | None) -> Path:

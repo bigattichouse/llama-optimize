@@ -40,8 +40,8 @@ You need three things: this repo, the `robust` DOE library (a **git submodule** 
 a second repo nested inside this one), and a `llama.cpp` build for your GPU.
 
 **1. Get the code, including the submodule.** The DOE engines live in a separate
-project (`robust`) that git tracks as a *submodule*: a plain `git clone` leaves the
-`taguchi/` folder empty, so you must pull it in explicitly.
+project (`robust`) that git tracks as a *submodule* in `./robust`: a plain
+`git clone` leaves that folder empty, so you must pull it in explicitly.
 
 ```bash
 # if you're cloning fresh, grab the submodule in one step:
@@ -52,18 +52,18 @@ cd llama-optimize
 git submodule update --init
 ```
 
-If `taguchi/` is empty, step 1 didn't run — `git submodule update --init` fixes it.
+If `robust/` is empty, step 1 didn't run — `git submodule update --init` fixes it.
 
 **2. Build `robust`.** It's pure C, no GPU needed, and takes a few seconds. This one
 build produces everything both funnel stages need:
 
 ```bash
-make -C taguchi          # builds libtaguchi.so (Taguchi arrays + main-effects)
+make -C robust           # builds libtaguchi.so (Taguchi arrays + main-effects)
                          # and the morris binary (for --screen)
 ```
 
-`llama-optimize` finds the Taguchi Python binding and the `morris` binary in
-`taguchi/build/bin/` automatically by searching the submodule — no paths to set.
+`llama-optimize` finds the Taguchi Python binding and the `morris` binary under
+`robust/` automatically by searching the submodule — no paths to set.
 
 **3. Point it at your `llama.cpp`.** You need `llama.cpp` built for your GPU
 (ROCm/HIP, CUDA, Metal, …). The tool auto-discovers the binaries in the default
@@ -702,6 +702,6 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for the background and tuning hypotheses.
 ## License
 
 `llama-optimize` is released under the [MIT License](LICENSE). The bundled
-[`robust`](https://github.com/bigattichouse/robust) DOE suite (the `taguchi/`
+[`robust`](https://github.com/bigattichouse/robust) DOE suite (the `robust/`
 submodule) is dedicated to the public domain under CC0-1.0 — so the whole thing is
 free to use, modify, and redistribute.
