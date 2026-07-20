@@ -815,6 +815,30 @@ FACTORS = {
 }
 
 
+# Each ngram sub-parameter applies only to a single --spec-type variant. The
+# orthogonal array assigns all of them independently of the selected variant,
+# so a given row can carry (say) ngram-simple sizes while the active variant is
+# ngram-mod. Those values are inert for that variant and must not be emitted as
+# flags — llama.cpp would receive options that don't belong to the running spec
+# type. Map each param-name prefix to the variant it belongs to.
+NGRAM_PARAM_VARIANT = {
+    "ngram_simple_":   "ngram-simple",
+    "ngram_map_k4v_":  "ngram-map-k4v",
+    "ngram_map_k_":    "ngram-map-k",
+    "ngram_mod_":      "ngram-mod",
+}
+
+
+def _ngram_param_inactive(name: str, f: dict) -> bool:
+    """True if `name` is an ngram sub-parameter whose variant is not the one
+    selected in row `f`, meaning its flag must be suppressed. Non-ngram factors
+    and rows where the matching variant is active return False."""
+    for prefix, variant in NGRAM_PARAM_VARIANT.items():
+        if name.startswith(prefix):
+            return f.get("ngram") != variant
+    return False
+
+
 def factor_flags(cfg: Config, f: dict, driver: str, ub: int) -> list[list[str]]:
     """Argument groups for the sweepable factors in `f` on the given driver, e.g.
     [["-ngl","64"], ["-nkvo"], ["-ctk","f16"]]. Skips env factors, request-time
@@ -827,6 +851,8 @@ def factor_flags(cfg: Config, f: dict, driver: str, ub: int) -> list[list[str]]:
             continue
         flags = spec.get(driver)
         if flags is None or spec.get("request"):
+            continue
+        if _ngram_param_inactive(name, f):         # variant not selected this row
             continue
         if spec.get("translate") is not None:
             val = spec["translate"].get(str(val), str(val))
@@ -949,9 +975,6 @@ def server_command(cfg: Config, f: dict, ctx: int) -> str:
     # ngram self-speculation: pattern-matching decoding that needs no draft
     # model. When enabled server-side, activate a sensible default variant
     # (ngram-mod) unless the sweep explores the ngram dimension.
-    # ngram self-speculation: pattern-matching decoding that needs no draft
-    # model. When enabled server-side, activate a sensible default variant
-    # (ngram-mod) unless the sweep explores the ngram dimension.
     # --spec-draft-n-max is shared with MTP via spec_n_max; only set if
     # neither MTP nor ngram sweeps it.
     if cfg.ngram:
@@ -959,7 +982,7 @@ def server_command(cfg: Config, f: dict, ctx: int) -> str:
             parts.append("--spec-type ngram-mod")
         if "spec_n_max" not in f and not (cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0):
             parts.append("--spec-draft-n-max 16")
-    # into a single comma-separated value.
+    # MTP + ngram can both emit --spec-type; merge into one comma-separated value.
     parts = _merge_spec_type_parts(parts)
     cmd = " \\\n    ".join(["./llama-server"] + parts)
     # prepend any winning env-var factor values as an env prefix
@@ -972,6 +995,7 @@ _OOM_PAT = re.compile(
     r"cudaErrorMemoryAllocation|ggml_backend_.*failed",
     re.IGNORECASE,
 )
+
 
 def parse_bench_json(stdout: str):
     """Return (pp_tps, tg_tps) from llama-bench JSON output, or (None, None)."""
@@ -2054,13 +2078,16 @@ def selftest() -> bool:
         assert parse_bench_json("not json") == (None, None)
 
         # OOM detection
+        assert _OOM_PAT.search("ggml_backend_alloc failed: out of memory")
+        assert _OOM_PAT.search("ROCm error: hipErrorOutOfMemory")
+
+        # thread + depth level generation
         assert len(thread_levels(8, 16)) >= 3
         # depth_levels respects ctx_floor
         assert depth_levels(65536, floor=0)[0] == 0
         assert depth_levels(65536, floor=32768)[0] >= 32768
         assert depth_levels(65536, floor=32768)[-1] == 65536
         assert depth_levels(65536, floor=999999) == [65536]  # floor > top → single
-        assert _OOM_PAT.search("ROCm error: hipErrorOutOfMemory")
 
         # factor-level generation
         assert five_levels_span(0, 64) == [0, 16, 32, 48, 64]
@@ -2371,6 +2398,20 @@ def selftest() -> bool:
                    "ngram_mod_n_match", "ngram_mod_n_min", "ngram_mod_n_max"):
             assert FACTORS[nf].get("server_only"), f"{nf} should be server_only"
 
+        # ngram sub-params are gated by the selected variant: only the active
+        # variant's params are emitted; others (inert for that row) are suppressed
+        # so llama-server never receives options for a spec type it isn't running.
+        gated = _flat(factor_flags(cfg_s, {"ngram": "ngram-mod",
+                                           "ngram_mod_n_match": "16",
+                                           "ngram_simple_size_n": "8"}, "server", 512))
+        assert "--spec-ngram-mod-n-match" in gated, f"got {gated}"
+        assert "--spec-ngram-simple-size-n" not in gated, f"got {gated}"
+        assert not _ngram_param_inactive("ngl", {"ngram": "none"})  # non-ngram unaffected
+        # ngram=none → variant flag omitted AND every sub-param suppressed
+        assert factor_flags(cfg_s, {"ngram": "none",
+                                    "ngram_mod_n_match": "16",
+                                    "ngram_simple_size_n": "8"}, "server", 512) == []
+
         # ngram builds include the ngram factors on the server driver
         cfg_n = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
                        ctx_floor=8192, driver="server", ngram=True,
@@ -2468,6 +2509,7 @@ def selftest() -> bool:
     except AssertionError as e:
         print(f"selftest FAILED: {e}")
         return False
+    print("selftest: all checks passed")
     return True
 
 
@@ -3207,8 +3249,8 @@ def main():
         driver = "server"
         print("note: model has an MTP head — driver auto-switched to server so "
               "the sweep measures and tunes MTP (--driver bench to override)")
-    if (driver == "bench" and args.driver is None and args.ngram
-            and llama_server.exists()):
+    if (driver == "bench" and args.driver is None and uc.get("driver") is None
+            and args.ngram and llama_server.exists()):
         driver = "server"
         print("note: ngram speculation requested — driver auto-switched to server "
               "(--driver bench to override)")
