@@ -728,6 +728,59 @@ def generate_runs(factors: dict, array: str | None):
 
 
 # ---------------------------------------------------------------------------
+# Staged designs for conditional factors — docs/CONDITIONAL-FACTORS.md.
+# A flat orthogonal array cannot hold conditional (active_when) factors without
+# inert columns (F1–F4). plan_stages decomposes a full factor set into a sequence
+# of flat designs, each with every factor active in every row (invariant I1):
+#   - one "screen" stage over the unconditional + gate factors (children excluded,
+#     each variant measured at its default knobs), then
+#   - one "tune:<gate>=<value>" stage per candidate gate value that has children,
+#     pinning the gate to that value and sweeping exactly its children.
+# The executor runs the screen, keeps the surviving gate values (top-K), and runs
+# their tuning stages; the winner is the best MEASURED config across all stages.
+# ---------------------------------------------------------------------------
+def _active_when(name: str):
+    return FACTORS.get(name, {}).get("active_when")
+
+
+def plan_stages(factors: dict) -> list[dict]:
+    """Ordered list of staged flat designs for `factors` (name → levels). Each
+    stage is {name, factors, pin, gate, value}: `factors` is that stage's OA
+    design, `pin` the gate constants that make its conditional children live. The
+    screen stage has pin={} (only unconditional + gate factors). Tuning stages are
+    ordered parent-gate-first so a nested gate is pinned only after the stage that
+    selects it. Every factor in a stage is active in every row (I1)."""
+    # children grouped by the (gate, value) that makes them live
+    kids: dict = {}
+    for n in factors:
+        aw = _active_when(n)
+        if aw:
+            gate, live = aw
+            for v in live:
+                if gate in factors and v in factors[gate]:
+                    kids.setdefault((gate, v), []).append(n)
+
+    screen = {n: factors[n] for n in factors if not _active_when(n)}
+    stages = [{"name": "screen", "factors": screen, "pin": {},
+               "gate": None, "value": None}]
+
+    def gate_depth(g: str) -> int:                 # nesting depth for ordering
+        d, seen, aw = 0, set(), _active_when(g)
+        while aw and aw[0] not in seen:
+            seen.add(aw[0]); d += 1; aw = _active_when(aw[0])
+        return d
+
+    for gate, v in sorted(kids, key=lambda gv: (gate_depth(gv[0]), gv[0],
+                                                factors[gv[0]].index(gv[1]))):
+        fset = {gate: [v]}                          # gate pinned to one value
+        for c in kids[(gate, v)]:
+            fset[c] = factors[c]
+        stages.append({"name": f"tune:{gate}={v}", "factors": fset,
+                       "pin": {gate: v}, "gate": gate, "value": v})
+    return stages
+
+
+# ---------------------------------------------------------------------------
 # Command building + execution
 # ---------------------------------------------------------------------------
 # Named -override-tensor patterns → real llama.cpp tensor regex. "none" emits
@@ -2576,6 +2629,33 @@ def selftest() -> bool:
         cond_means = factor_level_means(cond_rows, "ngram_size_n")
         assert max(cond_means, key=cond_means.get) == "24", cond_means   # true best
         assert "90.0" not in [f"{v}" for v in cond_means.values()]        # decoy row excluded
+
+        # --- stage planner (docs/CONDITIONAL-FACTORS.md) ---
+        stages = plan_stages(nfs)
+        assert stages[0]["name"] == "screen"
+        # screen sweeps the gate at full spread but excludes conditional children
+        assert stages[0]["factors"]["ngram"] == nfs["ngram"]
+        assert not any(_active_when(f) for f in stages[0]["factors"])
+        # one tuning stage per variant that has children (3 map + mod)
+        tune = {s["value"]: s for s in stages if s["gate"] == "ngram"}
+        assert set(tune) == {"ngram-simple", "ngram-map-k", "ngram-map-k4v", "ngram-mod"}
+        # a map variant tunes the 3 collapsed knobs; mod tunes its own 3; gate pinned
+        assert set(tune["ngram-simple"]["factors"]) == \
+            {"ngram", "ngram_size_n", "ngram_size_m", "ngram_min_hits"}
+        assert set(tune["ngram-mod"]["factors"]) == \
+            {"ngram", "ngram_mod_n_match", "ngram_mod_n_min", "ngram_mod_n_max"}
+        assert tune["ngram-simple"]["factors"]["ngram"] == ["ngram-simple"]
+        # I1 liveness: every factor in every stage is active under the stage's pin
+        for s in stages:
+            assert all(is_active(f, s["pin"]) for f in s["factors"]), s["name"]
+        # F2: each tuning stage is small (gate + 3 knobs = 4 factors → fits L25),
+        # versus the flat design's L125
+        assert all(len(s["factors"]) <= 4 for s in stages if s["gate"])
+        # a subset factor set plans just the screen + the one live variant's stage
+        ps = plan_stages({"ngram": ["none", "ngram-mod"],
+                          "ngram_mod_n_max": ["32", "64"], "ngl": ["0", "64"]})
+        assert [s["name"] for s in ps] == ["screen", "tune:ngram=ngram-mod"]
+        assert "ngl" in ps[0]["factors"] and "ngram_mod_n_max" not in ps[0]["factors"]
 
         # spec-type merging: mtp + ngram both present → comma-separated
         merged = _merge_spec_type_parts(["--spec-type draft-mtp", "--spec-type ngram-mod"])
