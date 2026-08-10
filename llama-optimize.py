@@ -81,6 +81,32 @@ def resolve_binary(name: str, explicit: Path | None, hint: Path | None) -> Path:
     return default  # doesn't exist; caller validates and errors clearly
 
 
+_help_cache: dict[str, str] = {}
+
+
+def binary_help(binary: Path) -> str:
+    """Cached `--help` text for a llama.cpp binary; "" if it cannot be run."""
+    key = str(binary)
+    if key not in _help_cache:
+        try:
+            out = subprocess.run([key, "--help"], capture_output=True,
+                                 text=True, timeout=60)
+            _help_cache[key] = (out.stdout or "") + "\n" + (out.stderr or "")
+        except (OSError, subprocess.TimeoutExpired):
+            _help_cache[key] = ""
+    return _help_cache[key]
+
+
+def supports_flag(binary: Path, flag: str) -> bool:
+    """Does this binary's --help advertise exactly `flag`?
+
+    Matched with a boundary so `--fit` does not match `--fit-target`: llama-bench
+    has the -target/-ctx variants but no `--fit` of its own, and a substring test
+    would emit a flag it rejects. llama.cpp exits non-zero on an unknown
+    argument, so a wrong answer here fails every run rather than degrading."""
+    return re.search(re.escape(flag) + r"(?![\w-])", binary_help(binary)) is not None
+
+
 def preflight(binary: Path, timeout: int = 60):
     """Confirm the binary actually runs (not just exists) — catches a wrong build
     or missing GPU libraries. Returns (ok, reason)."""
@@ -1263,6 +1289,10 @@ def bench_command(cfg: Config, f: dict) -> list[str]:
         "-r", str(cfg.reps),
         "-o", "json",
     ]
+    # No auto-fit suppression here: llama-bench has no --fit. It exposes only
+    # --fit-target/--fit-ctx, both off unless asked, so there is nothing to
+    # disable — and emitting a flag it does not know makes it exit non-zero,
+    # which would fail every bench run rather than fail safe.
     if "fa" not in f:                              # flash-attn fixed unless swept
         cmd += ["-fa", str(FIXED_FA)]
     ub = int(f.get("ubatch", 512))
@@ -1530,6 +1560,13 @@ def build_server_args(cfg: Config, f: dict, port: int, n_ctx: int) -> list[str]:
         "--host", "127.0.0.1", "--port", str(port),
         "-c", str(n_ctx),                          # mmap on is the server default
     ]
+    # --fit is on by default and adjusts unset arguments at load time to make
+    # the model fit — silently changing the very configuration being measured,
+    # so a row's factors and what actually ran can disagree. Turn it off, but
+    # only where the binary has it: the flag is recent, and older builds reject
+    # unknown arguments outright. Spelled `--fit off`; there is no `--no-fit`.
+    if supports_flag(cfg.llama_server, "--fit"):
+        args += ["--fit", "off"]
     if not FIXED_MMAP:
         args.append("--no-mmap")                   # llama-server flag (NOT -mmp)
     if "fa" not in f:                              # flash-attn fixed unless swept
@@ -2671,6 +2708,30 @@ def selftest() -> bool:
         assert run_env(cfg, f)["GGML_CUDA_FORCE_MMQ"] == "1"
         cmd2 = bench_command(cfg, {"ubatch": "2048", "batch": "512"})  # clamp b>=ub
         assert cmd2[cmd2.index("-b") + 1] == "2048"
+        # llama-bench has no --fit; emitting one makes it exit non-zero, which
+        # would fail every bench run. Verified against the binary: it answers
+        # "error: invalid parameter for argument: --no-fit".
+        assert "--no-fit" not in cmd and "--fit" not in cmd, cmd
+
+        # Capability probe. The boundary matters: llama-bench advertises
+        # --fit-target and --fit-ctx but has no --fit, so a substring test would
+        # emit a flag it rejects.
+        class _B:
+            def __init__(self, h): self.h = h
+            def __str__(self): return "bin-" + str(id(self))
+        _saved_help = dict(_help_cache)
+        try:
+            _help_cache["srv"] = "-fit,  --fit [on|off]   whether to adjust unset args\n"
+            _help_cache["bench"] = ("-fitt, --fit-target <MiB>  fit model to memory\n"
+                                    "-fitc, --fit-ctx <n>       minimum ctx\n")
+            _help_cache["old"] = "-m, --model FNAME\n"       # predates --fit
+            assert supports_flag(Path("srv"), "--fit")
+            assert not supports_flag(Path("bench"), "--fit")   # the substring trap
+            assert supports_flag(Path("bench"), "--fit-target")
+            assert not supports_flag(Path("old"), "--fit")
+        finally:
+            _help_cache.clear()
+            _help_cache.update(_saved_help)
 
         # effective throughput objective
         assert effective_tps(512, 256, 0, 100) == 0.0
@@ -2899,6 +2960,21 @@ def selftest() -> bool:
         assert "--spec-type" not in sa      # swept off: automatic flag yields
         sa = build_server_args(cfg_m, {"ubatch": "512"}, 8080, 4096)
         assert "--spec-type" in sa and "draft-mtp" in sa  # fixed on if not swept
+        # --fit off is emitted only when the binary advertises --fit, and is
+        # never spelled --no-fit (llama-server: "invalid argument: --no-fit").
+        _saved_help = dict(_help_cache)
+        try:
+            _help_cache[str(cfg_m.llama_server)] = "-fit, --fit [on|off]  adjust unset args\n"
+            sfit = build_server_args(cfg_m, {"ubatch": "512"}, 8080, 4096)
+            assert "--no-fit" not in sfit, sfit
+            assert sfit[sfit.index("--fit") + 1] == "off", sfit
+            # a build without --fit gets nothing rather than a rejected flag
+            _help_cache[str(cfg_m.llama_server)] = "-m, --model FNAME\n"
+            sold = build_server_args(cfg_m, {"ubatch": "512"}, 8080, 4096)
+            assert "--fit" not in sold and "--no-fit" not in sold, sold
+        finally:
+            _help_cache.clear()
+            _help_cache.update(_saved_help)
         # default factor set: nkvo/poll/batch always; ot for dense / ncmoe for
         # MoE; threads_batch + the MTP surface only on the server driver;
         # numa only on a multi-node box
@@ -3124,6 +3200,31 @@ def selftest() -> bool:
                "\nRanked by mu* (importance).\n")
         assert parse_morris_analyze(mci) == [("ngl", 4.867, 4.809),
                                              ("ubatch", 4.831, 5.14)]
+
+        # --- every flag we emit must exist on the real binary ---
+        # The gap that let --no-fit through: asserting a flag is in OUR argv
+        # proves nothing about whether llama.cpp accepts it, and llama.cpp exits
+        # non-zero on an unknown argument -- so a bad flag fails every run, not
+        # one. Skipped when llama.cpp is absent (CI, and --selftest's promise to
+        # need no GPU or model), which is why it cannot be the only guard.
+        _lb = resolve_binary("llama-bench", None, None)
+        _ls = resolve_binary("llama-server", None, None)
+        if _lb.exists() and _ls.exists():
+            fcfg = Config(model=Path("m.gguf"), llama_bench=_lb, llama_server=_ls,
+                          array="auto", ctx_floor=8192, driver="bench",
+                          factors={}, hw={"phys": 8, "logical": 16})
+            ff = {"ngl": "99", "n_depth": "0", "kv_type": "f16",
+                  "ubatch": "512", "threads": "8"}
+            for _which, _cmd, _bin in (
+                    ("bench", bench_command(fcfg, ff), _lb),
+                    ("server", build_server_args(fcfg, ff, 8080, 4096), _ls)):
+                emitted = [t for t in _cmd
+                           if isinstance(t, str) and t.startswith("-")
+                           and not t[1:2].isdigit()]
+                unknown = [x for x in emitted if not supports_flag(_bin, x)]
+                assert not unknown, (
+                    f"{_which} command emits flags this llama.cpp rejects: "
+                    f"{unknown} — it will exit non-zero on every run")
 
         # --- llama-fit-params output parsing (the OOM pruner's input) ---
         # Real output, captured from llama-fit-params --fit-print on. A wrong
