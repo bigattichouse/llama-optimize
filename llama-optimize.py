@@ -1438,7 +1438,12 @@ def validate_measurement(res: dict, parallel: int = 1) -> dict:
         res["implausible"] = why
         # Zero the scores so anything reading them before checking status (the
         # analyzer scores failures as 0) treats this as the non-result it is.
+        # eff_tps too when present: a row loaded from CSV arrives with one
+        # already computed, and leaving it would let the objective keep the
+        # rejected number.
         res["pp_tps"] = res["tg_tps"] = 0.0
+        if "eff_tps" in res:
+            res["eff_tps"] = 0.0
     return res
 
 
@@ -3316,6 +3321,35 @@ def selftest() -> bool:
         finally:
             subprocess.run = _real_run
 
+        # --- CSV round-trip: rejection must survive, and repair old files ---
+        # --report-only never re-measures, so a CSV written before the gate
+        # existed would keep crowning its bogus row forever. Re-validating at
+        # load is the only thing that can fix issue #3's own results file.
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "r.csv"
+            p.write_text(
+                "run_id,ngl,n_depth,parallel,pp_tps,tg_tps,eff_tps,status,secs\n"
+                "1,20,8192,1,444.1,1000000.0,1000000.0,OK,5.0\n"   # legacy bogus
+                "2,20,8192,1,444.1,25.0,25.0,OK,5.0\n"             # honest
+                "3,20,8192,1,0.0,0.0,0.0,OOM,0.0\n")               # untouched
+            got = load_results_csv(p, {})
+            assert got[0]["status"] == "IMPLAUSIBLE", got[0]
+            assert got[0]["tg_tps"] == 0.0 and got[0]["eff_tps"] == 0.0
+            assert got[1]["status"] == "OK" and got[1]["tg_tps"] == 25.0
+            assert got[2]["status"] == "OOM"
+            # the repaired row must not win anything
+            assert pareto_frontier(got) and all(
+                r["status"] == "OK" for r in pareto_frontier(got))
+            assert max(got, key=score_of)["tg_tps"] == 25.0   # honest row wins
+
+            # a legitimately high aggregate under --parallel must survive: the
+            # ceiling scales with the streams recorded in the row
+            p2 = Path(td) / "r2.csv"
+            p2.write_text(
+                "run_id,ngl,parallel,pp_tps,tg_tps,eff_tps,status,secs\n"
+                "1,20,64,900000.0,150000.0,150000.0,OK,5.0\n")
+            assert load_results_csv(p2, {})[0]["status"] == "OK"
+
         # the error check itself, independent of any transport
         try:
             raise_for_server_error({"error": {"message": "boom"}})
@@ -3449,6 +3483,13 @@ def selftest() -> bool:
 # refining the factor set between passes. Keeps the tested execution path intact.
 # ---------------------------------------------------------------------------
 def load_results_csv(path: Path, factors: dict) -> list[dict]:
+    """Read a results CSV, re-validating every row (docs/measurement-validity.md).
+
+    A row read from disk is a measurement entering the tool again, so the same
+    gate applies here as at the drivers (I4). This is also the only thing that
+    can repair a CSV recorded *before* the gate existed: a sweep that stored
+    tg=1000000 with status OK would otherwise keep winning --report-only
+    forever, since re-analysis never re-measures."""
     rows = []
     if not path.exists():
         return rows
@@ -3459,6 +3500,11 @@ def load_results_csv(path: Path, factors: dict) -> list[dict]:
                     r[c] = float(r[c])
                 except (KeyError, ValueError, TypeError):
                     r[c] = 0.0
+            try:                        # a swept --parallel rides in a column
+                par = int(r.get("parallel") or 1)
+            except (TypeError, ValueError):
+                par = 1
+            validate_measurement(r, parallel=par)
             rows.append(r)
     return rows
 
