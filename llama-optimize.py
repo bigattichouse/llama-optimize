@@ -318,21 +318,24 @@ def _fit_params_flags(f: dict, driver: str) -> list[str]:
 # Track whether we've already warned about a disabled prune (once per sweep).
 _oom_prune_warned = False
 
-# Cache for predict_fits: keyed by (model, ngl, n_depth, kv_type, nkvo).
-# ngl+n_depth+kv_type+nkvo drive >95% of the VRAM variance, so memoizing
-# cuts ~125 subprocess calls in an L125 sweep to ~10-15 unique ones.
-_fit_cache: dict[tuple, bool] = {}
+# Cache for predict_fits: memoizing collapses the ~125 subprocess calls of an
+# L125 sweep to the handful of distinct footprints it actually contains.
+#
+# The key is the *estimator's own argv*, not a hand-picked subset of factors.
+# Anything that changes the estimate necessarily changes the flags, so the key
+# cannot fall out of step with _fit_params_flags: adding a VRAM-relevant factor
+# there extends the key for free. Listing factors separately was the bug this
+# replaces — ncmoe and ot were forwarded as flags but missing from the key, so
+# configs differing only in expert offload collided and inherited each other's
+# verdict. A pruned row never runs, so a wrong verdict silently deletes a valid
+# config from the sweep — on MoE models, where -ncmoe is the biggest VRAM lever
+# we have, exactly the configs the feature exists to sort out.
+_fit_cache: dict[tuple, bool | None] = {}
 
 
-def _fit_cache_key(cfg: "Config", f: dict) -> tuple:
-    """Cache key from the VRAM-dominant factors + model path."""
-    return (
-        str(cfg.model),
-        f.get("ngl", ""),
-        f.get("n_depth", ""),
-        f.get("kv_type", ""),
-        f.get("nkvo", "1"),
-    )
+def _fit_cache_key(cfg: "Config", f: dict, driver: str) -> tuple:
+    """Identity of a fit estimate: the model plus the exact args we'd pass."""
+    return (str(cfg.model), tuple(_fit_params_flags(f, driver)))
 
 
 def predict_fits(cfg: "Config", f: dict, driver: str) -> bool | None:
@@ -344,7 +347,7 @@ def predict_fits(cfg: "Config", f: dict, driver: str) -> bool | None:
     total_vram = cfg.hw.get("vram")
     if total_vram is None or not cfg.fit_params.exists():
         return None
-    key = _fit_cache_key(cfg, f)
+    key = _fit_cache_key(cfg, f, driver)
     if key in _fit_cache:
         return _fit_cache[key]
     try:
@@ -353,6 +356,10 @@ def predict_fits(cfg: "Config", f: dict, driver: str) -> bool | None:
         args += _fit_params_flags(f, driver)
         proc = subprocess.run(args, capture_output=True, text=True, timeout=30)
         if proc.returncode != 0:
+            # Indeterminate is a real answer and worth remembering: a binary
+            # that rejects these flags rejects them every time, and without
+            # caching we would respawn it once per row to learn that again.
+            _fit_cache[key] = None
             return None
         # Parse output: each line is "DEVICE model context compute" in MiB.
         # Host is not counted — we care about GPU device lines only.
@@ -2936,6 +2943,33 @@ def selftest() -> bool:
         f4 = {"ngl": "32", "n_depth": "8192", "ncmoe": "16"}
         s4 = _fit_params_flags(f4, "bench")
         assert "-ncmoe" in s4 and "16" in s4
+
+        # --- OOM pruning: the fit cache must not merge distinct footprints ---
+        # A cached verdict is applied to a row that is then never run, so a
+        # collision doesn't produce a wrong number — it silently deletes a
+        # valid config from the sweep. Every factor _fit_params_flags forwards
+        # must therefore reach the key. Asserted as a property (perturb one
+        # factor at a time) rather than by listing names, so a VRAM-relevant
+        # factor added later is covered without anyone remembering to.
+        class _FC:                        # minimal Config stand-in
+            model = Path("m.gguf")
+        base = {"ngl": "32", "n_depth": "8192", "kv_type": "f16",
+                "nkvo": "1", "ncmoe": "0", "ot": "none"}
+        # each perturbation changes the estimated footprint, so each must
+        # change the key (ncmoe/ot were the two the original key dropped)
+        for knob, other in (("ngl", "16"), ("n_depth", "32768"),
+                            ("kv_type", "q4_0"), ("nkvo", "0"),
+                            ("ncmoe", "40"), ("ot", "ffn_cpu")):
+            alt = {**base, knob: other}
+            assert _fit_cache_key(_FC, base, "bench") != _fit_cache_key(_FC, alt, "bench"), \
+                f"fit cache key ignores {knob}: configs differing only in " \
+                f"{knob} would inherit each other's OOM verdict"
+        # same config → same key (the memo still has to memoize)
+        assert _fit_cache_key(_FC, base, "bench") == _fit_cache_key(_FC, dict(base), "bench")
+        # different model, identical flags → different key
+        class _FC2:
+            model = Path("other.gguf")
+        assert _fit_cache_key(_FC, base, "bench") != _fit_cache_key(_FC2, base, "bench")
     except AssertionError as e:
         print(f"selftest FAILED: {e}")
         return False
