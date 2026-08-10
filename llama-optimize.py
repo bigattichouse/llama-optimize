@@ -901,7 +901,12 @@ def choose_array(factors: dict) -> str | None:
     nf, mx = len(counts), max(counts)
     # Mixed level counts ride on the array of the largest base (a 2-level factor
     # maps onto a 5-level column with a modulo imbalance the level means absorb).
-    # The binding only ships pure 2/3/5-level arrays — no mixed L18/L36/L50.
+    # We deliberately pick from the pure 2/3/5-level arrays only. The library
+    # does ship one mixed array, L18 (one 2-level column and seven 3-level), but
+    # it fits only a factor set whose largest count is 3 — and ours almost always
+    # carries a 5-level factor (ngl, n_depth, threads, ubatch all default to 5),
+    # so L18 would apply rarely and is not worth a second selection path until a
+    # real factor set wants it.
     base = 2 if mx <= 2 else 3 if mx == 3 else 5 if mx <= 5 else None
     if base is None:
         return None
