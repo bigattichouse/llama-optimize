@@ -112,6 +112,34 @@ def find_taguchi_binding() -> Path:
         )
     return hits[0].parents[1]  # .../bindings/python
 
+
+def find_robust_binary(name: str) -> Path:
+    p = SUBMODULE_DIR / "build" / "bin" / name
+    if p.exists():
+        return p
+    hits = list(SUBMODULE_DIR.glob(f"**/bin/{name}"))
+    return hits[0] if hits else p
+
+
+def prepare_taguchi_cli():
+    """Point the python binding at the taguchi CLI we actually built.
+
+    The binding locates the CLI by walking paths relative to its own package
+    dir, which assumed the old layout (taguchi/build/taguchi, produced by a
+    vendored sub-make). Upstream now builds taguchi as a normal peer into
+    build/bin/, so those relative guesses all miss and the binding raises
+    "Could not find taguchi CLI" — even though it is sitting right there.
+    Rather than depend on the submodule's internal layout, hand it the path:
+    TAGUCHI_CLI_PATH is the enhanced binding's highest-priority source, and
+    PATH covers the plain binding, which only falls back to shutil.which."""
+    cli = find_robust_binary("taguchi")
+    if not cli.exists():
+        return
+    os.environ.setdefault("TAGUCHI_CLI_PATH", str(cli))
+    bindir = str(cli.parent)
+    if bindir not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = bindir + os.pathsep + os.environ.get("PATH", "")
+
 # Fixed parameters (see design notes): flash-attn is a precondition for KV-quant
 # and a near-certain win on gfx906; mmap on is the sane default; batch fixed to
 # avoid invalid batch<ubatch combinations.
@@ -715,6 +743,7 @@ def generate_runs(factors: dict, array: str | None):
                       for i, lvl in enumerate(levels)]
 
     sys.path.insert(0, str(find_taguchi_binding()))
+    prepare_taguchi_cli()
     from taguchi import Experiment  # noqa: E402
 
     if array and array.lower() == "auto":
@@ -2050,6 +2079,7 @@ def taguchi_effects(cfg: Config, exp, rows: list[dict]):
               "apply — every level was measured directly)")
         return None, None
     try:
+        prepare_taguchi_cli()
         from taguchi import Analyzer
     except Exception:
         return None, None
@@ -2760,6 +2790,18 @@ def selftest() -> bool:
         mtxt = ("Factor  mu*  sigma  note\n------  ----  -----  ----\n"
                 "ubatch  96  0\nngl  32  0.001  \n\nRanked by mu* ...\n")
         assert parse_morris_analyze(mtxt) == [("ubatch", 96.0, 0.0), ("ngl", 32.0, 0.001)]
+        # ...and the same table once morris grew a 95% CI on mu*. The CI is
+        # printed glued to the value, so a positional split() reads it as the
+        # mu* token and drops every row -- which silently turned --screen into
+        # a no-op (rankings empty => "keeping all factors") after paying for
+        # the runs. Both spellings, glued and space-separated, must parse.
+        mci = ("Factor       mu* [95% CI]   sigma   note\n"
+               "------       ------------   -----   ----\n"
+               "ngl       4.867[4.4,5.51]   4.809   interacting/nonlinear\n"
+               "ubatch    4.831 [4.1,5.5]    5.14   interacting/nonlinear\n"
+               "\nRanked by mu* (importance).\n")
+        assert parse_morris_analyze(mci) == [("ngl", 4.867, 4.809),
+                                             ("ubatch", 4.831, 5.14)]
 
         # ttft note: prefill-cost estimate on emitted commands
         n = ttft_note({"pp_tps": 100.0}, 235520)
@@ -3247,12 +3289,12 @@ def run_ngram_stages(args, cfg: Config):
 # interactions (sigma) at ~r*(k+1) runs, using the vendored `robust` morris tool
 # for the design + analysis and our own driver (with crash journal) for the runs.
 # ---------------------------------------------------------------------------
-def find_robust_binary(name: str) -> Path:
-    p = SUBMODULE_DIR / "build" / "bin" / name
-    if p.exists():
-        return p
-    hits = list(SUBMODULE_DIR.glob(f"**/bin/{name}"))
-    return hits[0] if hits else p
+# Table row: factor, mu*, sigma. morris grew a 95% CI on mu* (upstream E1),
+# printed glued to the value as `4.867[4.4,5.51]` — so a plain split()[1] no
+# longer parses as a float. Accept mu* with or without a trailing CI, in either
+# the glued or space-separated spelling, so we read both old and new output.
+_MORRIS_ROW = re.compile(
+    r"^(\S+)\s+([-+0-9.eE]+)\s*(?:\[[^\]]*\])?\s+([-+0-9.eE]+)")
 
 
 def parse_morris_analyze(text: str):
@@ -3265,10 +3307,10 @@ def parse_morris_analyze(text: str):
         if started:
             if not line.strip():
                 break
-            parts = line.split()
-            if len(parts) >= 3:
+            m = _MORRIS_ROW.match(line)
+            if m:
                 try:
-                    out.append((parts[0], float(parts[1]), float(parts[2])))
+                    out.append((m.group(1), float(m.group(2)), float(m.group(3))))
                 except ValueError:
                     pass
     return out
