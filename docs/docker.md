@@ -51,7 +51,7 @@ Then, inside the container, install as usual:
 ```bash
 git clone --recurse-submodules https://github.com/bigattichouse/llama-optimize
 cd llama-optimize
-make -C robust
+make -C robust all
 ```
 
 The llama.cpp binaries live in `/app` in the official images, which is not where

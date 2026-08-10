@@ -49,6 +49,31 @@ Available devices:
   ROCm0: AMD Instinct MI50/MI60 (32752 MiB, 32730 MiB free)
 ```
 
+Issue #5's reporter supplied theirs, which is the mixed pair this is all about:
+
+```
+Available devices:
+  CUDA0: NVIDIA GeForce RTX 3090 (24117 MiB, 6672 MiB free)
+  CUDA1: NVIDIA GeForce RTX 3060 (11909 MiB, 9837 MiB free)
+```
+
+Three things that data settles:
+
+- The CUDA and ROCm lines are the **same shape**, so one parser genuinely
+  covers both — the assumption this design rests on, now confirmed rather than
+  assumed.
+- A VRAM-proportional starting split is roughly **2:1** (24117 : 11909), which
+  is a long way from the even split llama.cpp picks by default. There is real
+  headroom here, which is what makes the sweep worth running.
+- **`free` differs sharply from total** (6672 free of 24117 on CUDA0, because a
+  display or another workload holds the rest). Level generation must use *free*,
+  not total, or the proportional split will be derived from capacity the run
+  cannot actually have. Add to the checklist.
+
+It also demonstrates the ordering hazard concretely: the 3090 is the larger and
+faster card, so getting the order backwards would hand two thirds of the model to
+the 3060.
+
 It is the authoritative order (the one `-ts` and `-dev` index into), it carries
 per-device total **and free** VRAM, and it is vendor-neutral — `ROCm0`, `CUDA0`,
 `Vulkan0` all parse identically, so one parser replaces the two vendor paths and
@@ -139,6 +164,8 @@ same shape that took ngram from 9 knobs to 3 collapsed ones and L125 back to L25
 ## Checklist
 
 - [ ] Per-device capacities recorded in `hw` (parsing already returns them)
+- [ ] `ts_levels()` derives from **free** VRAM, not total — issue #5's CUDA0
+      reports 6672 MiB free of 24117
 - [ ] `M2` guard: placement factors only when >1 device is detected
 - [ ] `-sm` registry entry (gate) + `-ts`/`-mg` with `active_when`
 - [ ] `ts_levels()` generator + normalisation/dedup, with tests

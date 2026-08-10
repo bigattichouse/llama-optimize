@@ -3080,6 +3080,38 @@ def selftest() -> bool:
         mtxt = ("Factor  mu*  sigma  note\n------  ----  -----  ----\n"
                 "ubatch  96  0\nngl  32  0.001  \n\nRanked by mu* ...\n")
         assert parse_morris_analyze(mtxt) == [("ubatch", 96.0, 0.0), ("ngl", 32.0, 0.001)]
+        # morris --json: the stable contract, used for decisions. Real shape,
+        # captured from `morris analyze ... --json`.
+        mjson = json.dumps({
+            "tool": "morris", "command": "analyze", "schema": 1,
+            "metric": "eff_tps", "trajectories": 2, "all_zero": False,
+            "factors": [
+                {"factor": "kv_type", "rank": 1, "mu_star": 215.572275,
+                 "sigma": 8.066638804, "share": 0.939, "interacting": False},
+                {"factor": "n_depth", "rank": 2, "mu_star": 8.8437,
+                 "sigma": 12.50688048, "share": 0.038, "interacting": True},
+            ]})
+        d, why = parse_morris_json(mjson)
+        assert why is None and d["all_zero"] is False
+        assert [f["factor"] for f in d["factors"]] == ["kv_type", "n_depth"]
+        assert d["factors"][0]["mu_star"] == 215.572275
+        # an unknown schema must be refused, not guessed at -- upstream bumps it
+        # only on a rename or removal, so a field we rely on may have moved
+        d2, why2 = parse_morris_json(json.dumps({"tool": "morris", "schema": 2,
+                                                 "factors": []}))
+        assert d2 is None and "schema" in why2
+        # older morris (no --json) prints the table; fall back rather than crash
+        d3, why3 = parse_morris_json("Morris elementary effects (metric: x)\n")
+        assert d3 is None and why3
+        assert parse_morris_json("")[0] is None
+        assert parse_morris_json(json.dumps({"tool": "sobol", "schema": 1}))[0] is None
+        # all_zero is the tell for the exact defect that started this: a screen
+        # where the response never moved, previously indistinguishable from a
+        # legitimate empty ranking
+        d4, _ = parse_morris_json(json.dumps({"tool": "morris", "schema": 1,
+                                              "all_zero": True, "factors": []}))
+        assert d4 and d4["all_zero"] is True
+
         # ...and the same table once morris grew a 95% CI on mu*. The CI is
         # printed glued to the value, so a positional split() reads it as the
         # mu* token and drops every row -- which silently turned --screen into
@@ -3933,6 +3965,31 @@ _MORRIS_ROW = re.compile(
     r"^(\S+)\s+([-+0-9.eE]+)\s*(?:\[[^\]]*\])?\s+([-+0-9.eE]+)")
 
 
+# morris --json contract version we know how to read. Upstream bumps this only
+# on a rename or removal, never on an addition, so an unknown value means the
+# meaning of a field we rely on may have changed — refuse it and fall back
+# rather than misread it. Declining a version we do not know is the signal the
+# original CI change lacked.
+MORRIS_JSON_SCHEMA = 1
+
+
+def parse_morris_json(text: str):
+    """(data, None) for usable morris --json, or (None, reason) to fall back."""
+    try:
+        d = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return None, "output was not JSON (older morris without --json?)"
+    if not isinstance(d, dict) or d.get("tool") != "morris":
+        return None, "JSON did not come from morris"
+    schema = d.get("schema")
+    if schema != MORRIS_JSON_SCHEMA:
+        return None, (f"unknown --json schema {schema!r} (this build reads "
+                      f"{MORRIS_JSON_SCHEMA}); not guessing at its meaning")
+    if not isinstance(d.get("factors"), list):
+        return None, "JSON had no factors array"
+    return d, None
+
+
 def parse_morris_analyze(text: str):
     """Parse the morris analyze table into [(factor, mu_star, sigma), ...]."""
     out, started = [], False
@@ -4038,10 +4095,38 @@ def morris_screen(cfg: Config, args, ap, trajectories: int):
         fh.close()
         journal.close()
 
-    out = subprocess.run([str(morris), "analyze", str(space_path), str(res_path),
-                          "--metric", "eff_tps"], capture_output=True, text=True)
-    print("\n" + out.stdout)
-    rankings = parse_morris_analyze(out.stdout)
+    base_cmd = [str(morris), "analyze", str(space_path), str(res_path),
+                "--metric", "eff_tps"]
+    # Decisions read --json, the stable contract. The table is for the log only:
+    # parsing it positionally is what silently turned this whole stage into a
+    # no-op when upstream glued a confidence interval onto the mu* column.
+    js = subprocess.run(base_cmd + ["--json"], capture_output=True, text=True)
+    tbl = subprocess.run(base_cmd, capture_output=True, text=True)
+    print("\n" + tbl.stdout)
+    data, why = (parse_morris_json(js.stdout) if js.returncode == 0
+                 else (None, f"morris --json exited {js.returncode}"))
+    # Diagnostics (near-tie cuts, overlapping CIs, all-inert results) go to
+    # stderr in --json mode too, and the prose there is the useful part.
+    for stream in (js.stderr, tbl.stderr):
+        if stream and stream.strip():
+            print(stream.strip())
+            break
+    if data:
+        rankings = [(f.get("factor", ""), float(f.get("mu_star", 0.0)),
+                     float(f.get("sigma", 0.0)))
+                    for f in data["factors"] if f.get("factor")]
+        # all_zero means the response never moved across the whole design. That
+        # is almost always a broken harness, not a genuine "nothing matters" —
+        # and it used to be indistinguishable from a real empty ranking.
+        if data.get("all_zero"):
+            print("\n  every factor measured zero effect — the response never "
+                  "moved.\n  That usually means the runs failed rather than that "
+                  "nothing matters;\n  check the statuses above before trusting "
+                  "this. Keeping all factors.")
+            return
+    else:
+        print(f"(morris --json unusable: {why}; falling back to the table)")
+        rankings = parse_morris_analyze(tbl.stdout)
     if not rankings:
         print("(morris analyze returned no rankings — keeping all factors)")
         return

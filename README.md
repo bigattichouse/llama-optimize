@@ -58,7 +58,7 @@ If `robust/` is empty, step 1 didn't run — `git submodule update --init` fixes
 build produces everything both funnel stages need:
 
 ```bash
-make -C robust           # builds libtaguchi.so (Taguchi arrays + main-effects)
+make -C robust all       # builds libtaguchi.so (Taguchi arrays + main-effects)
                          # and the morris binary (for --screen)
 ```
 
