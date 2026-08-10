@@ -417,6 +417,25 @@ def _fit_cache_key(cfg: "Config", f: dict, driver: str) -> tuple:
     return (str(cfg.model), tuple(_fit_params_flags(f, driver)))
 
 
+def parse_fit_print(stdout: str) -> int:
+    """Total GPU MiB from `llama-fit-params --fit-print on`.
+
+    Each line is "DEVICE model context compute" in MiB, e.g.
+    "ROCm0 271 27 513". The Host line is system RAM, not VRAM, and is excluded —
+    counting it would inflate the footprint and prune configs that fit."""
+    gpu_used = 0
+    for line in stdout.strip().splitlines():
+        if not line.strip() or line.startswith("Host"):
+            continue
+        parts = line.split()
+        if len(parts) >= 4:
+            try:
+                gpu_used += sum(int(p) for p in parts[1:4])
+            except ValueError:
+                continue                   # not a device line; ignore
+    return gpu_used
+
+
 def predict_fits(cfg: "Config", f: dict, driver: str) -> bool | None:
     """Estimate whether factor config `f` fits in GPU VRAM using
     llama-fit-params --fit-print. Returns True (fits), False (would OOM), or
@@ -440,16 +459,7 @@ def predict_fits(cfg: "Config", f: dict, driver: str) -> bool | None:
             # caching we would respawn it once per row to learn that again.
             _fit_cache[key] = None
             return None
-        # Parse output: each line is "DEVICE model context compute" in MiB.
-        # Host is not counted — we care about GPU device lines only.
-        gpu_used = 0
-        for line in proc.stdout.strip().splitlines():
-            if not line.strip() or line.startswith("Host"):
-                continue
-            parts = line.split()
-            if len(parts) >= 4:
-                # lines: CUDA0 model_mib context_mib compute_mib
-                gpu_used += sum(int(p) for p in parts[1:4])
+        gpu_used = parse_fit_print(proc.stdout)
         limit = total_vram - cfg.fit_headroom_mib
         result = gpu_used < limit
         _fit_cache[key] = result
@@ -3078,6 +3088,66 @@ def selftest() -> bool:
         assert parse_morris_analyze(mci) == [("ngl", 4.867, 4.809),
                                              ("ubatch", 4.831, 5.14)]
 
+        # --- llama-fit-params output parsing (the OOM pruner's input) ---
+        # Real output, captured from llama-fit-params --fit-print on. A wrong
+        # number here prunes a config that would have run, and the row never
+        # appears to contradict it.
+        assert parse_fit_print("ROCm0 271 27 513 \nHost 170 0 12") == 811
+        assert parse_fit_print("Host 170 0 12") == 0        # host RAM is not VRAM
+        # multi-GPU: every device line counts toward the footprint
+        assert parse_fit_print("CUDA0 271 27 513\nCUDA1 100 10 90\nHost 5 0 1") == 1011
+        assert parse_fit_print("") == 0
+        assert parse_fit_print("garbage\nROCm0 1 2 3") == 6   # skip unparseable
+        assert parse_fit_print("ROCm0 a b c") == 0            # non-numeric ignored
+
+        # ...and predict_fits must actually use it. Testing the parser alone
+        # leaves the wiring free to regress: stubbing the parse out still
+        # passed until this was added, because a footprint of 0 fits anything
+        # and the pruner would simply stop pruning.
+        _real_run2, _real_exists = subprocess.run, Path.exists
+        try:
+            class _P:
+                returncode, stderr = 0, ""
+                def __init__(self, out): self.stdout = out
+            fit_cfg = Config(model=Path("m.gguf"), llama_bench=Path("b"),
+                             array="auto", ctx_floor=8192, driver="bench",
+                             fit_params=Path("llama-fit-params"),
+                             hw={"phys": 8, "logical": 16, "vram": 8192})
+            Path.exists = lambda self: True          # pretend the binary is there
+            row_f = {"ngl": "20", "n_depth": "8192", "kv_type": "f16"}
+
+            # 811 MiB against 8192 - 512 headroom -> fits
+            subprocess.run = lambda *a, **k: _P("ROCm0 271 27 513\nHost 170 0 12")
+            _fit_cache.clear()
+            assert predict_fits(fit_cfg, row_f, "bench") is True
+            # 20000 MiB on the same card -> cannot fit
+            subprocess.run = lambda *a, **k: _P("ROCm0 19000 500 500\nHost 170 0 12")
+            _fit_cache.clear()
+            assert predict_fits(fit_cfg, row_f, "bench") is False
+            # host-only output means no GPU footprint seen -> must not prune
+            subprocess.run = lambda *a, **k: _P("Host 170 0 12")
+            _fit_cache.clear()
+            assert predict_fits(fit_cfg, row_f, "bench") is True
+        finally:
+            subprocess.run, Path.exists = _real_run2, _real_exists
+            _fit_cache.clear()
+
+        # --- submodule discovery (the reorg that broke us) ---
+        # Both are layout-dependent by nature: upstream moved taguchi under
+        # optimize/ and stopped building it into taguchi/build, which silently
+        # broke the binding. These assert the discovery still lands on a real
+        # file, so the next reorg fails here instead of mid-sweep.
+        if SUBMODULE_DIR.exists():
+            binding = find_taguchi_binding()
+            assert (binding / "taguchi" / "__init__.py").exists(), binding
+            cli = find_robust_binary("taguchi")
+            if cli.exists():               # only meaningful once built
+                prepare_taguchi_cli()
+                assert os.environ.get("TAGUCHI_CLI_PATH") == str(cli)
+                assert str(cli.parent) in os.environ["PATH"].split(os.pathsep)
+                # the binding's own fallback is shutil.which, so PATH must work
+                assert shutil.which("taguchi")
+
         # --- multi-GPU VRAM detection (issue #5) ---
         # Both smi tools emit one line/key per device. Reading only the first
         # understates a multi-GPU box, and that number is the OOM pruner's
@@ -3209,6 +3279,42 @@ def selftest() -> bool:
             assert r_e["status"] == "ERROR", r_e
         finally:
             globals()["_completion"] = _real_completion
+
+        # The bench driver needs the same wiring as the server driver above.
+        # It reaches validate_measurement by a different route, and llama-bench
+        # has the same exposure -- it divides the NOMINAL n_prompt + n_gen by
+        # measured time (llama-bench.cpp:1473), guarded upstream only since May
+        # 2025, so older builds still report a huge rate for a decode that did
+        # nothing. Drive run_one over a faked subprocess to prove the gate is
+        # actually on this path too.
+        _real_run = subprocess.run
+
+        class _Proc:
+            def __init__(self, out):
+                self.returncode, self.stdout, self.stderr = 0, out, ""
+
+        def _bench_json(tg):
+            return json.dumps([
+                {"n_prompt": 512, "n_gen": 0, "avg_ts": 444.1},
+                {"n_prompt": 0, "n_gen": 128, "avg_ts": tg},
+            ])
+        try:
+            bench_cfg = Config(model=Path("m.gguf"), llama_bench=Path("llama-bench"),
+                               array="auto", ctx_floor=8192, driver="bench",
+                               factors={}, hw={"phys": 8, "logical": 16})
+            row = {"ngl": "20", "n_depth": "8192", "kv_type": "f16",
+                   "ubatch": "1024", "threads": "16"}
+
+            subprocess.run = lambda *a, **k: _Proc(_bench_json(1_000_000.0))
+            rb = run_one(bench_cfg, row, 60)
+            assert rb["status"] == "IMPLAUSIBLE", rb
+            assert rb["tg_tps"] == 0.0 and rb["implausible"]
+
+            subprocess.run = lambda *a, **k: _Proc(_bench_json(25.0))
+            rg = run_one(bench_cfg, row, 60)
+            assert rg["status"] == "OK" and rg["tg_tps"] == 25.0, rg
+        finally:
+            subprocess.run = _real_run
 
         # the error check itself, independent of any transport
         try:
