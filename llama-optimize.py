@@ -1262,6 +1262,7 @@ def bench_command(cfg: Config, f: dict) -> list[str]:
         "-n", str(cfg.n_gen),
         "-r", str(cfg.reps),
         "-o", "json",
+        "--no-fit",
     ]
     if "fa" not in f:                              # flash-attn fixed unless swept
         cmd += ["-fa", str(FIXED_FA)]
@@ -1529,6 +1530,7 @@ def build_server_args(cfg: Config, f: dict, port: int, n_ctx: int) -> list[str]:
         str(cfg.llama_server), "-m", str(cfg.model),
         "--host", "127.0.0.1", "--port", str(port),
         "-c", str(n_ctx),                          # mmap on is the server default
+        "--no-fit",
     ]
     if not FIXED_MMAP:
         args.append("--no-mmap")                   # llama-server flag (NOT -mmp)
@@ -2671,6 +2673,7 @@ def selftest() -> bool:
         assert run_env(cfg, f)["GGML_CUDA_FORCE_MMQ"] == "1"
         cmd2 = bench_command(cfg, {"ubatch": "2048", "batch": "512"})  # clamp b>=ub
         assert cmd2[cmd2.index("-b") + 1] == "2048"
+        assert "--no-fit" in cmd, "bench_command must emit --no-fit (disable auto-fit)"
 
         # effective throughput objective
         assert effective_tps(512, 256, 0, 100) == 0.0
@@ -2899,6 +2902,7 @@ def selftest() -> bool:
         assert "--spec-type" not in sa      # swept off: automatic flag yields
         sa = build_server_args(cfg_m, {"ubatch": "512"}, 8080, 4096)
         assert "--spec-type" in sa and "draft-mtp" in sa  # fixed on if not swept
+        assert "--no-fit" in sa, "build_server_args must emit --no-fit (disable auto-fit)"
         # default factor set: nkvo/poll/batch always; ot for dense / ncmoe for
         # MoE; threads_batch + the MTP surface only on the server driver;
         # numa only on a multi-node box
