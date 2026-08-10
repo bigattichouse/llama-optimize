@@ -310,6 +310,107 @@ def gpu_temp_c() -> float | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Predictive OOM pruning: use llama-fit-params --fit-print to estimate VRAM
+# before running a config — skip configs that can't fit, saving a model load
+# + timeout per doomed row (ROADMAP item 2).
+# ---------------------------------------------------------------------------
+def _fit_params_flags(f: dict, driver: str) -> list[str]:
+    """Build llama-fit-params args from the VRAM-relevant factors in a run row.
+    Only the factors that affect memory footprint are forwarded; the rest of the
+    config (threads, poll, batch, spec knobs) is irrelevant to the estimate."""
+    flags = []
+    # GPU layers
+    if "ngl" in f:
+        flags += ["-ngl", f["ngl"]]
+    # Context size (n_depth for bench, but fit-params uses -c for both)
+    ctx = f.get("n_depth", "0")
+    flags += ["-c", ctx]
+    # KV cache type
+    if "kv_type" in f:
+        flags += ["-ctk", f["kv_type"], "-ctv", f["kv_type"]]
+    # KV offload: fit-params follows server conventions (--no-kv-offload)
+    if f.get("nkvo", "1") == "0":
+        flags.append("--no-kv-offload")
+    # Tensor placement overrides (ot factor — only when present and not "none")
+    if "ot" in f:
+        pat = OT_PATTERNS.get(f["ot"], "")
+        if pat:
+            flags += ["-ot", pat]
+    # MoE expert offload
+    if "ncmoe" in f:
+        flags += ["-ncmoe", f["ncmoe"]]
+    return flags
+
+
+# Track whether we've already warned about a disabled prune (once per sweep).
+_oom_prune_warned = False
+
+# Cache for predict_fits: memoizing collapses the ~125 subprocess calls of an
+# L125 sweep to the handful of distinct footprints it actually contains.
+#
+# The key is the *estimator's own argv*, not a hand-picked subset of factors.
+# Anything that changes the estimate necessarily changes the flags, so the key
+# cannot fall out of step with _fit_params_flags: adding a VRAM-relevant factor
+# there extends the key for free. Listing factors separately was the bug this
+# replaces — ncmoe and ot were forwarded as flags but missing from the key, so
+# configs differing only in expert offload collided and inherited each other's
+# verdict. A pruned row never runs, so a wrong verdict silently deletes a valid
+# config from the sweep — on MoE models, where -ncmoe is the biggest VRAM lever
+# we have, exactly the configs the feature exists to sort out.
+_fit_cache: dict[tuple, bool | None] = {}
+
+
+def _fit_cache_key(cfg: "Config", f: dict, driver: str) -> tuple:
+    """Identity of a fit estimate: the model plus the exact args we'd pass."""
+    return (str(cfg.model), tuple(_fit_params_flags(f, driver)))
+
+
+def predict_fits(cfg: "Config", f: dict, driver: str) -> bool | None:
+    """Estimate whether factor config `f` fits in GPU VRAM using
+    llama-fit-params --fit-print. Returns True (fits), False (would OOM), or
+    None (could not determine — skip pruning for safety). Only considers GPU
+    devices; when there are none, always returns True (CPU-only fits)."""
+    global _oom_prune_warned, _fit_cache
+    total_vram = cfg.hw.get("vram")
+    if total_vram is None or not cfg.fit_params.exists():
+        return None
+    key = _fit_cache_key(cfg, f, driver)
+    if key in _fit_cache:
+        return _fit_cache[key]
+    try:
+        args = [str(cfg.fit_params), "-m", str(cfg.model),
+                "--fit-print", "on"]
+        args += _fit_params_flags(f, driver)
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=30)
+        if proc.returncode != 0:
+            # Indeterminate is a real answer and worth remembering: a binary
+            # that rejects these flags rejects them every time, and without
+            # caching we would respawn it once per row to learn that again.
+            _fit_cache[key] = None
+            return None
+        # Parse output: each line is "DEVICE model context compute" in MiB.
+        # Host is not counted — we care about GPU device lines only.
+        gpu_used = 0
+        for line in proc.stdout.strip().splitlines():
+            if not line.strip() or line.startswith("Host"):
+                continue
+            parts = line.split()
+            if len(parts) >= 4:
+                # lines: CUDA0 model_mib context_mib compute_mib
+                gpu_used += sum(int(p) for p in parts[1:4])
+        limit = total_vram - cfg.fit_headroom_mib
+        result = gpu_used < limit
+        _fit_cache[key] = result
+        return result
+    except (OSError, ValueError, subprocess.TimeoutExpired, IndexError):
+        if not _oom_prune_warned:
+            print("OOM prune: unable to estimate — running all configs anyway "
+                  "(conservative; --no-oom-prune silences this)", file=sys.stderr)
+            _oom_prune_warned = True
+        return None
+
+
 # Thermal "wait and watch": between runs, block until the GPU falls back to
 # within THERMAL_BAND_C of the idle baseline so each config is measured from a
 # comparable thermal state (the MI50 throttles ~1.8× cool-vs-hot, a swing bigger
@@ -587,6 +688,10 @@ class Config:
     parallel: int = 1             # concurrent request streams (server driver)
     server_start_timeout: int = 180  # max seconds to wait for llama-server to load
     measure_vram: bool = False       # sample peak VRAM used during each run
+    oom_prune: bool = True           # skip configs predicted to OOM via llama-fit-params
+    fit_headroom_mib: int = 512      # safety margin under detected VRAM for OOM pruning
+    fit_params: Path = field(
+        default_factory=lambda: WORKSPACE / "llama.cpp" / "build" / "bin" / "llama-fit-params")
     score: str = "tg"             # objective: "tg" (decode only) or "eff" (blend pp+tg)
     factors: dict = field(default_factory=dict)
     hw: dict = field(default_factory=dict)
@@ -2850,6 +2955,67 @@ def selftest() -> bool:
     except AssertionError as e:
         print(f"selftest FAILED: {e}")
         return False
+
+    # --- OOM pruning: fit-params flag generation ---
+    try:
+        f = {"ngl": "32", "n_depth": "32768", "kv_type": "q4_0", "nkvo": "0"}
+        bench_flags = _fit_params_flags(f, "bench")
+        assert "-ngl" in bench_flags and "32" in bench_flags
+        assert "-c" in bench_flags and "32768" in bench_flags
+        assert "-ctk" in bench_flags and "q4_0" in bench_flags
+        assert "--no-kv-offload" in bench_flags  # nkvo=0 → --no-kv-offload
+
+        server_flags = _fit_params_flags(f, "server")
+        assert "--no-kv-offload" in server_flags  # same for both drivers
+
+        # nkvo=1 (default) → no offload flag
+        f2 = {"ngl": "32", "n_depth": "8192", "kv_type": "f16", "nkvo": "1"}
+        assert "--no-kv-offload" not in _fit_params_flags(f2, "bench")
+        assert "-nkvo" not in _fit_params_flags(f2, "bench")
+
+        # ot factor — pattern must be passed literally (no shell quoting)
+        f3 = {"ngl": "32", "n_depth": "8192", "ot": "ffn_cpu"}
+        s3 = _fit_params_flags(f3, "bench")
+        assert "-ot" in s3
+        assert s3[s3.index("-ot") + 1] == OT_PATTERNS["ffn_cpu"]
+        # "none" ot → no -ot flag emitted
+        assert "-ot" not in _fit_params_flags({"ngl": "32", "n_depth": "8192", "ot": "none"}, "bench")
+
+        # ncmoe
+        f4 = {"ngl": "32", "n_depth": "8192", "ncmoe": "16"}
+        s4 = _fit_params_flags(f4, "bench")
+        assert "-ncmoe" in s4 and "16" in s4
+
+        # --- OOM pruning: the fit cache must not merge distinct footprints ---
+        # A cached verdict is applied to a row that is then never run, so a
+        # collision doesn't produce a wrong number — it silently deletes a
+        # valid config from the sweep. Every factor _fit_params_flags forwards
+        # must therefore reach the key. Asserted as a property (perturb one
+        # factor at a time) rather than by listing names, so a VRAM-relevant
+        # factor added later is covered without anyone remembering to.
+        class _FC:                        # minimal Config stand-in
+            model = Path("m.gguf")
+        base = {"ngl": "32", "n_depth": "8192", "kv_type": "f16",
+                "nkvo": "1", "ncmoe": "0", "ot": "none"}
+        # each perturbation changes the estimated footprint, so each must
+        # change the key (ncmoe/ot were the two the original key dropped)
+        for knob, other in (("ngl", "16"), ("n_depth", "32768"),
+                            ("kv_type", "q4_0"), ("nkvo", "0"),
+                            ("ncmoe", "40"), ("ot", "ffn_cpu")):
+            alt = {**base, knob: other}
+            assert _fit_cache_key(_FC, base, "bench") != _fit_cache_key(_FC, alt, "bench"), \
+                f"fit cache key ignores {knob}: configs differing only in " \
+                f"{knob} would inherit each other's OOM verdict"
+        # same config → same key (the memo still has to memoize)
+        assert _fit_cache_key(_FC, base, "bench") == _fit_cache_key(_FC, dict(base), "bench")
+        # different model, identical flags → different key
+        class _FC2:
+            model = Path("other.gguf")
+        assert _fit_cache_key(_FC, base, "bench") != _fit_cache_key(_FC2, base, "bench")
+    except AssertionError as e:
+        print(f"selftest FAILED: {e}")
+        return False
+
     print("selftest: all checks passed")
     return True
 
@@ -3626,6 +3792,15 @@ def main():
                     help="measure actual peak VRAM used per run (polls "
                          "rocm-smi/nvidia-smi); records vram_mib and draws the "
                          "VRAM curve + physical ceiling on the Pareto chart")
+    ap.add_argument("--no-oom-prune", action="store_true",
+                    help="don't skip configs predicted to exceed VRAM (by default, "
+                         "llama-fit-params estimates each config's footprint before "
+                         "running it, and skips those certain to OOM — saving a "
+                         "model load + timeout per doomed row)")
+    ap.add_argument("--fit-headroom", type=int, default=512, metavar="MiB",
+                    help="safety margin under detected VRAM for OOM pruning; "
+                         "configs using more than (vram - headroom) are skipped "
+                         "(default: 512)")
     args = ap.parse_args()
 
     if args.selftest:
@@ -3691,6 +3866,7 @@ def main():
 
     llama_bench = resolve_binary("llama-bench", args.llama_bench, args.llama_cpp)
     llama_server = resolve_binary("llama-server", args.llama_server, args.llama_cpp)
+    fit_params = resolve_binary("llama-fit-params", None, args.llama_cpp)
 
     # A model with an MTP/NextN head defaults to the server driver: llama-bench
     # cannot do speculative decoding, so on bench the MTP speedup is neither
@@ -3731,6 +3907,9 @@ def main():
         parallel=parallel,
         score=args.score,
         measure_vram=args.vram,
+        oom_prune=not args.no_oom_prune,
+        fit_headroom_mib=args.fit_headroom,
+        fit_params=fit_params,
         server_start_timeout=args.server_start_timeout,
         hw={"phys": phys, "logical": logical, "n_layers": n_layers, "vram": vram,
             "n_experts": n_experts, "n_ctx_train": n_ctx_train, "n_nextn": n_nextn,
@@ -3862,6 +4041,11 @@ def main():
     print(f"arch       : {arch}   layers: {n_layers if n_layers else '?'}   {moe}")
     print(f"CPU        : {phys} physical / {logical} logical cores")
     print(f"VRAM       : {vram} MiB" if vram else "VRAM       : (undetected)")
+    if cfg.oom_prune and vram and cfg.fit_params.exists():
+        print(f"OOM prune  : on (llama-fit-params, {cfg.fit_headroom_mib} MiB headroom)")
+    elif cfg.oom_prune:
+        what = "no fit-params binary" if not cfg.fit_params.exists() else "VRAM undetected"
+        print(f"OOM prune  : off ({what})")
     if n_ctx_train:
         print(f"native ctx : {n_ctx_train}")
     if n_nextn:
@@ -4080,6 +4264,21 @@ def main():
                               f"{f['kv_type']} KV cache, {f['n_depth']}-token context, "
                               f"ubatch {f['ubatch']}")
                     journal_write(journal, "TRY", "run", rid, json.dumps(f))  # durable
+                    # OOM pruning: estimate VRAM footprint before loading the model.
+                    # Skip rows certain to exceed physical VRAM (ROADMAP item 2).
+                    if cfg.oom_prune:
+                        est = predict_fits(cfg, f, cfg.driver)
+                        if est is False:
+                            res = {"status": "SKIP_PRED", "pp_tps": 0.0,
+                                   "tg_tps": 0.0, "secs": 0.0, "vram_mib": 0}
+                            res["eff_tps"] = 0.0
+                            row = {"run_id": rid, **f, **res, "temp_c": ""}
+                            rows.append(row)
+                            writer.writerow(row)
+                            fh.flush()
+                            journal_write(journal, "OK", "run", rid)  # close journal
+                            print(f"{prefix} -> SKIP_PRED (predicted OOM, skipped)")
+                            continue
                     temp0 = gpu_temp_c()   # start temp: thermal comparability is
                     #                        checkable in the CSV, not assumed
                     if cfg.driver == "server":
