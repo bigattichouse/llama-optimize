@@ -225,19 +225,63 @@ def detect_numa_nodes() -> int:
         return 1
 
 
+def parse_nvidia_vram(stdout: str) -> list[int]:
+    """Per-GPU MiB from `nvidia-smi --query-gpu=memory.* --format=csv,noheader,
+    nounits` — one line per device, already in MiB."""
+    out = []
+    for line in stdout.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(int(float(line)))
+        except ValueError:
+            continue
+    return out
+
+
+def parse_rocm_vram(payload: str, want: str) -> list[int]:
+    """Per-GPU MiB from `rocm-smi --showmeminfo vram --json` (bytes), where
+    `want` is "total" or "used". One entry per card key."""
+    out = []
+    for card in json.loads(payload).values():
+        if not isinstance(card, dict):
+            continue
+        for k, v in card.items():
+            kl = k.lower()
+            # rocm-smi spells these "VRAM Total Memory (B)" and "VRAM Total
+            # Used Memory (B)" — the used key contains "total" as well, so a
+            # bare substring test for total matches both and the answer would
+            # depend on key order.
+            if "vram" not in kl:
+                continue
+            hit = ("used" in kl) if want == "used" else ("total" in kl and "used" not in kl)
+            if hit:
+                try:
+                    out.append(int(v) // (1024 * 1024))
+                except (TypeError, ValueError):
+                    pass
+                break
+    return out
+
+
 def detect_vram_mib() -> int | None:
-    """Best-effort total VRAM in MiB. Tries AMD (rocm-smi) then NVIDIA
-    (nvidia-smi); None if neither is available."""
+    """Best-effort total VRAM in MiB across ALL GPUs. Tries AMD (rocm-smi) then
+    NVIDIA (nvidia-smi); None if neither is available.
+
+    Summed, not first-card: both smi tools print one line/key per device, and
+    reading only the first silently understates a multi-GPU box. That number
+    feeds the OOM pruner, which sums usage over every GPU line llama-fit-params
+    reports — comparing an all-device footprint against one card's capacity
+    prunes configurations that would have fit (issue #5)."""
     # AMD / ROCm
     try:
         out = subprocess.run(["rocm-smi", "--showmeminfo", "vram", "--json"],
                              capture_output=True, text=True, timeout=15)
         if out.returncode == 0:
-            data = json.loads(out.stdout)
-            for card in data.values():
-                for k, v in card.items():
-                    if "vram" in k.lower() and "total" in k.lower():
-                        return int(v) // (1024 * 1024)
+            per_gpu = parse_rocm_vram(out.stdout, "total")
+            if per_gpu:
+                return sum(per_gpu)
     except (OSError, ValueError, json.JSONDecodeError):
         pass
     # NVIDIA / CUDA
@@ -245,31 +289,37 @@ def detect_vram_mib() -> int | None:
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=15)
-        if out.returncode == 0 and out.stdout.strip():
-            return int(float(out.stdout.strip().splitlines()[0]))  # already MiB
+        if out.returncode == 0:
+            per_gpu = parse_nvidia_vram(out.stdout)
+            if per_gpu:
+                return sum(per_gpu)
     except (OSError, ValueError):
         pass
     return None
 
 
 def vram_used_mib() -> int | None:
-    """Currently-used VRAM in MiB (AMD then NVIDIA); None if unavailable."""
+    """Currently-used VRAM in MiB across all GPUs (AMD then NVIDIA); None if
+    unavailable. Summed for the same reason as detect_vram_mib: a peak-usage
+    sample on a split model is only meaningful against every device it lives
+    on."""
     try:
         out = subprocess.run(["rocm-smi", "--showmeminfo", "vram", "--json"],
                              capture_output=True, text=True, timeout=10)
         if out.returncode == 0:
-            for card in json.loads(out.stdout).values():
-                for k, v in card.items():
-                    if "vram" in k.lower() and "used" in k.lower():
-                        return int(v) // (1024 * 1024)
+            per_gpu = parse_rocm_vram(out.stdout, "used")
+            if per_gpu:
+                return sum(per_gpu)
     except (OSError, ValueError, json.JSONDecodeError):
         pass
     try:
         out = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=10)
-        if out.returncode == 0 and out.stdout.strip():
-            return int(float(out.stdout.strip().splitlines()[0]))
+        if out.returncode == 0:
+            per_gpu = parse_nvidia_vram(out.stdout)
+            if per_gpu:
+                return sum(per_gpu)
     except (OSError, ValueError):
         pass
     return None
@@ -3027,6 +3077,36 @@ def selftest() -> bool:
                "\nRanked by mu* (importance).\n")
         assert parse_morris_analyze(mci) == [("ngl", 4.867, 4.809),
                                              ("ubatch", 4.831, 5.14)]
+
+        # --- multi-GPU VRAM detection (issue #5) ---
+        # Both smi tools emit one line/key per device. Reading only the first
+        # understates a multi-GPU box, and that number is the OOM pruner's
+        # limit -- which it compares against a footprint summed over every GPU
+        # llama-fit-params reports. Mismatched scopes prune configs that fit.
+        assert parse_nvidia_vram("24564\n24564\n") == [24564, 24564]
+        assert sum(parse_nvidia_vram("24564\n24564\n")) == 49128
+        assert parse_nvidia_vram("8192\n") == [8192]        # single GPU unchanged
+        assert parse_nvidia_vram("") == []                  # nothing detected
+        assert parse_nvidia_vram("\n  \n") == []
+        assert parse_nvidia_vram("12288.0\n") == [12288]    # float-formatted
+        assert parse_nvidia_vram("N/A\n8192\n") == [8192]   # skip unparseable
+
+        # real rocm-smi shape (bytes). NOTE both keys contain "total", so a
+        # bare substring match for total also matches the *used* key and the
+        # result would depend on key order -- assert we pick the right one.
+        rocm1 = ('{"card0": {"VRAM Total Memory (B)": "34342961152", '
+                 '"VRAM Total Used Memory (B)": "96665600"}}')
+        assert parse_rocm_vram(rocm1, "total") == [32752]
+        assert parse_rocm_vram(rocm1, "used") == [92]
+        # two cards, and the used key listed first to prove order-independence
+        rocm2 = ('{"card0": {"VRAM Total Used Memory (B)": "1048576", '
+                 '"VRAM Total Memory (B)": "8589934592"}, '
+                 '"card1": {"VRAM Total Memory (B)": "17179869184", '
+                 '"VRAM Total Used Memory (B)": "2097152"}}')
+        assert parse_rocm_vram(rocm2, "total") == [8192, 16384]
+        assert sum(parse_rocm_vram(rocm2, "total")) == 24576
+        assert parse_rocm_vram(rocm2, "used") == [1, 2]
+        assert parse_rocm_vram('{"card0": {}}', "total") == []
 
         # --- measurement validity (docs/measurement-validity.md) ---
         # Issue #3: a server-driver sweep reported tg=1000000.0 t/s alongside
