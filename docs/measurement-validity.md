@@ -1,0 +1,156 @@
+# Measurement validity — rejecting impossible numbers
+
+General principles for deciding whether a measurement is *believable*, distinct
+from whether it was *obtained*. The first consumer is the 1,000,000 t/s defect
+([issue #3](https://github.com/bigattichouse/llama-optimize/issues/3)), but the
+mechanism is meant to cover any future case where a driver hands us a number
+that cannot be true.
+
+## Defect
+
+A sweep reported `tg=1000000.0 t/s` and crowned that config the winner, with
+`pp=444.1` on the same row. Every downstream consumer accepted it: the Pareto
+frontier, the main-effects analysis, the suggested `llama-server` command. The
+report was not merely wrong, it was confidently wrong — the bogus row dominated
+every real one, so the one number a user actually acts on was the one number
+that never happened.
+
+Verification did not catch it. `verify_picks` re-measured three times and
+reported "median of 3 measurements (spread 0%)" — because the fault is
+deterministic, repetition confirmed it instead of exposing it. **Reproducibility
+is not validity.** A measurement that is wrong the same way every time passes
+every consistency check we have.
+
+## Where the number comes from
+
+The reporter's CSV header carries `threads_batch`, which is `server_only` in
+`FACTORS` and is only added to the design when `cfg.driver == "server"`. So this
+was a **server-driver** sweep, and the number came from `llama-server`'s own
+timings, not from `llama-bench`.
+
+`llama-server` derives the rate as (`server-context.cpp:390`):
+
+```cpp
+timings.predicted_per_second = 1e3 / t_token_generation * n_decoded;
+```
+
+`ServerSession.measure` read `predicted_per_second` straight out of the response
+and averaged it. Nothing in the response can contradict it: the rate, the token
+count and the elapsed time all come from the same counter, so if that counter is
+wrong every field agrees with every other field.
+
+Solving for the elapsed time at 1e6 t/s gives **1.0 µs/token for any
+`n_decoded`** — 128 tokens in 0.128 ms, 64 in 0.064 ms. Real decode on the
+reporter's hardware (Ryzen 5700X3D, 8 GB 2060 Super, 35B MoE at Q4_K_M) runs
+~25 t/s, or 40 ms/token. The measurement is off by four orders of magnitude, in
+the direction only "no work happened" produces.
+
+That `pp=444.1` on the same row is plausible is the tell: prefill ran, decode did
+not, and only decode's number is impossible.
+
+`llama-bench` has the same shape of exposure — it divides the *nominal*
+`n_prompt + n_gen` by measured nanoseconds (`llama-bench.cpp:1473`) — but its
+modern versions `exit(1)` when a decode fails ("bench: handle decode errors",
+May 2025), which our driver already reports as `ERROR`. Older builds did not,
+so the bench path needs the general gate even though the reported defect came in
+through the server.
+
+## Principles
+
+**P1 — Plausibility is separate from success.** `status == "OK"` currently means
+"the process exited cleanly and a number parsed". It does not mean the number
+can be true. These are different questions and need different checks; a driver
+that exits 0 while producing nonsense is exactly the case that slips through.
+
+**P2 — Prefer invariants over calibration.** A threshold tuned to one person's
+hardware is wrong on everyone else's. Prefer bounds that follow from how
+transformers work and hold on any machine, and reserve absolute constants for
+backstops where no invariant is available.
+
+**P3 — Reject conservatively; a false reject is worse than a false accept.** A
+rejected row is excluded from the design, and we have already been bitten by
+silently deleting valid configurations (the fit-cache collision in PR #4).
+Throwing out a real measurement costs a run *and* biases the main effects.
+Bounds are therefore set to catch the physically absurd, not the merely
+surprising — an order of magnitude of slack is deliberate, not sloppiness.
+
+**P4 — Rejection must be loud and attributable.** A discarded measurement gets
+its own status, appears in the CSV, and is counted in the report. Silently
+dropping rows would turn one visible defect into an invisible one.
+
+## Invariants
+
+**I1 — Decode cannot outrun prefill.** For one config on one machine,
+`tg_tps <= pp_tps`. Prefill consumes many tokens per forward pass; decode
+consumes one, re-reading the same weights each time, and is memory-bandwidth
+bound. Their ratio is normally 10–100× in prefill's favour. Speculative decoding
+and MTP raise `tg` by small integer factors, never above `pp`.
+
+Applied with a 10× margin (`tg > 10 * pp` rejects) so that only the absurd is
+caught, per P3. The reporter's row sits at a ratio of **2251×**.
+
+Requires `pp_tps > 0`; when prefill was not measured, I1 does not apply and I2
+carries the check alone.
+
+**I2 — Absolute ceiling.** `tg_tps <= MAX_PLAUSIBLE_TPS * parallel`. A backstop
+for when I1 is unavailable. Scaled by `--parallel` because the server driver
+reports aggregate throughput across concurrent streams, which legitimately
+multiplies with stream count.
+
+**I3 — Rejection is total.** A row failing I1 or I2 gets `status =
+"IMPLAUSIBLE"` and is excluded everywhere `status == "OK"` gates: the Pareto
+frontier, the picks, the max-context probe's base config, and the analyzer's
+scoring (where it lands as a 0, the same treatment as OOM — "failure is data").
+
+**I5 — A server's self-reported rate is checked against an independent clock.**
+The decisive check, and the only one that addresses the cause rather than the
+symptom. Every field in a completion response comes from the server's own
+counter, so a wrong counter is internally consistent and unfalsifiable from the
+inside. Our wall-clock time around the request is the one number the server does
+not supply — and a request cannot have produced tokens faster than it elapsed.
+So `predicted_n / wall_seconds` is a hard upper bound on any rate the server may
+claim, resting on no hardware assumption at all.
+
+Applied with a 2× margin, because wall time also covers the HTTP round trip and
+any prefill the cache did not spare, and therefore always overstates pure decode
+a little. The bound uses the *kindest* rep, so one slow round trip cannot
+condemn a run. The reporter's row exceeds it by ~1500×.
+
+Only the single-stream path needs it: the concurrency path already computes its
+rates from our wall clock, so it cannot exceed it by construction.
+
+Alongside it, a completion carrying an `error` object is raised rather than
+returned. llama-server answers some failures with HTTP 200 and an error body,
+and reading timings off a non-result is how zero elapsed time becomes an
+infinite rate.
+
+**I4 — The check runs where measurements are born.** Applied in the two places
+that construct a result dict from measured numbers — `run_one` (bench driver)
+and `measure_in_session` (server driver) — so every caller inherits it: the
+sweep, the max-context probe, and pick verification alike. Validating in the
+report instead would let the probe and the verifier keep making decisions on
+numbers the report would later reject.
+
+## Layering
+
+I5 is causal and specific: it catches the defect at its source, with a real
+reason attached ("the request's own duration allows at most 639 t/s"). I1 and I2
+are the general backstop — they know nothing about servers or requests and
+therefore still apply to the bench driver, to `--report-only` re-analysis, and to
+whatever produces the next impossible number.
+
+Neither layer is sufficient alone. I5 cannot see a bench-driver result; I1/I2
+would accept a server row that is wrong by 5× rather than 2000×. Both are cheap.
+
+## What this does not do
+
+It does not explain *why* generation returned early on the reporter's
+configuration. That is upstream behaviour, plausibly a config that cannot
+actually run (35B MoE, `ngl=20`, `-ncmoe 40`, 8 GB VRAM, 8192-token depth)
+failing in a way that neither sets an error nor prints anything `_OOM_PAT`
+recognises. Diagnosing it needs the reporter's full CSV; the issue attachment is
+truncated to a header and a single OOM row.
+
+The gate is deliberately independent of that answer. Whatever makes a driver
+emit an impossible number, the tool's obligation is the same: do not report it
+as the best configuration.

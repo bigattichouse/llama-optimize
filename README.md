@@ -231,6 +231,14 @@ Runs that **OOM, crash, or time out** are recorded as data (`tg=0`, with a statu
 `-ngl` with an `f16` KV cache is *expected* to OOM — that failure is the memory cliff
 we're mapping, not a bug.
 
+Runs whose numbers **cannot be true** are recorded as `IMPLAUSIBLE` and excluded
+from the picks, the Pareto frontier and the main effects, with the reason printed
+as they are discarded. A driver can exit cleanly and still report an impossible
+speed — a decode that returns without decoding is divided by a near-zero elapsed
+time and comes back as a spectacular result. Repeating the measurement does not
+help, because the fault is deterministic; the checks are about physical
+possibility instead. See [`docs/measurement-validity.md`](docs/measurement-validity.md).
+
 ---
 
 ## Auto-detection

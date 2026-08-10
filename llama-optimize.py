@@ -39,6 +39,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from types import SimpleNamespace
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -1325,6 +1326,62 @@ def parse_bench_json(stdout: str):
     return pp, tg
 
 
+# ---------------------------------------------------------------------------
+# Measurement validity — docs/measurement-validity.md.
+# "OK" only ever meant the process exited cleanly and a number parsed; it never
+# meant the number could be true. llama-bench derives throughput as
+# 1e9 * n_tokens / t_ns using the NOMINAL token count (llama-bench.cpp:1473), so
+# a decode loop that returns without decoding keeps the numerator and collapses
+# the denominator — issue #3 saw 1,000,000 t/s (exactly 1.0 us/token for any
+# n_gen) crowned the winner on a box that really does ~25 t/s. Repetition does
+# not catch this: the fault is deterministic, so verify_picks confirmed it at
+# "spread 0%". Reproducibility is not validity.
+# ---------------------------------------------------------------------------
+# Backstop for when prefill is unavailable (I2). Generous by design: rejecting a
+# real measurement silently deletes a config from the design, which is the worse
+# error (P3).
+MAX_PLAUSIBLE_TPS = 100_000.0
+# I1 margin. Decode re-reads the weights per token and cannot outrun batched
+# prefill; the honest ratio runs 10-100x in prefill's favour, and speculative
+# decoding moves tg by small integer factors. 10x rejects only the absurd —
+# issue #3's row sits at 2251x.
+TG_OVER_PP_LIMIT = 10.0
+
+
+def implausible_reason(pp: float, tg: float, parallel: int = 1) -> str | None:
+    """Why this measurement cannot be true, or None if it might be.
+
+    Deliberately one-sided: it rejects impossibly FAST decode. A too-slow number
+    is a real (if disappointing) measurement and must survive."""
+    if tg <= 0:
+        return None                        # not a measurement; other paths own it
+    if pp > 0 and tg > TG_OVER_PP_LIMIT * pp:
+        return f"tg={tg:.1f} exceeds pp={pp:.1f} by {tg / pp:.0f}x (decode cannot outrun prefill)"
+    ceiling = MAX_PLAUSIBLE_TPS * max(1, parallel)
+    if tg >= ceiling:
+        return f"tg={tg:.1f} t/s exceeds the plausible ceiling ({ceiling:.0f} t/s)"
+    return None
+
+
+def validate_measurement(res: dict, parallel: int = 1) -> dict:
+    """Downgrade a physically impossible measurement to IMPLAUSIBLE (I3).
+
+    Applied where measurements are born, not where they are reported (I4), so
+    the sweep, the max-context probe and pick verification all inherit it —
+    otherwise the probe would keep steering by numbers the report rejects."""
+    if res.get("status") != "OK":
+        return res
+    why = implausible_reason(float(res.get("pp_tps") or 0.0),
+                             float(res.get("tg_tps") or 0.0), parallel)
+    if why:
+        res["status"] = "IMPLAUSIBLE"
+        res["implausible"] = why
+        # Zero the scores so anything reading them before checking status (the
+        # analyzer scores failures as 0) treats this as the non-result it is.
+        res["pp_tps"] = res["tg_tps"] = 0.0
+    return res
+
+
 def fmt_dur(secs: float) -> str:
     secs = int(secs)
     if secs < 60:
@@ -1386,8 +1443,9 @@ def run_one(cfg: Config, f: dict, timeout: int):
     finally:
         if sampler:
             sampler.__exit__()
-    return {"status": status, "pp_tps": pp, "tg_tps": tg,
-            "secs": time.time() - t0, "vram_mib": sampler.peak if sampler else 0}
+    return validate_measurement(
+        {"status": status, "pp_tps": pp, "tg_tps": tg,
+         "secs": time.time() - t0, "vram_mib": sampler.peak if sampler else 0})
 
 
 # ---------------------------------------------------------------------------
@@ -1468,6 +1526,44 @@ def _realistic_prompt(n_tokens: int) -> str:
     return (_CORPUS * reps)[:approx_chars]
 
 
+# Slack on the wall-clock bound (I5). Wall time covers HTTP round trip and any
+# prefill the cache did not spare, so it always exceeds pure decode — the bound
+# is already generous in the server's favour and this only absorbs clock
+# granularity on very short requests. Rejecting a real measurement is the worse
+# error (P3), so the margin is deliberately loose: the defect it exists to catch
+# overshoots by four orders of magnitude, not by tens of percent.
+WALL_CLOCK_MARGIN = 2.0
+
+
+def exceeds_wall_clock(tg: float, ceilings: list[float]) -> str | None:
+    """Why the server's self-reported rate is impossible, or None.
+
+    Compares a server-reported tg against what its own request duration allows.
+    Independent of any hardware assumption: it asks only whether the tokens
+    could have been produced in the time the request actually took."""
+    if tg <= 0 or not ceilings:
+        return None
+    ceiling = max(ceilings)                    # kindest rep to the server
+    if tg > ceiling * WALL_CLOCK_MARGIN:
+        return (f"server reported tg={tg:.1f} t/s, but the request's own "
+                f"duration allows at most {ceiling:.1f} t/s "
+                f"({tg / ceiling:.0f}x faster than the wall clock permits)")
+    return None
+
+
+def raise_for_server_error(body):
+    """Pass a completion response through, or raise if it is really a failure.
+
+    llama-server answers some failures with HTTP 200 and an "error" object.
+    Treating that as a measurement is how a non-result acquires timings of zero
+    and turns into an infinite rate (P1)."""
+    if isinstance(body, dict) and body.get("error"):
+        err = body["error"]
+        msg = err.get("message") if isinstance(err, dict) else str(err)
+        raise OSError(f"llama-server returned an error: {msg}")
+    return body
+
+
 def _completion(port: int, prompt, n_gen: int, timeout: int, cache: bool = False) -> dict:
     body = json.dumps({
         "prompt": prompt,
@@ -1480,7 +1576,7 @@ def _completion(port: int, prompt, n_gen: int, timeout: int, cache: bool = False
         f"http://127.0.0.1:{port}/completion", data=body,
         headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())
+        return raise_for_server_error(json.loads(r.read()))
 
 
 def _measure_round(port: int, prompt, n_gen: int, par: int, timeout: int, cache=False):
@@ -1525,6 +1621,8 @@ class ServerSession:
                             f"server not healthy within {cfg.server_start_timeout}s")
 
     def measure(self, prompt_len, n_gen, par, reps, timeout):
+        """Returns (pp_tps, tg_tps, problem) — problem is a string when the
+        numbers cannot be believed, else None (docs/measurement-validity.md)."""
         prompt = _realistic_prompt(prompt_len)
         if par == 1:
             # Single stream: prefill once (warm request → real pp + primes the KV
@@ -1533,13 +1631,29 @@ class ServerSession:
             # cleaner decode number.
             warm = _completion(self.port, prompt, n_gen, timeout, cache=True)
             pp = warm.get("timings", {}).get("prompt_per_second", 0.0) or 0.0
-            tps = []
+            tps, ceilings = [], []
             for _ in range(max(1, reps)):
+                w0 = time.time()
                 r = _completion(self.port, prompt, n_gen, timeout, cache=True)
-                tps.append(r.get("timings", {}).get("predicted_per_second", 0.0) or 0.0)
-            return pp, sum(tps) / len(tps)
+                wall = time.time() - w0
+                t = r.get("timings", {})
+                tps.append(t.get("predicted_per_second", 0.0) or 0.0)
+                # Independent clock. The server derives its rate as
+                # 1e3 / t_token_generation * n_decoded from its own counter
+                # (server-context.cpp:390); when that counter is wrong nothing
+                # inside the response can reveal it. Our wall time is the one
+                # number the server does not supply, and the request cannot have
+                # produced tokens faster than it elapsed — so predicted_n / wall
+                # is a hard upper bound on any rate it may claim.
+                n_dec = t.get("predicted_n", 0) or 0
+                if wall > 0 and n_dec > 0:
+                    ceilings.append(n_dec / wall)
+            tg = sum(tps) / len(tps)
+            return pp, tg, exceeds_wall_clock(tg, ceilings)
         # Concurrency: realistic serving — every request prefills; aggregate over
         # the streams. Warmup once, then average per-round throughput over reps.
+        # These rates are computed from our own wall clock already, so they
+        # cannot exceed it by construction — no cross-check needed.
         _measure_round(self.port, prompt, n_gen, par, timeout)  # warmup, discard
         pps, tps = [], []
         for _ in range(max(1, reps)):
@@ -1548,7 +1662,7 @@ class ServerSession:
             pp_tok = sum(r.get("timings", {}).get("prompt_n", 0) for r in res)
             tps.append(tg_tok / wall if wall > 0 else 0.0)
             pps.append(pp_tok / wall if wall > 0 else 0.0)
-        return sum(pps) / len(pps), sum(tps) / len(tps)
+        return sum(pps) / len(pps), sum(tps) / len(tps), None
 
     def close(self):
         if self.proc and self.proc.poll() is None:
@@ -1614,16 +1728,22 @@ def measure_in_session(cfg: Config, f: dict, session, timeout: int) -> dict:
     prompt_len = cfg.n_prompt + int(f.get("n_depth", 0))
     par = int(f.get("parallel", cfg.parallel))
     sampler = VRAMSampler().__enter__() if cfg.measure_vram else None
-    status, pp, tg = "OK", 0.0, 0.0
+    status, pp, tg, problem = "OK", 0.0, 0.0, None
     try:
-        pp, tg = session.measure(prompt_len, cfg.n_gen, par, cfg.reps, timeout)
+        pp, tg, problem = session.measure(prompt_len, cfg.n_gen, par, cfg.reps, timeout)
     except (urllib.error.URLError, OSError, json.JSONDecodeError):
         status = "ERROR"
     finally:
         if sampler:
             sampler.__exit__()
-    return {"status": status, "pp_tps": pp, "tg_tps": tg,
-            "secs": time.time() - t0, "vram_mib": sampler.peak if sampler else 0}
+    res = {"status": status, "pp_tps": pp, "tg_tps": tg,
+           "secs": time.time() - t0, "vram_mib": sampler.peak if sampler else 0}
+    if status == "OK" and problem:         # the wall-clock cross-check (I5)
+        res.update(status="IMPLAUSIBLE", implausible=problem,
+                   pp_tps=0.0, tg_tps=0.0)
+    # parallel scales the ceiling: the server driver reports throughput
+    # aggregated across concurrent streams (I2).
+    return validate_measurement(res, parallel=par)
 
 
 def server_run_one(cfg: Config, f: dict, timeout: int):
@@ -2908,6 +3028,124 @@ def selftest() -> bool:
         assert parse_morris_analyze(mci) == [("ngl", 4.867, 4.809),
                                              ("ubatch", 4.831, 5.14)]
 
+        # --- measurement validity (docs/measurement-validity.md) ---
+        # Issue #3: a server-driver sweep reported tg=1000000.0 t/s alongside
+        # pp=444.1 and crowned it the winner on a box that really does ~25 t/s.
+        # Repetition could not catch it -- the fault is deterministic, so
+        # verify_picks confirmed it at "spread 0%". Reproducibility is not
+        # validity, so the checks are about physical possibility instead.
+
+        # I5, the causal check: a request cannot have produced tokens faster
+        # than its own wall clock allows. 128 tokens over a 5s request permits
+        # ~26 t/s no matter what the server's internal counter says.
+        assert exceeds_wall_clock(1_000_000.0, [128 / 5.0])
+        assert "wall clock" in exceeds_wall_clock(1_000_000.0, [128 / 5.0])
+        # honest measurements survive, including a rate slightly above the
+        # bound (wall time includes HTTP + prefill, so it always understates
+        # pure decode a little)
+        assert exceeds_wall_clock(25.0, [128 / 5.0]) is None
+        assert exceeds_wall_clock(30.0, [128 / 5.0]) is None      # inside margin
+        # the kindest rep decides, so one slow round trip cannot condemn a run
+        assert exceeds_wall_clock(50.0, [128 / 60.0, 128 / 2.4]) is None
+        # nothing to compare against -> no verdict (never invent a rejection)
+        assert exceeds_wall_clock(1_000_000.0, []) is None
+        assert exceeds_wall_clock(0.0, [26.0]) is None
+
+        # I1: decode cannot outrun prefill. The reporter's exact row.
+        assert implausible_reason(444.1, 1_000_000.0) is not None
+        assert "decode cannot outrun prefill" in implausible_reason(444.1, 1_000_000.0)
+        # normal rows: pp is 10-100x tg in prefill's favour
+        assert implausible_reason(444.1, 25.0) is None
+        assert implausible_reason(500.0, 120.0) is None
+        # speculative decoding lifts tg by small factors, never past pp
+        assert implausible_reason(300.0, 900.0) is None       # 3x, allowed
+        # I2 backstop: absolute ceiling when prefill is unavailable
+        assert implausible_reason(0.0, 1_000_000.0) is not None
+        assert implausible_reason(0.0, 500.0) is None
+        # ...scaled by concurrent streams, which legitimately aggregate
+        assert implausible_reason(0.0, 150_000.0) is not None
+        assert implausible_reason(0.0, 150_000.0, parallel=64) is None
+        # a too-SLOW number is a real measurement and must survive
+        assert implausible_reason(444.1, 0.2) is None
+
+        # I3: rejection is total -- status flips and scores are zeroed, so a
+        # consumer that reads the number before checking status still sees a
+        # non-result rather than a record-breaking one.
+        bad = validate_measurement({"status": "OK", "pp_tps": 444.1,
+                                    "tg_tps": 1_000_000.0, "secs": 5.0})
+        assert bad["status"] == "IMPLAUSIBLE", bad
+        assert bad["tg_tps"] == 0.0 and bad["pp_tps"] == 0.0
+        assert bad["implausible"]
+        assert score_of({**bad, "eff_tps": 0.0}) == 0.0
+        # and it is excluded everywhere status == "OK" gates
+        assert pareto_frontier([bad]) == []
+        good = validate_measurement({"status": "OK", "pp_tps": 444.1,
+                                     "tg_tps": 25.0, "secs": 5.0})
+        assert good["status"] == "OK" and good["tg_tps"] == 25.0
+        assert "implausible" not in good
+        # a non-OK status is left alone -- OOM rows are not our business
+        oom = validate_measurement({"status": "OOM", "pp_tps": 0.0, "tg_tps": 0.0})
+        assert oom["status"] == "OOM"
+
+        # I4/I5 wiring: the pure predicates above are worthless if the drivers
+        # do not consult them, and that connection is what silently regresses.
+        # Drive a fake server through the real measure() path -- one claiming
+        # the reporter's 1e6 t/s, one honest -- and check the verdict reaches
+        # the result dict. Sleeps are what give the wall clock something to
+        # measure; keep them small.
+        _real_completion = _completion
+        try:
+            def _fake(per_second):
+                def f(port, prompt, n_gen, timeout, cache=False):
+                    time.sleep(0.02)
+                    return {"content": "x",
+                            "timings": {"prompt_per_second": 444.1,
+                                        "predicted_per_second": per_second,
+                                        "predicted_n": 128, "prompt_n": 8192}}
+                return f
+
+            sess = ServerSession.__new__(ServerSession)   # no server launched
+            sess.port, sess.ok, sess.err = 1, True, ""
+            fake_cfg = SimpleNamespace(n_prompt=0, n_gen=128, parallel=1, reps=1,
+                                       measure_vram=False, factors={})
+
+            globals()["_completion"] = _fake(1_000_000.0)
+            r_bad = measure_in_session(fake_cfg, {"n_depth": "8192"}, sess, 30)
+            assert r_bad["status"] == "IMPLAUSIBLE", r_bad
+            assert r_bad["tg_tps"] == 0.0 and r_bad["implausible"]
+
+            globals()["_completion"] = _fake(600.0)       # fast but possible
+            r_ok = measure_in_session(fake_cfg, {"n_depth": "8192"}, sess, 30)
+            assert r_ok["status"] == "OK", r_ok
+            assert r_ok["tg_tps"] == 600.0
+
+            # an error payload is a failure, not a zero-time measurement, and
+            # the raise it produces is what measure_in_session turns into ERROR
+            def _err(port, prompt, n_gen, timeout, cache=False):
+                return raise_for_server_error(
+                    {"error": {"message": "context shift is disabled"}})
+            globals()["_completion"] = _err
+            r_e = measure_in_session(fake_cfg, {"n_depth": "8192"}, sess, 30)
+            assert r_e["status"] == "ERROR", r_e
+        finally:
+            globals()["_completion"] = _real_completion
+
+        # the error check itself, independent of any transport
+        try:
+            raise_for_server_error({"error": {"message": "boom"}})
+            assert False, "error payload was accepted as a result"
+        except OSError as e:
+            assert "boom" in str(e)
+        # a bare-string error, and the shapes that must pass through untouched
+        try:
+            raise_for_server_error({"error": "kv cache full"})
+            assert False, "string error payload was accepted"
+        except OSError:
+            pass
+        ok_body = {"content": "hi", "timings": {"predicted_per_second": 30.0}}
+        assert raise_for_server_error(ok_body) is ok_body
+        assert raise_for_server_error({"error": None}) == {"error": None}
+
         # ttft note: prefill-cost estimate on emitted commands
         n = ttft_note({"pp_tps": 100.0}, 235520)
         assert n and "39m" in n and "8k prompt" in n
@@ -3042,7 +3280,7 @@ def load_results_csv(path: Path, factors: dict) -> list[dict]:
 # results-CSV columns that are measurements/bookkeeping; everything else in a
 # header is a factor column (must match the writer's `cols` in main)
 RESULT_COLS = {"run_id", "pp_tps", "tg_tps", "eff_tps", "status", "secs",
-               "temp_c", "vram_mib"}
+               "temp_c", "vram_mib", "implausible"}
 
 
 def merge_result_rows(cfg: Config, rows: list[dict],
@@ -4302,6 +4540,8 @@ def main():
                           f"{cfg.score}={res['eff_tps']:.1f} t/s ({raw}) ({res['secs']:.0f}s)  "
                           f"[{i}/{len(runs)} done, elapsed {fmt_dur(elapsed)}, "
                           f"ETA ~{fmt_dur(eta)}]", flush=True)
+                    if res.get("implausible"):      # P4: never discard quietly
+                        print(f"  discarded: {res['implausible']}", flush=True)
                     if i < len(runs):                  # settle before the next run
                         if thermal_wait and thermal_baseline is not None:
                             wait_until_cool(thermal_baseline)
