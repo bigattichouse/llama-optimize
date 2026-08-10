@@ -72,6 +72,11 @@ workspace layout; otherwise pass **`--llama-cpp /path/to/llama.cpp`** (its root 
 `--llama-bench`/`--llama-server` directly. If the binaries can't be found the tool
 stops with a clear error.
 
+Running llama.cpp from a container instead of a local build? See
+[`docs/docker.md`](docs/docker.md) — the short version is that llama-optimize
+launches the binaries itself rather than talking to a server, so it needs to run
+*inside* the container.
+
 **4. Run it** — the commands above (e.g. `python3 llama-optimize.py model.gguf --run`).
 Python 3.10+ is the only other requirement (uses `X | None` syntax, standard library
 only). Verify the install with no GPU or model via `python3 llama-optimize.py --selftest`.
