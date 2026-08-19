@@ -8,6 +8,8 @@ balanced set of benchmarks, and hands you paste-ready commands for the **fastest
 speed-vs-context Pareto frontier. The DOE engines (Taguchi + Morris) come from the
 [`robust`](https://github.com/bigattichouse/robust) suite, vendored as a submodule.
 
+Read more: ['Automated Optimization of llama.cpp Parameters using Morris Elementary Effects and Taguchi Methods']( https://medium.com/@bigattichouse/automated-optimization-of-llama-cpp-parameters-using-morris-elementary-effects-and-taguchi-methods-e530c6906fda?sk=face6e3dc18052e8c609dfaac2996058 )
+
 It works on **AMD (ROCm) or NVIDIA (CUDA)**, tunes **every knob llama.cpp exposes**
 (see the [knob reference](#knob-reference-one-stop-shop)), can measure **MTP /
 speculative decoding**, **ngram self-speculation** (`--ngram`), and
