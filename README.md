@@ -250,8 +250,15 @@ The tool inspects the box and the model so you don't hand-tune the factor levels
 - **Physical / logical cores** — unique `(physical id, core id)` pairs from
   `/proc/cpuinfo` (fallback: `logical / 2`). Thread levels bracket the physical-core
   count, where llama.cpp throughput usually peaks.
-- **VRAM** — via `rocm-smi` (AMD) or `nvidia-smi` (NVIDIA); best-effort,
-  informational. Everything else is vendor-agnostic — the tool just drives
+- **VRAM** — from `llama-server --list-devices`, summed over every device, with
+  `rocm-smi`/`nvidia-smi` as a fallback. llama.cpp is asked first because the
+  number that matters is what the inference process can allocate, which is not
+  always what the vendor tool calls VRAM: on an APU the model runs out of GTT,
+  so `rocm-smi` reports a 2 GiB carve-out where llama.cpp reports ~30 GiB. This
+  is not merely informational — it is the ceiling the OOM pruner prunes against,
+  so an understated figure skips runs that would have fit. The banner prints the
+  source it used. One parser covers `ROCm0`/`CUDA0`/`Vulkan0` alike, and
+  everything else is vendor-agnostic too — the tool just drives
   `llama-bench`/`llama-server`, so it works on ROCm, CUDA, or Metal builds alike.
 - **Model layer count** — a minimal, dependency-free GGUF metadata reader parses
   `<arch>.block_count` from the header (no tensors loaded), so `-ngl`'s top level is

@@ -291,15 +291,89 @@ def parse_rocm_vram(payload: str, want: str) -> list[int]:
     return out
 
 
-def detect_vram_mib() -> int | None:
-    """Best-effort total VRAM in MiB across ALL GPUs. Tries AMD (rocm-smi) then
-    NVIDIA (nvidia-smi); None if neither is available.
+# `llama-server --list-devices` prints one line per device, same shape for
+# every backend:
+#     ROCm0: AMD Radeon 780M Graphics (30438 MiB, 43542 MiB free)
+#     CUDA0: NVIDIA GeForce RTX 3090 (24117 MiB, 6672 MiB free)
+_DEVICE_LINE = re.compile(
+    r"^\s*([A-Za-z][A-Za-z0-9_]*?\d+)\s*:\s*(.+?)\s*"
+    r"\(\s*(\d+)\s*MiB\s*,\s*(\d+)\s*MiB\s+free\s*\)\s*$")
+
+
+def parse_list_devices(text: str) -> list[dict]:
+    """Per-device capacity from `llama-server --list-devices`, in llama.cpp's
+    own device order. Returns [{id, name, total_mib, free_mib}, ...].
+
+    One parser covers every backend because the line shape is identical for
+    ROCm, CUDA and Vulkan — which is also why this replaces two vendor-specific
+    smi paths rather than adding a third.
+
+    CPU devices are dropped: some builds list them, their "VRAM" is system RAM,
+    and summing that into a GPU budget would overstate the machine by more than
+    the bug this function exists to fix.
+    """
+    out = []
+    for line in text.splitlines():
+        m = _DEVICE_LINE.match(line)
+        if not m:
+            continue
+        dev_id, name, total, free = m.groups()
+        if dev_id.upper().startswith("CPU"):
+            continue
+        out.append({"id": dev_id, "name": name,
+                    "total_mib": int(total), "free_mib": int(free)})
+    return out
+
+
+def list_devices(binary: Path | None) -> list[dict]:
+    """Ask llama.cpp itself what devices it has. [] if the binary is missing,
+    too old for --list-devices, or prints nothing we recognise.
+
+    Output is read from stdout and stderr together: the device table goes to
+    stdout, but backend init chatter lands on stderr and some builds interleave
+    them. The line pattern is specific enough that combining is safe."""
+    if binary is None or not binary.exists():
+        return []
+    try:
+        out = subprocess.run([str(binary), "--list-devices"],
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    # Deliberately not gated on returncode: a build that does not know the flag
+    # prints no device lines, which the parser reports as [] anyway.
+    return parse_list_devices((out.stdout or "") + "\n" + (out.stderr or ""))
+
+
+def detect_vram_mib(*binaries: Path | None) -> tuple[int, str] | None:
+    """Best-effort total usable VRAM in MiB across ALL devices, with the source
+    it came from. None if nothing could be read.
+
+    Asks llama.cpp first (`llama-server --list-devices`) and only falls back to
+    rocm-smi/nvidia-smi. llama.cpp is the right authority for the same reason it
+    is for device *order* (docs/multi-gpu-design.md): the number that matters is
+    what the inference process can actually allocate, which is not always what
+    the vendor tool calls VRAM.
+
+    Issue #7 is the case in point. On an APU (Radeon 780M) the model lives in
+    GTT, host memory the GPU maps; `rocm-smi --showmeminfo vram` reports the
+    2 GiB carve-out and nothing else, while llama.cpp reports the ~30 GiB it can
+    really use. Reading 2048 MiB there made the OOM pruner skip nearly every
+    configuration in the sweep without running one of them.
 
     Summed, not first-card: both smi tools print one line/key per device, and
     reading only the first silently understates a multi-GPU box. That number
     feeds the OOM pruner, which sums usage over every GPU line llama-fit-params
     reports — comparing an all-device footprint against one card's capacity
-    prunes configurations that would have fit (issue #5)."""
+    prunes configurations that would have fit (issue #5).
+
+    Several binaries may be offered and the first that answers wins: both
+    llama-server and llama-bench implement --list-devices identically, and a
+    bench-driver user has no reason to have built the server."""
+    for binary in binaries:
+        devs = list_devices(binary)
+        total = sum(d["total_mib"] for d in devs)
+        if total > 0:   # a device list that adds to zero is not an answer
+            return total, "llama.cpp: " + ", ".join(d["id"] for d in devs)
     # AMD / ROCm
     try:
         out = subprocess.run(["rocm-smi", "--showmeminfo", "vram", "--json"],
@@ -307,7 +381,7 @@ def detect_vram_mib() -> int | None:
         if out.returncode == 0:
             per_gpu = parse_rocm_vram(out.stdout, "total")
             if per_gpu:
-                return sum(per_gpu)
+                return sum(per_gpu), "rocm-smi"
     except (OSError, ValueError, json.JSONDecodeError):
         pass
     # NVIDIA / CUDA
@@ -318,7 +392,7 @@ def detect_vram_mib() -> int | None:
         if out.returncode == 0:
             per_gpu = parse_nvidia_vram(out.stdout)
             if per_gpu:
-                return sum(per_gpu)
+                return sum(per_gpu), "nvidia-smi"
     except (OSError, ValueError):
         pass
     return None
@@ -466,7 +540,12 @@ def predict_fits(cfg: "Config", f: dict, driver: str) -> bool | None:
     """Estimate whether factor config `f` fits in GPU VRAM using
     llama-fit-params --fit-print. Returns True (fits), False (would OOM), or
     None (could not determine — skip pruning for safety). Only considers GPU
-    devices; when there are none, always returns True (CPU-only fits)."""
+    devices; when there are none, always returns True (CPU-only fits).
+
+    Both sides of the comparison now come from llama.cpp: the footprint from
+    llama-fit-params' per-device lines, the ceiling from --list-devices. They
+    used to disagree about what "GPU memory" means — issue #7's APU counted GTT
+    on one side and a 2 GiB VRAM carve-out on the other, and every row lost."""
     global _oom_prune_warned, _fit_cache
     total_vram = cfg.hw.get("vram")
     if total_vram is None or not cfg.fit_params.exists():
@@ -3321,6 +3400,61 @@ def selftest() -> bool:
         assert parse_rocm_vram(rocm2, "used") == [1, 2]
         assert parse_rocm_vram('{"card0": {}}', "total") == []
 
+        # --- capacity comes from llama.cpp, not the vendor tool (issue #7) ---
+        # An APU runs the model out of GTT, so `rocm-smi --showmeminfo vram`
+        # answers with the 2 GiB carve-out while llama.cpp reports the ~30 GiB
+        # it can really use. Verbatim from the issue, both tools on the same box:
+        rocm_apu = ('{"card0": {"VRAM Total Memory (B)": "2147483648", '
+                    '"VRAM Total Used Memory (B)": "1205387264"}}')
+        assert parse_rocm_vram(rocm_apu, "total") == [2048]   # what we used to use
+        apu = parse_list_devices(
+            "Available devices:\n"
+            "  ROCm0: AMD Radeon 780M Graphics (30438 MiB, 43542 MiB free)\n")
+        assert apu == [{"id": "ROCm0", "name": "AMD Radeon 780M Graphics",
+                        "total_mib": 30438, "free_mib": 43542}], apu
+        # ~15x the smi figure: the gap that pruned the reporter's whole sweep.
+        assert sum(d["total_mib"] for d in apu) == 30438
+
+        # issue #5's mixed pair, verbatim -- CUDA and ROCm lines are the same
+        # shape, which is why one parser replaces both vendor paths. Order is
+        # llama.cpp's own, the order -ts will index into.
+        mixed = parse_list_devices(
+            "Available devices:\n"
+            "  CUDA0: NVIDIA GeForce RTX 3090 (24117 MiB, 6672 MiB free)\n"
+            "  CUDA1: NVIDIA GeForce RTX 3060 (11909 MiB, 9837 MiB free)\n")
+        assert [d["id"] for d in mixed] == ["CUDA0", "CUDA1"]
+        assert [d["total_mib"] for d in mixed] == [24117, 11909]
+        assert [d["free_mib"] for d in mixed] == [6672, 9837]
+        assert sum(d["total_mib"] for d in mixed) == 36026
+        # free is NOT total here (a display holds the rest of CUDA0); anything
+        # deriving a split from capacity must not quietly read one for the other
+        assert sum(d["free_mib"] for d in mixed) != sum(d["total_mib"] for d in mixed)
+
+        # a CPU device would be system RAM wearing a device line: dropped, or
+        # the GPU budget overstates the machine worse than the bug being fixed
+        assert parse_list_devices(
+            "  CPU0: AMD Ryzen 9 (64000 MiB, 32000 MiB free)\n"
+            "  Vulkan0: Radeon RX 7900 XTX (24560 MiB, 24000 MiB free)\n") == [
+            {"id": "Vulkan0", "name": "Radeon RX 7900 XTX",
+             "total_mib": 24560, "free_mib": 24000}]
+        # a build too old for the flag prints no device lines -> fall back
+        assert parse_list_devices("error: invalid argument: --list-devices") == []
+        assert parse_list_devices("") == []
+        assert parse_list_devices("Available devices:\n") == []
+        # backend chatter on the same stream must not parse as a device
+        assert parse_list_devices(
+            "ggml_cuda_init: found 1 ROCm devices:\n"
+            "  Device 0: AMD Radeon 780M Graphics, gfx1103 (0x1103)\n") == []
+        # list_devices() with no binary is [] rather than an exception, so
+        # detection degrades to the smi path instead of aborting the run
+        assert list_devices(None) == []
+        assert list_devices(Path("/nonexistent/llama-server")) == []
+        # a device list that sums to zero is not an answer -- fall through to
+        # the smi path rather than reporting a 0 MiB machine
+        assert parse_list_devices("  ROCm0: some accelerator (0 MiB, 0 MiB free)\n") == [
+            {"id": "ROCm0", "name": "some accelerator",
+             "total_mib": 0, "free_mib": 0}]
+
         # --- measurement validity (docs/measurement-validity.md) ---
         # Issue #3: a server-driver sweep reported tg=1000000.0 t/s alongside
         # pp=444.1 and crowned it the winner on a box that really does ~25 t/s.
@@ -4497,7 +4631,14 @@ def main():
     n_nextn = model_nextn_layers(meta)
     phys = detect_physical_cores()
     logical = detect_logical_cores()
-    vram = detect_vram_mib()
+    # Resolved before hardware detection: capacity now comes from llama.cpp
+    # itself where possible, so detect_vram_mib needs the binary. resolve_binary
+    # never raises — a missing binary is a best-guess path the caller validates.
+    llama_bench = resolve_binary("llama-bench", args.llama_bench, args.llama_cpp)
+    llama_server = resolve_binary("llama-server", args.llama_server, args.llama_cpp)
+    fit_params = resolve_binary("llama-fit-params", None, args.llama_cpp)
+    detected = detect_vram_mib(llama_server, llama_bench)
+    vram, vram_src = detected if detected else (None, "")
 
     if args.quick and args.full:
         ap.error("--quick and --full are mutually exclusive")
@@ -4524,10 +4665,6 @@ def main():
     reps = args.reps if args.reps is not None else (1 if args.quick else 5 if args.full else BENCH_REPS)
     if args.verify_picks is None:
         args.verify_picks = 0 if args.quick else 3 if args.full else 2
-
-    llama_bench = resolve_binary("llama-bench", args.llama_bench, args.llama_cpp)
-    llama_server = resolve_binary("llama-server", args.llama_server, args.llama_cpp)
-    fit_params = resolve_binary("llama-fit-params", None, args.llama_cpp)
 
     # A model with an MTP/NextN head defaults to the server driver: llama-bench
     # cannot do speculative decoding, so on bench the MTP speedup is neither
@@ -4701,7 +4838,11 @@ def main():
     moe = f"MoE ({n_experts} experts)" if n_experts else "dense"
     print(f"arch       : {arch}   layers: {n_layers if n_layers else '?'}   {moe}")
     print(f"CPU        : {phys} physical / {logical} logical cores")
-    print(f"VRAM       : {vram} MiB" if vram else "VRAM       : (undetected)")
+    # The source is printed because getting it wrong is silent otherwise: a
+    # too-small number just prunes runs away (issue #7), and the line that says
+    # where it came from is what makes that diagnosable from a paste.
+    print(f"VRAM       : {vram} MiB ({vram_src})" if vram
+          else "VRAM       : (undetected)")
     if cfg.oom_prune and vram and cfg.fit_params.exists():
         print(f"OOM prune  : on (llama-fit-params, {cfg.fit_headroom_mib} MiB headroom)")
     elif cfg.oom_prune:

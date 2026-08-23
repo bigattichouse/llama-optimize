@@ -23,10 +23,12 @@ invisible to the tool: they are neither swept nor settable. `--factor` rejects
 names absent from the registry, so there is no user-side workaround either — a
 multi-GPU owner cannot ask the question at all today.
 
-One prerequisite is already fixed: `detect_vram_mib` read only the first card
+Two prerequisites are already fixed. `detect_vram_mib` read only the first card
 (2edff6c), which both understated the machine and mis-scoped the OOM pruner's
-limit. Its parsing now returns per-device figures, which is also what `-ts` level
-generation needs.
+limit; its parsing now returns per-device figures, which is also what `-ts` level
+generation needs. And the `--list-devices` parser argued for below is now built
+and used for capacity — see the checklist, and note that issue #7 got there
+first, on one GPU.
 
 ## Ask llama.cpp for the devices, not the vendor tool
 
@@ -163,6 +165,14 @@ same shape that took ngram from 9 knobs to 3 collapsed ones and L125 back to L25
 
 ## Checklist
 
+- [x] `--list-devices` parser (`parse_list_devices`/`list_devices`), returning
+      per-device id, name, total and free MiB in llama.cpp's order. Landed ahead
+      of the rest because [issue #7](https://github.com/bigattichouse/llama-optimize/issues/7)
+      needed it for a *single*-GPU reason: on an APU the vendor tool reports the
+      2 GiB VRAM carve-out, not the ~30 GiB of GTT the model actually runs in,
+      and the OOM pruner skipped nearly the whole sweep. `detect_vram_mib` now
+      asks llama.cpp first and falls back to smi, which satisfies **M0** for
+      capacity. Ordering is carried but nothing consumes it yet.
 - [ ] Per-device capacities recorded in `hw` (parsing already returns them)
 - [ ] `ts_levels()` derives from **free** VRAM, not total — issue #5's CUDA0
       reports 6672 MiB free of 24117
