@@ -21,6 +21,7 @@ import contextlib
 import csv
 import io
 import json
+import math
 import os
 import random
 import re
@@ -902,11 +903,13 @@ def build_factors(cfg: Config):
         # fa=0 × KV-quant row — sweep it via --factor fa=0,1 --min-kv f16.)
         "nkvo": ["0", "1"],
         # An L125 fits 31 factors at the same 125 runs, so the remaining clean
-        # knobs ride along free. batch levels start at the largest ubatch level
-        # so the -b >= -ub clamp never fires (clamping would alias low batch
-        # levels with high ubatch ones and muddy both estimates).
+        # knobs ride along free. batch is swept as a MULTIPLE of ubatch, not an
+        # absolute: -b >= -ub holds in every row by construction, so no clamp is
+        # needed and the low-batch regime (which an absolute floor of 2048 used
+        # to hide entirely) is reachable again. 1x/4x/16x over ubatch's
+        # 128..2048 spans -b 128..32768.
         "poll": ["0", "50", "100"],
-        "batch": ["2048", "4096", "8192"],
+        "batch_ratio": ["1", "4", "16"],
     }
     if cfg.driver == "server":
         # decode threads (-t) and prefill threads (-tb) can want different
@@ -932,7 +935,9 @@ def build_factors(cfg: Config):
     if cfg.driver == "server" and cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0:
         factors["mtp"] = ["1", "0"]
         factors["spec_n_max"] = ["1", "2", "3", "4", "6"]
-        factors["spec_n_min"] = ["1", "2"]
+        # relative: n_min = floor(frac * n_max), so n_min <= n_max always. 0.0 is
+        # llama.cpp's own default (common/common.h:326) and 1.0 pins them equal.
+        factors["spec_n_min_frac"] = ["0.0", "0.5", "1.0"]
         factors["spec_p_min"] = ["0.0", "0.25", "0.5", "0.75", "0.9"]
         factors["spec_p_split"] = ["0.1", "0.3", "0.5"]
     # ngram self-speculative decoding (server only). The --spec-type variant is a
@@ -952,6 +957,8 @@ def build_factors(cfg: Config):
         else:                                      # screen stage: variants only
             factors["ngram"] = ["none", "ngram-simple", "ngram-mod",
                                 "ngram-map-k", "ngram-map-k4v"]
+    lvl_errors = validate_factor_levels(factors)
+    assert not lvl_errors, "factor levels invalid: " + "; ".join(lvl_errors)
     return factors
 
 
@@ -1114,9 +1121,11 @@ NGRAM_MAP_LEVELS = {                      # ngram-simple / map-k / map-k4v
     "ngram_min_hits": ["1", "2", "3", "5"],           # default 1
 }
 NGRAM_MOD_LEVELS = {                      # ngram-mod
-    "ngram_mod_n_match": ["8", "16", "24", "32", "48"],   # default 24
-    "ngram_mod_n_min":   ["16", "32", "48", "64", "96"],  # default 48
-    "ngram_mod_n_max":   ["32", "48", "64", "96", "128"], # default 64
+    "ngram_mod_n_match":   ["8", "16", "24", "32", "48"],   # default 24
+    "ngram_mod_n_min":     ["16", "32", "48", "64", "96"],  # default 48
+    # relative: n_max = n_min + off, so n_max >= n_min always. llama.cpp's
+    # default pair (n_min 48, n_max 64) is reachable as n_min=48, off=16.
+    "ngram_mod_n_max_off": ["0", "16", "32", "48", "64"],
 }
 
 
@@ -1159,7 +1168,14 @@ FACTORS = {
                      "translate": OT_PATTERNS},
     "nkvo":         {"bench": ("-nkvo",), "server": ("-nkvo",), "kind": "bool"},
     # --- batching ---
-    "batch":        {"bench": ("-b",), "server": ("-b",), "kind": "num"},
+    # -b is DERIVED from -ub (docs/CONSTRAINED-FACTORS.md): a batch below the
+    # micro-batch is a contradiction llama.cpp silently clamps, so an absolute -b
+    # column meant either inverted rows or (as it was) a 2048 floor that hid the
+    # whole low-batch regime. As a MULTIPLE of -ub every row is valid by
+    # construction and the low end is reachable again.
+    "batch_ratio":  {"bench": ("-b",), "server": ("-b",), "kind": "num",
+                     "derived_from": ("ubatch", "scale"), "relation": "at_least",
+                     "abs_name": "batch"},
     "ubatch":       {"bench": ("-ub",), "server": ("-ub",), "kind": "num"},
     # --- KV cache ---
     "kv_type":      {"bench": ("-ctk", "-ctv"), "server": ("-ctk", "-ctv"), "kind": "cat"},
@@ -1179,7 +1195,16 @@ FACTORS = {
     "mtp":          {"bench": None, "server": ("--spec-type",), "kind": "cat", "server_only": True,
                      "translate": {"1": "draft-mtp", "0": ""}},   # on/off: "" omits the flag
     "spec_n_max":   {"bench": None, "server": ("--spec-draft-n-max",), "kind": "num", "server_only": True},
-    "spec_n_min":   {"bench": None, "server": ("--spec-draft-n-min",), "kind": "num", "server_only": True},
+    # n_min is DERIVED from n_max as a FRACTION of it. Swept as an absolute it
+    # produced inverted rows (n_max=1, n_min=2 — issue #8), and llama.cpp does not
+    # reject those: it drafts at most n_max tokens and then discards any draft
+    # shorter than n_min (common/speculative.cpp:378), so an inverted row runs
+    # with speculation silently OFF while still recording mtp=1 — poisoning the
+    # mtp main effect, not merely its own score.
+    "spec_n_min_frac": {"bench": None, "server": ("--spec-draft-n-min",), "kind": "float",
+                        "server_only": True,
+                        "derived_from": ("spec_n_max", "scale"), "relation": "at_most",
+                        "abs_name": "spec_n_min"},
     "spec_p_min":   {"bench": None, "server": ("--spec-draft-p-min",), "kind": "float", "server_only": True},
     "spec_p_split": {"bench": None, "server": ("--spec-draft-p-split",), "kind": "float", "server_only": True},
     "ngram":             {"bench": None, "server": ("--spec-type",), "kind": "cat", "server_only": True,
@@ -1206,8 +1231,13 @@ FACTORS = {
                           "server_only": True, "active_when": ("ngram", {"ngram-mod"})},
     "ngram_mod_n_min":   {"bench": None, "server": ("--spec-ngram-mod-n-min",), "kind": "num",
                           "server_only": True, "active_when": ("ngram", {"ngram-mod"})},
-    "ngram_mod_n_max":   {"bench": None, "server": ("--spec-ngram-mod-n-max",), "kind": "num",
-                          "server_only": True, "active_when": ("ngram", {"ngram-mod"})},
+    # n_max is DERIVED from n_min as an OFFSET above it — same defect as
+    # spec_n_min_frac: speculative.cpp:1920 discards a draft shorter than n_min,
+    # so an inverted ngram-mod row measures the baseline, not ngram-mod.
+    "ngram_mod_n_max_off": {"bench": None, "server": ("--spec-ngram-mod-n-max",), "kind": "num",
+                            "server_only": True, "active_when": ("ngram", {"ngram-mod"}),
+                            "derived_from": ("ngram_mod_n_min", "offset"),
+                            "relation": "at_least", "abs_name": "ngram_mod_n_max"},
     # --- concurrency (server only) ---
     "parallel":     {"bench": None, "server": ("--parallel",), "kind": "num", "server_only": True},
     # --- context extension / capability (server only) ---
@@ -1254,12 +1284,116 @@ def conditional_flags(name: str, gate_value) -> tuple | None:
     return spec.get("server")
 
 
+# ---------------------------------------------------------------------------
+# Constrained (derived) factors — see docs/CONSTRAINED-FACTORS.md.
+# Some knobs come in ordered pairs: -b >= -ub, n_min <= n_max. An orthogonal
+# array varies its columns independently, so sweeping BOTH members as absolutes
+# emits inverted rows — and llama.cpp accepts them, then behaves as if the
+# feature were switched off (issue #8). Clamping at emission would desync the
+# recorded level from the config that actually ran; dropping the rows would
+# unbalance the array. Instead the DEPENDENT member of a pair declares
+#     "derived_from": (base_factor, "scale" | "offset")
+#     "relation":     "at_most" | "at_least"
+# and its LEVELS become relative to the base — a "scale" factor multiplies the
+# base, an "offset" factor adds to it. Every row then satisfies the relation by
+# construction, the relative level remains a fully orthogonal design axis, and
+# the absolute value is a pure function of the two levels in the same row.
+# ---------------------------------------------------------------------------
+# What to derive from when the base factor is not itself being swept: the fixed
+# value that run will use for it.
+DERIVED_BASE_FALLBACK = {
+    "ubatch":          lambda cfg: 512,                            # llama.cpp -ub default
+    "spec_n_max":      lambda cfg: getattr(cfg, "spec_draft_n_max", 2),
+    "ngram_mod_n_min": lambda cfg: 48,                             # common/common.h:355
+}
+
+
+# Factors that USED to be swept as absolutes and are now derived (issue #8).
+# The rename is deliberate: silently rereading an old `--factor batch=2048` as
+# "2048 x ubatch" would be exactly the class of quiet misinterpretation this
+# mechanism exists to remove, so the old spelling has to fail loudly.
+RENAMED_FACTORS = {
+    "batch": ("batch_ratio",
+              "-b is now swept as a MULTIPLE of -ub (e.g. batch_ratio=1,4,16); "
+              "the emitted -b is batch_ratio x ubatch"),
+    "spec_n_min": ("spec_n_min_frac",
+                   "--spec-draft-n-min is now swept as a FRACTION of spec_n_max "
+                   "(e.g. spec_n_min_frac=0.0,0.5,1.0), so n_min <= n_max always"),
+    "ngram_mod_n_max": ("ngram_mod_n_max_off",
+                        "--spec-ngram-mod-n-max is now swept as an OFFSET above "
+                        "ngram_mod_n_min (e.g. ngram_mod_n_max_off=0,16,32), so "
+                        "n_max >= n_min always"),
+}
+
+
+def derived_base(name: str, f: dict, cfg=None) -> int:
+    """Absolute value of `name`'s base sibling in row `f` (its fixed default when
+    the base is not part of this design)."""
+    base_name = FACTORS[name]["derived_from"][0]
+    if base_name in f:
+        return int(f[base_name])
+    return DERIVED_BASE_FALLBACK[base_name](cfg)
+
+
+def derived_value(name: str, f: dict, cfg=None) -> int:
+    """Materialize a derived factor's ABSOLUTE value from its relative level and
+    its base sibling in the same row.
+
+    Rounding is picked so the declared relation holds unconditionally: floor for
+    `at_most`, ceil for `at_least`. round() would not do — banker's rounding
+    sends 0.5*1 to 0 but 0.5*3 to 2, and only floor makes level 1.0 land exactly
+    on the base. The final clamp is belt-and-braces for hand-written levels."""
+    spec = FACTORS[name]
+    _, op = spec["derived_from"]
+    at_most = spec["relation"] == "at_most"
+    base = derived_base(name, f, cfg)
+    lvl = float(f[name])
+    if op == "scale":
+        raw = math.floor(lvl * base) if at_most else math.ceil(lvl * base)
+    else:                                              # "offset"
+        raw = base + int(lvl)
+    return max(0, min(raw, base)) if at_most else max(raw, base)
+
+
+def derived_names(names=None) -> list:
+    """The derived factors among `names` (default: the whole registry)."""
+    return [n for n in (FACTORS if names is None else names)
+            if FACTORS.get(n, {}).get("derived_from")]
+
+
+def derived_abs_name(name: str) -> str:
+    """Column name for a derived factor's materialized absolute value."""
+    return FACTORS.get(name, {}).get("abs_name", name + "_abs")
+
+
+def derived_abs_cols(cfg, f: dict) -> dict:
+    """The absolute values of the derived factors in row `f`, keyed by their
+    absolute column name. A derived factor's own column holds its RELATIVE level
+    (that is the design axis the main effects are computed over); this records
+    what actually reached llama.cpp alongside it, so a CSV row is reproducible on
+    its own (C3). Blank for a conditional factor inactive in this row — nothing
+    was emitted for it."""
+    return {derived_abs_name(n): (derived_value(n, f, cfg) if is_active(n, f) else "")
+            for n in derived_names(f)}
+
+
+def derived_base_pins(names) -> set:
+    """Bases that `names` derive from but that are NOT themselves swept here.
+    Such a base has to be pinned explicitly on the command line: the relation was
+    guaranteed against the fallback value, so letting llama.cpp apply its own
+    default instead would break C1."""
+    return {FACTORS[n]["derived_from"][0] for n in derived_names(names)
+            if FACTORS[n]["derived_from"][0] not in names}
+
+
 def validate_factor_registry(factors: dict = FACTORS) -> list:
     """Return a list of registry errors (empty ⇒ valid). Checks that every
     conditional factor's gate exists, its live values are real gate levels (when
     the gate enumerates them via `translate`), `flag_for` is total over the live
-    set, the factor can emit a flag, and the gate graph is acyclic. Run in
-    selftest and asserted at build_factors time so a bad registry fails fast."""
+    set, the factor can emit a flag, and the gate graph is acyclic; and that every
+    derived factor's base exists, is numeric, is not itself derived, and that the
+    derivation graph is acyclic. Run in selftest and asserted at build_factors
+    time so a bad registry fails fast."""
     errors: list[str] = []
     edges: dict[str, str] = {}          # factor -> its gate (for cycle check)
     for name, spec in factors.items():
@@ -1296,32 +1430,108 @@ def validate_factor_registry(factors: dict = FACTORS) -> list:
         elif spec.get("server") is None and spec.get("bench") is None:
             errors.append(f"{name}: conditional factor has no flag mapping "
                           f"(need server/bench tuple or flag_for)")
-    # cycle detection over factor -> gate edges (must be a DAG)
-    WHITE, GREY, BLACK = 0, 1, 2
-    color = {n: WHITE for n in edges}
+    # Derived (constrained) factors: base must exist, be numeric, and be a leaf
+    # of the derivation graph — deriving from a derived factor would make a row's
+    # absolute value depend on a chain the OA never balanced.
+    dedges: dict[str, str] = {}         # factor -> its base (for cycle check)
+    for name, spec in factors.items():
+        dfrom = spec.get("derived_from")
+        if dfrom is None:
+            continue
+        try:
+            base, op = dfrom
+        except (TypeError, ValueError):
+            errors.append(f"{name}: derived_from must be (base, 'scale'|'offset')")
+            continue
+        dedges[name] = base
+        if op not in ("scale", "offset"):
+            errors.append(f"{name}: derived_from op must be 'scale' or 'offset', "
+                          f"got {op!r}")
+        if spec.get("relation") not in ("at_most", "at_least"):
+            errors.append(f"{name}: derived factor needs relation "
+                          f"'at_most' or 'at_least', got {spec.get('relation')!r}")
+        if base not in factors:
+            errors.append(f"{name}: derived_from base '{base}' is not a factor")
+        else:
+            if factors[base].get("kind") not in ("num", "float"):
+                errors.append(f"{name}: derived_from base '{base}' must be numeric "
+                              f"(kind num/float), got {factors[base].get('kind')!r}")
+            if factors[base].get("derived_from") is not None:
+                errors.append(f"{name}: derived_from base '{base}' is itself "
+                              "derived (chains are not supported)")
+        if base not in DERIVED_BASE_FALLBACK:
+            errors.append(f"{name}: base '{base}' has no DERIVED_BASE_FALLBACK "
+                          "entry (needed when the base is not swept)")
 
-    def visit(n: str) -> bool:                               # True ⇒ cycle found
-        color[n] = GREY
-        g = edges.get(n)
-        if g in edges:
-            if color[g] == GREY or (color[g] == WHITE and visit(g)):
-                return True
-        color[n] = BLACK
-        return False
+    def has_cycle(graph: dict) -> str | None:
+        """The first node on a cycle in a node -> node graph, else None."""
+        WHITE, GREY, BLACK = 0, 1, 2
+        color = {n: WHITE for n in graph}
 
-    for n in edges:
-        if color[n] == WHITE and visit(n):
-            errors.append(f"active_when gate graph has a cycle through '{n}'")
-            break
+        def visit(n: str) -> bool:                           # True ⇒ cycle found
+            color[n] = GREY
+            g = graph.get(n)
+            if g in graph:
+                if color[g] == GREY or (color[g] == WHITE and visit(g)):
+                    return True
+            color[n] = BLACK
+            return False
+
+        for n in graph:
+            if color[n] == WHITE and visit(n):
+                return n
+        return None
+
+    n = has_cycle(edges)                    # factor -> gate must be a DAG
+    if n is not None:
+        errors.append(f"active_when gate graph has a cycle through '{n}'")
+    n = has_cycle(dedges)                   # factor -> base must be a DAG
+    if n is not None:
+        errors.append(f"derived_from graph has a cycle through '{n}'")
     return errors
 
 
-def factor_flags(cfg: Config, f: dict, driver: str, ub: int) -> list[list[str]]:
+def validate_factor_levels(factors: dict) -> list:
+    """Return errors for a LEVEL SET (name -> levels), as opposed to the registry.
+    A derived factor's levels are relative to its base, so they must honour the
+    declared relation: `at_most` needs scale levels <= 1 / offsets <= 0,
+    `at_least` needs scale levels >= 1 / offsets >= 0. Checked at build/argparse
+    time so `--factor spec_n_min_frac=2.0` fails before the sweep starts, not
+    silently as an inverted row (C1)."""
+    errors: list[str] = []
+    for name, levels in factors.items():
+        spec = FACTORS.get(name, {})
+        dfrom = spec.get("derived_from")
+        if dfrom is None:
+            continue
+        _, op = dfrom
+        at_most = spec.get("relation") == "at_most"
+        bound = 1.0 if op == "scale" else 0.0
+        what = f"{'a fraction of' if at_most else 'a multiple of'} {dfrom[0]}" \
+            if op == "scale" else f"an offset from {dfrom[0]}"
+        for lvl in levels:
+            try:
+                v = float(lvl)
+            except (TypeError, ValueError):
+                errors.append(f"{name}: level {lvl!r} is not numeric "
+                              f"({name} is {what})")
+                continue
+            if at_most and v > bound:
+                errors.append(f"{name}: level {lvl} > {bound:g} would make "
+                              f"{name} exceed {dfrom[0]} ({name} is {what})")
+            elif not at_most and v < bound:
+                errors.append(f"{name}: level {lvl} < {bound:g} would make "
+                              f"{name} fall below {dfrom[0]} ({name} is {what})")
+    return errors
+
+
+def factor_flags(cfg: Config, f: dict, driver: str) -> list[list[str]]:
     """Argument groups for the sweepable factors in `f` on the given driver, e.g.
     [["-ngl","64"], ["-nkvo"], ["-ctk","f16"]]. Skips env factors, request-time
     factors (n_depth), factors unsupported on the driver, and conditional factors
     whose gate isn't selected in this row (I2). Handles kv (two flags), booleans,
-    batch clamp, named -ot patterns, and variant-dependent flag_for spellings."""
+    derived factors (relative level -> absolute value, C1/C4), named -ot patterns,
+    and variant-dependent flag_for spellings."""
     groups = []
     for name, val in f.items():
         spec = FACTORS.get(name)
@@ -1341,8 +1551,8 @@ def factor_flags(cfg: Config, f: dict, driver: str, ub: int) -> list[list[str]]:
             val = spec["translate"].get(str(val), str(val))
             if val == "":
                 continue
-        if name == "batch":
-            val = str(max(int(val), ub))
+        if spec.get("derived_from") is not None:    # relative level -> absolute
+            val = str(derived_value(name, f, cfg))
         if spec["kind"] == "bool":
             if driver == "server":
                 if str(val) in ("1", "on", "true", "True"):
@@ -1352,6 +1562,19 @@ def factor_flags(cfg: Config, f: dict, driver: str, ub: int) -> list[list[str]]:
         else:
             for fl in flags:
                 groups.append([fl, str(val)])
+    # Pin any base a derived factor leaned on but that is not swept here, at the
+    # exact value the derivation assumed (C1). Without this, `--factor
+    # spec_n_min_frac=1.0` on a design that does not sweep spec_n_max would
+    # compute n_min against our fallback while llama.cpp used its own n_max.
+    for base_name in derived_base_pins(f):
+        if base_name in cfg.env_factor_names:
+            continue
+        flags = FACTORS.get(base_name, {}).get(driver)
+        if flags is None:
+            continue
+        pin = str(DERIVED_BASE_FALLBACK[base_name](cfg))   # base absent from f
+        for fl in flags:
+            groups.append([fl, pin])
     return groups
 
 
@@ -1380,9 +1603,9 @@ def bench_command(cfg: Config, f: dict) -> list[str]:
     if "fa" not in f:                              # flash-attn fixed unless swept
         cmd += ["-fa", str(FIXED_FA)]
     ub = int(f.get("ubatch", 512))
-    if "batch" not in f:                           # batch fixed; needs -b >= -ub
+    if "batch_ratio" not in f:                     # batch fixed; needs -b >= -ub
         cmd += ["-b", str(max(FIXED_BATCH, ub))]
-    cmd += _flat(factor_flags(cfg, f, "bench", ub))
+    cmd += _flat(factor_flags(cfg, f, "bench"))
     return cmd
 
 
@@ -1444,10 +1667,10 @@ def server_command(cfg: Config, f: dict, ctx: int) -> str:
         parts.append("--no-mmap")
     if "fa" not in f:
         parts.append(f"-fa {FIXED_FA}")
-    if "batch" not in f:
+    if "batch_ratio" not in f:
         parts.append(f"-b {max(FIXED_BATCH, ub)}")
     parts += [" ".join(shlex.quote(t) for t in g)
-              for g in factor_flags(cfg, f, "server", ub)]
+              for g in factor_flags(cfg, f, "server")]
     if "parallel" not in f and cfg.parallel > 1:
         parts.append(f"--parallel {cfg.parallel}")
     # Multi-token prediction: if the model ships a NextN/MTP head, enable
@@ -1457,7 +1680,8 @@ def server_command(cfg: Config, f: dict, ctx: int) -> str:
     if cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0:
         if "mtp" not in f:                    # MTP fixed on unless swept
             parts.append("--spec-type draft-mtp")
-        if "spec_n_max" not in f:
+        # (skipped when factor_flags already pinned it for a derived sibling)
+        if "spec_n_max" not in f and "spec_n_max" not in derived_base_pins(f):
             parts.append(f"--spec-draft-n-max {cfg.spec_draft_n_max}")
     # ngram self-speculation: pattern-matching decoding that needs no draft model.
     # When enabled but not swept, activate a sensible default variant (ngram-mod);
@@ -1655,15 +1879,16 @@ def build_server_args(cfg: Config, f: dict, port: int, n_ctx: int) -> list[str]:
         args.append("--no-mmap")                   # llama-server flag (NOT -mmp)
     if "fa" not in f:                              # flash-attn fixed unless swept
         args += ["-fa", str(FIXED_FA)]
-    if "batch" not in f:
+    if "batch_ratio" not in f:
         args += ["-b", str(max(FIXED_BATCH, ub))]
-    args += _flat(factor_flags(cfg, f, "server", ub))
+    args += _flat(factor_flags(cfg, f, "server"))
     if "parallel" not in f and cfg.parallel > 1:   # concurrency (fixed) if not swept
         args += ["--parallel", str(cfg.parallel)]
     if cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0:
         if "mtp" not in f:                         # MTP fixed on unless swept
             args += ["--spec-type", "draft-mtp"]
-        if "spec_n_max" not in f:                  # default n_max if not swept
+        # default n_max if not swept (and not already pinned for a derived sibling)
+        if "spec_n_max" not in f and "spec_n_max" not in derived_base_pins(f):
             args += ["--spec-draft-n-max", str(cfg.spec_draft_n_max)]
     # ngram self-speculation: enable ngram-mod by default when ngram is on but not
     # swept. ngram's draft length is ngram-mod's own default, not --spec-draft-n-max
@@ -2241,6 +2466,18 @@ def refine_factors(cfg: Config, rows: list[dict]) -> dict:
             means = factor_level_means(rows, name)
             ranked = sorted(means, key=means.get, reverse=True)
             new[name] = ranked[:3] if len(ranked) >= 3 else ranked
+    # A derived factor's refined grid must still honour its relation (C1). This
+    # is the path a level-set-only fix could never have covered: refine_numeric
+    # brackets the winner on a grid of its own, per pass, so a conflict-free pass
+    # 1 can hand pass 2 an out-of-domain level. Drop the offenders rather than
+    # assert — a refinement pass must not abort a sweep that is already hours in.
+    for name in derived_names(new):
+        kept = [l for l in new[name] if not validate_factor_levels({name: [l]})]
+        dropped = [l for l in new[name] if l not in kept]
+        if dropped:
+            print(f"refine: dropping out-of-domain {name} level(s) {dropped} — "
+                  f"{name} is relative to {FACTORS[name]['derived_from'][0]}")
+        new[name] = kept or [str(bests[name])]   # the winner is in-domain by construction
     return new
 
 
@@ -2790,8 +3027,109 @@ def selftest() -> bool:
         assert "-ctk" in cmd and "-ctv" in cmd
         assert "GGML_CUDA_FORCE_MMQ" not in " ".join(cmd)  # env not on cmdline
         assert run_env(cfg, f)["GGML_CUDA_FORCE_MMQ"] == "1"
-        cmd2 = bench_command(cfg, {"ubatch": "2048", "batch": "512"})  # clamp b>=ub
-        assert cmd2[cmd2.index("-b") + 1] == "2048"
+        # -b is derived from -ub, so a ratio row can never emit -b < -ub (C1) and
+        # ratio 1 lands exactly on -ub — the low-batch regime an absolute floor of
+        # 2048 used to hide.
+        cmd2 = bench_command(cfg, {"ubatch": "2048", "batch_ratio": "4"})
+        assert cmd2[cmd2.index("-b") + 1] == "8192"
+        cmd3 = bench_command(cfg, {"ubatch": "128", "batch_ratio": "1"})
+        assert cmd3[cmd3.index("-b") + 1] == "128"
+
+        # --- constrained (derived) factors: docs/CONSTRAINED-FACTORS.md ---
+        # Rounding must keep the relation unconditional. round() would not:
+        # banker's rounding sends 0.5*1 -> 0 but 0.5*3 -> 2, and only floor makes
+        # frac 1.0 land exactly on the base.
+        for n_max, frac, want in [("1", "0.5", 0), ("1", "1.0", 1), ("1", "0.0", 0),
+                                  ("2", "0.5", 1), ("3", "0.5", 1), ("4", "0.5", 2),
+                                  ("6", "0.5", 3), ("6", "1.0", 6)]:
+            got = derived_value("spec_n_min_frac",
+                                {"spec_n_max": n_max, "spec_n_min_frac": frac})
+            assert got == want, f"n_max={n_max} frac={frac}: {got} != {want}"
+            assert got <= int(n_max)                      # C1
+        # offset op, and the llama.cpp default pair (n_min 48, n_max 64)
+        assert derived_value("ngram_mod_n_max_off",
+                             {"ngram_mod_n_min": "48",
+                              "ngram_mod_n_max_off": "16"}) == 64
+        assert derived_value("ngram_mod_n_max_off",
+                             {"ngram_mod_n_min": "96",
+                              "ngram_mod_n_max_off": "0"}) == 96
+        # base not swept: derive from that run's fixed value for it
+        cfg_d = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
+                       ctx_floor=8192, spec_draft_n_max=4)
+        assert derived_value("spec_n_min_frac", {"spec_n_min_frac": "0.5"}, cfg_d) == 2
+        assert derived_value("batch_ratio", {"batch_ratio": "4"}) == 2048  # -ub 512
+
+        # a conditional derived factor records no absolute where it is inactive
+        abscols = derived_abs_cols(cfg_d, {"ngram": "ngram-simple",
+                                           "ngram_mod_n_min": "48",
+                                           "ngram_mod_n_max_off": "16"})
+        assert abscols["ngram_mod_n_max"] == "", abscols
+
+        # registry validation catches a malformed derived declaration
+        bad = dict(FACTORS)
+        bad["spec_n_min_frac"] = {**FACTORS["spec_n_min_frac"],
+                                  "derived_from": ("kv_type", "scale")}
+        errs = validate_factor_registry(bad)
+        assert any("must be numeric" in e for e in errs), errs
+        bad2 = {"a": {"kind": "num", "server": ("-a",),
+                      "derived_from": ("b", "scale"), "relation": "at_most"},
+                "b": {"kind": "num", "server": ("-b",),
+                      "derived_from": ("a", "scale"), "relation": "at_most"}}
+        assert any("cycle" in e for e in validate_factor_registry(bad2)), \
+            validate_factor_registry(bad2)
+        # and level sets that would break the relation are rejected up front
+        assert validate_factor_levels({"spec_n_min_frac": ["0.0", "0.5"]}) == []
+        assert validate_factor_levels({"spec_n_min_frac": ["2.0"]})
+        assert validate_factor_levels({"batch_ratio": ["0"]})
+        assert validate_factor_levels({"ngram_mod_n_max_off": ["-16"]})
+
+        # A base a derived factor leaned on but that is NOT swept must be pinned
+        # explicitly, or llama.cpp would apply its own default and the relation
+        # would have been guaranteed against a number that never reached it.
+        cfg_pin = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
+                         ctx_floor=8192, driver="server", spec_draft_n_max=8,
+                         hw={"phys": 8, "logical": 16, "n_layers": 32,
+                             "n_ctx_train": 32768, "n_experts": 0, "n_nextn": 1})
+        ap_ = build_server_args(cfg_pin, {"spec_n_min_frac": "1.0",
+                                          "ubatch": "512"}, 8080, 4096)
+        assert ap_.count("--spec-draft-n-max") == 1, ap_       # pinned, not doubled
+        assert int(ap_[ap_.index("--spec-draft-n-min") + 1]) \
+            <= int(ap_[ap_.index("--spec-draft-n-max") + 1]), ap_
+        # base swept: no pin needed, still exactly one flag
+        bp_ = build_server_args(cfg_pin, {"spec_n_max": "3", "spec_n_min_frac": "1.0",
+                                          "ubatch": "512"}, 8080, 4096)
+        assert bp_.count("--spec-draft-n-max") == 1, bp_
+        assert bp_[bp_.index("--spec-draft-n-min") + 1] == "3", bp_
+        # same for -b/-ub: sweeping the ratio without ubatch pins -ub
+        cp_ = bench_command(cfg_pin, {"batch_ratio": "4"})
+        assert int(cp_[cp_.index("-b") + 1]) >= int(cp_[cp_.index("-ub") + 1]), cp_
+
+        # THE issue-#8 property: no generated row can invert an ordered pair.
+        # This is what a level-set-only fix would not have given us, since
+        # refine_factors rebuilds each numeric grid independently per pass.
+        def _assert_no_inversion(factor_levels, cfgx):
+            _, gruns = generate_runs(factor_levels, choose_array(factor_levels))
+            for gr in gruns:
+                row = gr["factors"]
+                for dn in derived_names(row):
+                    base = derived_base(dn, row, cfgx)
+                    val = derived_value(dn, row, cfgx)
+                    if FACTORS[dn]["relation"] == "at_most":
+                        assert val <= base, (dn, row, val, base)
+                    else:
+                        assert val >= base, (dn, row, val, base)
+            return len(gruns)
+
+        hw_d = {"phys": 8, "logical": 16, "n_layers": 32,
+                "n_ctx_train": 32768, "n_experts": 0, "n_nextn": 1}
+        cfg_mtp = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
+                         ctx_floor=8192, driver="server", hw=dict(hw_d))
+        assert _assert_no_inversion(build_factors(cfg_mtp), cfg_mtp) > 0
+        cfg_tune = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
+                          ctx_floor=8192, driver="server", ngram=True,
+                          ngram_type="ngram-mod",
+                          hw={**hw_d, "n_nextn": 0})
+        assert _assert_no_inversion(build_factors(cfg_tune), cfg_tune) > 0
         # llama-bench has no --fit; emitting one makes it exit non-zero, which
         # would fail every bench run. Verified against the binary: it answers
         # "error: invalid parameter for argument: --no-fit".
@@ -3025,17 +3363,17 @@ def selftest() -> bool:
         assert FACTORS["threads_batch"]["bench"] is None      # server-only flag
         cfg_s = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
                        ctx_floor=8192, driver="server")
-        assert factor_flags(cfg_s, {"ot": "none"}, "bench", 512) == []   # none omits
-        assert factor_flags(cfg_s, {"ot": "exps_cpu"}, "bench", 512)[0][0] == "-ot"
-        assert factor_flags(cfg_s, {"fa": "0"}, "bench", 512) == [["-fa", "0"]]
-        assert factor_flags(cfg_s, {"nkvo": "1"}, "server", 512) == [["-nkvo"]]  # bare
-        assert factor_flags(cfg_s, {"nkvo": "1"}, "bench", 512) == [["-nkvo", "1"]]
+        assert factor_flags(cfg_s, {"ot": "none"}, "bench") == []   # none omits
+        assert factor_flags(cfg_s, {"ot": "exps_cpu"}, "bench")[0][0] == "-ot"
+        assert factor_flags(cfg_s, {"fa": "0"}, "bench") == [["-fa", "0"]]
+        assert factor_flags(cfg_s, {"nkvo": "1"}, "server") == [["-nkvo"]]  # bare
+        assert factor_flags(cfg_s, {"nkvo": "1"}, "bench") == [["-nkvo", "1"]]
 
         # MTP as a swept factor: on/off via translate ("" omits), server-only
-        assert factor_flags(cfg_s, {"mtp": "1"}, "server", 512) == \
+        assert factor_flags(cfg_s, {"mtp": "1"}, "server") == \
             [["--spec-type", "draft-mtp"]]
-        assert factor_flags(cfg_s, {"mtp": "0"}, "server", 512) == []
-        assert factor_flags(cfg_s, {"mtp": "1"}, "bench", 512) == []
+        assert factor_flags(cfg_s, {"mtp": "0"}, "server") == []
+        assert factor_flags(cfg_s, {"mtp": "1"}, "bench") == []
         cfg_m = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
                        ctx_floor=8192, driver="server",
                        hw={"phys": 8, "logical": 16, "n_layers": 32,
@@ -3063,9 +3401,10 @@ def selftest() -> bool:
         # MoE; threads_batch + the MTP surface only on the server driver;
         # numa only on a multi-node box
         fs = build_factors(cfg_m)
-        assert all(k in fs for k in ("nkvo", "poll", "batch", "threads_batch",
-                                     "mtp", "spec_n_max", "spec_n_min",
+        assert all(k in fs for k in ("nkvo", "poll", "batch_ratio", "threads_batch",
+                                     "mtp", "spec_n_max", "spec_n_min_frac",
                                      "spec_p_min", "spec_p_split"))
+        assert "batch" not in fs and "spec_n_min" not in fs   # renamed, now derived
         assert "ot" in fs and "ncmoe" not in fs            # dense
         assert "numa" not in fs                            # single NUMA node
         cfg_m.hw["numa_nodes"] = 2
@@ -3073,39 +3412,40 @@ def selftest() -> bool:
         cfg_m.hw["numa_nodes"] = 1
         cfg_m.driver = "bench"
         fs = build_factors(cfg_m)
-        assert "nkvo" in fs and "poll" in fs and "batch" in fs
-        assert all(k not in fs for k in ("mtp", "spec_n_max", "spec_n_min",
+        assert "nkvo" in fs and "poll" in fs and "batch_ratio" in fs
+        assert all(k not in fs for k in ("mtp", "spec_n_max", "spec_n_min_frac",
                                          "spec_p_min", "spec_p_split",
                                          "threads_batch"))  # server-only
 
         # ngram as a swept factor: translate maps variant names, "none" omits
-        assert factor_flags(cfg_s, {"ngram": "ngram-mod"}, "server", 512) == \
+        assert factor_flags(cfg_s, {"ngram": "ngram-mod"}, "server") == \
             [["--spec-type", "ngram-mod"]]
-        assert factor_flags(cfg_s, {"ngram": "none"}, "server", 512) == []
-        assert factor_flags(cfg_s, {"ngram": "ngram-simple"}, "server", 512) == \
+        assert factor_flags(cfg_s, {"ngram": "none"}, "server") == []
+        assert factor_flags(cfg_s, {"ngram": "ngram-simple"}, "server") == \
             [["--spec-type", "ngram-simple"]]
-        assert factor_flags(cfg_s, {"ngram": "ngram-mod"}, "bench", 512) == []
+        assert factor_flags(cfg_s, {"ngram": "ngram-mod"}, "bench") == []
         # all ngram factors are server-only
         for nf in ("ngram", "ngram_size_n", "ngram_size_m", "ngram_min_hits",
-                   "ngram_mod_n_match", "ngram_mod_n_min", "ngram_mod_n_max"):
+                   "ngram_mod_n_match", "ngram_mod_n_min", "ngram_mod_n_max_off"):
             assert FACTORS[nf].get("server_only"), f"{nf} should be server_only"
 
         # conditional ngram knobs: emitted only for their active variant (I2), and
         # the collapsed shared knob resolves the variant-specific flag via flag_for.
         gated = _flat(factor_flags(cfg_s, {"ngram": "ngram-mod",
                                            "ngram_mod_n_match": "16",
-                                           "ngram_size_n": "8"}, "server", 512))
+                                           "ngram_size_n": "8"}, "server"))
         assert "--spec-ngram-mod-n-match" in gated, f"got {gated}"
         assert "--spec-ngram-simple-size-n" not in gated, f"got {gated}"
         # same shared knob, different variant → different flag spelling
         for variant in ("ngram-simple", "ngram-map-k", "ngram-map-k4v"):
             g = _flat(factor_flags(cfg_s, {"ngram": variant, "ngram_size_m": "32",
-                                           "ngram_mod_n_max": "64"}, "server", 512))
+                                           "ngram_mod_n_min": "48",
+                                           "ngram_mod_n_max_off": "16"}, "server"))
             assert f"--spec-{variant}-size-m" in g, f"{variant}: {g}"
             assert "--spec-ngram-mod-n-max" not in g          # mod knob inactive here
         # ngram=none → variant flag omitted AND every conditional knob suppressed
         assert factor_flags(cfg_s, {"ngram": "none", "ngram_mod_n_match": "16",
-                                    "ngram_size_n": "8"}, "server", 512) == []
+                                    "ngram_size_n": "8"}, "server") == []
 
         # ngram screen build: the gate only (no conditional children — those enter
         # a variant's tuning stage), and NOT spec_n_max (a draft-model knob).
@@ -3121,9 +3461,9 @@ def selftest() -> bool:
         # a pinned variant (tuning stage) includes ONLY its own knobs
         vf_mod = build_factors(replace(cfg_n, ngram_type="ngram-mod"))
         assert vf_mod["ngram"] == ["ngram-mod"]
-        assert "ngram_mod_n_max" in vf_mod and "ngram_size_n" not in vf_mod
+        assert "ngram_mod_n_max_off" in vf_mod and "ngram_size_n" not in vf_mod
         vf_simple = build_factors(replace(cfg_n, ngram_type="ngram-simple"))
-        assert "ngram_size_n" in vf_simple and "ngram_mod_n_max" not in vf_simple
+        assert "ngram_size_n" in vf_simple and "ngram_mod_n_max_off" not in vf_simple
 
         # I3: a conditional knob is scored only over rows where it was active.
         # ngram_size_n really matters within ngram-simple (best at "24"); rows on
@@ -3156,7 +3496,7 @@ def selftest() -> bool:
         assert set(tune["ngram-simple"]["factors"]) == \
             {"ngram", "ngram_size_n", "ngram_size_m", "ngram_min_hits"}
         assert set(tune["ngram-mod"]["factors"]) == \
-            {"ngram", "ngram_mod_n_match", "ngram_mod_n_min", "ngram_mod_n_max"}
+            {"ngram", "ngram_mod_n_match", "ngram_mod_n_min", "ngram_mod_n_max_off"}
         assert tune["ngram-simple"]["factors"]["ngram"] == ["ngram-simple"]
         # I1 liveness: every factor in every stage is active under the stage's pin
         for s in stages:
@@ -3166,9 +3506,10 @@ def selftest() -> bool:
         assert all(len(s["factors"]) <= 4 for s in stages if s["gate"])
         # a subset factor set plans just the screen + the one live variant's stage
         ps = plan_stages({"ngram": ["none", "ngram-mod"],
-                          "ngram_mod_n_max": ["32", "64"], "ngl": ["0", "64"]})
+                          "ngram_mod_n_max_off": ["0", "16"], "ngl": ["0", "64"]})
         assert [s["name"] for s in ps] == ["screen", "tune:ngram=ngram-mod"]
-        assert "ngl" in ps[0]["factors"] and "ngram_mod_n_max" not in ps[0]["factors"]
+        assert "ngl" in ps[0]["factors"] and \
+            "ngram_mod_n_max_off" not in ps[0]["factors"]
 
         # --- ngram staging helpers (run_ngram_stages) ---
         screen_rows = [
@@ -4722,6 +5063,10 @@ def main():
         name, _, vals = spec.partition("=")
         name = name.strip()
         levels = [v.strip() for v in vals.split(",") if v.strip()]
+        if name in RENAMED_FACTORS:
+            new, why = RENAMED_FACTORS[name]
+            ap.error(f"--factor {name}: '{name}' is now derived from a sibling "
+                     f"factor and was renamed to '{new}'.\n  {why}.")
         if name not in FACTORS:
             ap.error(f"--factor: unknown factor '{name}' "
                      f"(sweepable: {', '.join(sorted(FACTORS))})")
@@ -4733,6 +5078,9 @@ def main():
                      "use --driver server")
         if not levels:
             ap.error(f"--factor {name}: no levels given")
+        lvl_errors = validate_factor_levels({name: levels})
+        if lvl_errors:
+            ap.error("--factor " + "; ".join(lvl_errors))
         cfg.factors[name] = levels
 
     # apply --env: each becomes an orthogonal factor that sets a process env var
@@ -4880,7 +5228,7 @@ def main():
     fixed_bits = [f"mmap {'on' if FIXED_MMAP else 'off'}"]
     if "fa" not in cfg.factors:
         fixed_bits.insert(0, f"flash-attn {'on' if FIXED_FA else 'off'}")
-    if "batch" not in cfg.factors:
+    if "batch_ratio" not in cfg.factors:
         fixed_bits.append(f"batch {FIXED_BATCH}")
     print(f"fixed      : {', '.join(fixed_bits)}  "
           f"(p={cfg.n_prompt} n={cfg.n_gen} reps={cfg.reps})")
@@ -4939,7 +5287,10 @@ def main():
                  if args.cooldown > 0 else "no settle between runs (see --cooldown)"))
 
     # --- execute sweep ---
-    cols = (["run_id"] + list(cfg.factors.keys())
+    # Derived factors contribute two columns: the relative level they were swept
+    # at, and the absolute value it materialized to (C3).
+    abs_cols = [derived_abs_name(n) for n in derived_names(cfg.factors)]
+    cols = (["run_id"] + list(cfg.factors.keys()) + abs_cols
             + ["pp_tps", "tg_tps", "eff_tps", "status", "secs", "temp_c"]
             + (["vram_mib"] if cfg.measure_vram else []))
 
@@ -4987,6 +5338,7 @@ def main():
                 crashed.setdefault(rid, run["factors"])
         for rid, fac in crashed.items():
             crow = {"run_id": rid, **{k: fac.get(k, "") for k in cfg.factors},
+                    **derived_abs_cols(cfg, fac),
                     "pp_tps": 0.0, "tg_tps": 0.0, "eff_tps": 0.0,
                     "status": "CRASH", "secs": 0.0}
             rows.append(crow)
@@ -5074,7 +5426,8 @@ def main():
                             res = {"status": "SKIP_PRED", "pp_tps": 0.0,
                                    "tg_tps": 0.0, "secs": 0.0, "vram_mib": 0}
                             res["eff_tps"] = 0.0
-                            row = {"run_id": rid, **f, **res, "temp_c": ""}
+                            row = {"run_id": rid, **f, **derived_abs_cols(cfg, f),
+                                   **res, "temp_c": ""}
                             rows.append(row)
                             writer.writerow(row)
                             fh.flush()
@@ -5091,7 +5444,7 @@ def main():
                     else:
                         res = run_with_progress(cfg, f, args.timeout, prefix)
                     res["eff_tps"] = objective_tps(cfg, res["pp_tps"], res["tg_tps"])
-                    row = {"run_id": rid, **f, **res,
+                    row = {"run_id": rid, **f, **derived_abs_cols(cfg, f), **res,
                            "temp_c": f"{temp0:.0f}" if temp0 is not None else ""}
                     rows.append(row)
                     writer.writerow(row)   # incremental save: survive a crash/kill

@@ -361,10 +361,14 @@ name them rather than let them slip in as flat factors:
 
 - **Sibling ordering constraint.** Two factors with an implied relation
   (`n_min ≤ n_max`). An OA varies them independently, so it will emit inverted
-  rows. These are not conditional-on-a-gate; they are a *joint* constraint. Options:
-  derive one from the other (sweep `n_max` and an offset), clamp at emission, or
-  accept inverted rows as expected-poor data (never as crashes). Flag which, so a
-  low score on an inverted row is not misread as a real effect.
+  rows. These are not conditional-on-a-gate; they are a *joint* constraint.
+  **Resolved** (issue #8) in [`CONSTRAINED-FACTORS.md`](CONSTRAINED-FACTORS.md):
+  the dependent member is *derived* from the base and its levels become relative
+  (a fraction, a multiple, or an offset), so no row can invert. The two options
+  rejected there were clamping at emission (desyncs the CSV from the run) and
+  accepting inverted rows as expected-poor data — the latter because llama.cpp
+  turns an inverted row into a *speculation-off* run that still records `mtp=1`,
+  which biases another factor's main effect rather than only its own score.
 
 ## Prior art
 

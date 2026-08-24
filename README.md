@@ -136,7 +136,7 @@ Swept by default (auto-scaled to your hardware and model):
 | Micro-batch   | `-ub`            | `128, 256, 512, 1024, 2048`            | prefill/decode balance |
 | KV offload    | `-nkvo`          | `0, 1`                                 | KV cache in VRAM vs system RAM — the VRAM-vs-PCIe lever |
 | CPU polling   | `--poll`         | `0, 50, 100`                           | busy-wait level for CPU-side work |
-| Logical batch | `-b`             | `2048, 4096, 8192`                     | prompt chunking (levels start at max `-ub` so the `b≥ub` clamp never aliases) |
+| Logical batch | `-b`             | `1x, 4x, 16x` the `-ub` of the same row | prompt chunking (swept as a *multiple* of `-ub`, so `b≥ub` holds by construction — see [constrained factors](docs/CONSTRAINED-FACTORS.md)) |
 | Tensor placement | `-ot`         | `none, ffn_up_cpu, ffn_cpu`            | **dense models**: FFN tensors on CPU at full `-ngl` often beats dropping whole layers |
 | MoE expert offload | `-ncmoe`   | `0 .. n_layers` (5 levels)             | **MoE models** (replaces `-ot`): how many layers keep experts on CPU |
 | NUMA policy   | `--numa`         | `distribute, isolate`                  | **multi-NUMA-node boxes only** (inert on one node) |
@@ -595,7 +595,7 @@ registry in `llama-optimize.py`.
 | `kv_type` | `-ctk -ctv` | both | cat | swept | KV cache precision (buys context) |
 | `ubatch` | `-ub` | both | num | swept | physical micro-batch |
 | `ncmoe` | `-ncmoe` | both | num | swept¹ | MoE expert layers kept on CPU |
-| `batch` | `-b` | both | num | swept | logical batch (levels ≥ max ubatch) |
+| `batch_ratio` | `-b` | both | num | swept | logical batch, as a **multiple of `ubatch`** (`-b` = `batch_ratio × ubatch`)⁵ |
 | `nkvo` | `-nkvo` | both | bool | swept | keep KV in RAM vs VRAM |
 | `poll` | `--poll` | both | num | swept | CPU polling level |
 | `numa` | `--numa` | both | cat | swept⁴ | NUMA optimization mode |
@@ -610,10 +610,11 @@ registry in `llama-optimize.py`.
 | `ngram_size_n` | `--spec-ngram-<v>-size-n` | server | num | tuning⁴ | lookup n-gram length (ngram-simple / map-k / map-k4v — one factor, variant-spelled) |
 | `ngram_size_m` | `--spec-ngram-<v>-size-m` | server | num | tuning⁴ | draft m-gram length (simple / map-k / map-k4v) |
 | `ngram_min_hits` | `--spec-ngram-<v>-min-hits` | server | num | tuning⁴ | min hits to draft (simple / map-k / map-k4v) |
-| `ngram_mod_n_match/min/max` | `--spec-ngram-mod-n-*` | server | num | tuning⁴ | ngram-mod hasher: lookup length, min/max range |
+| `ngram_mod_n_match` / `_n_min` | `--spec-ngram-mod-n-*` | server | num | tuning⁴ | ngram-mod hasher: lookup length, min draft length |
+| `ngram_mod_n_max_off` | `--spec-ngram-mod-n-max` | server | num | tuning⁴ | max draft length, as an **offset above `ngram_mod_n_min`**⁵ |
 | `mtp` | `--spec-type draft-mtp` | server | cat | swept³ | speculative decoding via the model's MTP head, on/off |
 | `spec_n_max` | `--spec-draft-n-max` | server | num | swept³ | max draft tokens (MTP / draft-model only — **not** ngram) |
-| `spec_n_min` | `--spec-draft-n-min` | server | num | swept³ | MTP draft tokens (min) |
+| `spec_n_min_frac` | `--spec-draft-n-min` | server | float | swept³ | min draft tokens, as a **fraction of `spec_n_max`** (`n_min` = `⌊frac × n_max⌋`)⁵ |
 | `spec_p_min` | `--spec-draft-p-min` | server | float | swept³ | MTP acceptance-probability threshold |
 | `spec_p_split` | `--spec-draft-p-split` | server | float | swept³ | MTP split probability |
 | `rope_scaling` | `--rope-scaling` | server | cat | opt-in | RoPE scaling: none/linear/yarn |
@@ -627,7 +628,14 @@ each variant's tuning knobs are then swept only in that variant's tuning stage �
 they never share one array with the gate (see [ngram staging](#ngram-staged-search)).
 ngram needs no draft model — it pattern-matches from the token history.  Note
 `spec_n_max` (`--spec-draft-n-max`) is a draft-model/MTP knob and has **no effect
-on ngram**, so it is not an ngram factor.
+on ngram**, so it is not an ngram factor.  ⁵ **derived factor**: swept *relative*
+to a sibling rather than as an absolute, so the pair's implied ordering (`-b ≥
+-ub`, `n_min ≤ n_max`) holds in every row by construction — no clamping, no
+inverted rows. The results CSV records both the relative level and the absolute
+value it materialized to. See
+[constrained factors](docs/CONSTRAINED-FACTORS.md); these three were renamed from
+`batch` / `spec_n_min` / `ngram_mod_n_max`, and the old names give a
+pointer-to-the-new-one error rather than being silently reinterpreted.
 
 **`-ot` named patterns** (translate to real tensor regexes): `none`, `ffn_cpu`,
 `ffn_up_cpu`, `exps_cpu`, `attn_cpu`.

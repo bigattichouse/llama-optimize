@@ -121,7 +121,7 @@ already covered: `ngram-mod` → `n-max`; `ngram-simple/map-k/map-k4v` → `size
 | factor | default | valid range |
 |--------|---------|-------------|
 | `ngram_mod_n_match` | 24 | 1–1024 |
-| `ngram_mod_n_max` | 64 | 0–1024 |
+| `ngram_mod_n_max` | 64 | 0–1024 (swept as `ngram_mod_n_max_off`, an offset above `n_min`) |
 | `ngram_mod_n_min` | 48 | 0–1024 |
 | `ngram_size_n` (simple/map-k/map-k4v) | 12 | 1–1024 |
 | `ngram_size_m` | 48 | 1–1024 |
@@ -129,18 +129,29 @@ already covered: `ngram-mod` → `n-max`; `ngram-simple/map-k/map-k4v` → `size
 
 `size_*`/`min_hits` are `uint16`. The PR's sweep levels sit inside these bounds.
 
-**3. Coupled-constraint — decided: no clamp.** `ngram_mod_n_min ≤ n_max` is the
-implied relation (defaults 48 ≤ 64), and the sweep can produce inverted rows
-(`n_min=96, n_max=32`). Verified against llama.cpp: inverted bounds are **legal**
-(`arg.cpp` only enforces 0–1024 per value, independently) and **do not crash** —
-`ngram-mod` drafts at most `n_max` tokens (`speculative.cpp:986`), and a draft
-shorter than `n_min` is simply rejected (`speculative.cpp:748`), so an inverted
-row accepts no draft tokens and runs at ~baseline. It therefore **self-
-deprioritizes**: it scores at/below the non-speculative baseline and the Pareto /
-main-effects naturally rank it last. We deliberately do **not** clamp — clamping
-would desync the CSV factor level from the config actually run and hide that real
-signal. (The general "sibling ordering constraint" pattern is noted in
-`CONDITIONAL-FACTORS.md`; the chosen policy here is "accept as expected-poor".)
+**3. Coupled-constraint — superseded: `n_max` is now derived from `n_min`.**
+`ngram_mod_n_min ≤ n_max` is the implied relation (defaults 48 ≤ 64), and an
+absolute sweep of both produces inverted rows (`n_min=96, n_max=32`). Verified
+against llama.cpp: inverted bounds are **legal** (`arg.cpp` only enforces 0–1024
+per value, independently) and **do not crash** — `ngram-mod` drafts at most
+`n_max` tokens and a draft shorter than `n_min` is discarded
+(`speculative.cpp:1920`), so an inverted row accepts no draft tokens and runs at
+~baseline.
+
+This section originally concluded "accept as expected-poor, do not clamp", on the
+grounds that such a row self-deprioritizes. Issue #8 showed that reasoning does
+not survive contact with the *MTP* sweep, where the same shape appears as
+`spec_n_min > spec_n_max`: there `mtp` is a swept factor in the same array, so an
+inverted row feeds a speculation-off measurement into the `mtp=1` level mean and
+biases a *different* factor's main effect. "Scores badly, ranks last" is only
+true of effects the row is the sole contributor to.
+
+The fix generalizes to both pairs — see
+[`CONSTRAINED-FACTORS.md`](CONSTRAINED-FACTORS.md). `ngram_mod_n_max` is replaced
+by `ngram_mod_n_max_off`, an **offset above `n_min`** (levels `0,16,32,48,64`;
+the llama.cpp default pair is `n_min=48, off=16`), so `n_max ≥ n_min` holds by
+construction with no clamp and no desync — the CSV records both the offset swept
+and the absolute `ngram_mod_n_max` it materialized to.
 
 **Deliberate exclusion:** the `ngram-cache` spec type exists but is omitted — it
 needs external static/dynamic cache files (`--lookup-cache-static/-dynamic`), not
