@@ -3104,32 +3104,51 @@ def selftest() -> bool:
         cp_ = bench_command(cfg_pin, {"batch_ratio": "4"})
         assert int(cp_[cp_.index("-b") + 1]) >= int(cp_[cp_.index("-ub") + 1]), cp_
 
-        # THE issue-#8 property: no generated row can invert an ordered pair.
-        # This is what a level-set-only fix would not have given us, since
-        # refine_factors rebuilds each numeric grid independently per pass.
-        def _assert_no_inversion(factor_levels, cfgx):
-            _, gruns = generate_runs(factor_levels, choose_array(factor_levels))
-            for gr in gruns:
-                row = gr["factors"]
-                for dn in derived_names(row):
-                    base = derived_base(dn, row, cfgx)
-                    val = derived_value(dn, row, cfgx)
-                    if FACTORS[dn]["relation"] == "at_most":
-                        assert val <= base, (dn, row, val, base)
-                    else:
-                        assert val >= base, (dn, row, val, base)
-            return len(gruns)
+        # THE issue-#8 property. Checked as a FULL CROSS-PRODUCT of each derived
+        # factor's levels against its base's levels, not over the rows some array
+        # happened to draw: an OA can only ever emit cells from this grid, so
+        # covering the grid covers every design — including the ones
+        # refine_factors invents on later passes, which is what a level-set-only
+        # fix could never have guaranteed. Cross-product needs no array binding,
+        # so this stays inside --selftest's stdlib-only promise; the same check
+        # over real generated rows lives in .github/workflows/binding_smoke.py.
+        def _assert_grid_cannot_invert(factor_levels, cfgx):
+            cells = 0
+            for dn in derived_names(factor_levels):
+                base_name = FACTORS[dn]["derived_from"][0]
+                bases = factor_levels.get(base_name)
+                bases = bases if bases else [str(DERIVED_BASE_FALLBACK[base_name](cfgx))]
+                for bl in bases:
+                    for dl in factor_levels[dn]:
+                        row = {base_name: bl, dn: dl}
+                        base, val = derived_base(dn, row, cfgx), derived_value(dn, row, cfgx)
+                        if FACTORS[dn]["relation"] == "at_most":
+                            assert val <= base, (dn, bl, dl, val, base)
+                        else:
+                            assert val >= base, (dn, bl, dl, val, base)
+                        cells += 1
+            return cells
 
         hw_d = {"phys": 8, "logical": 16, "n_layers": 32,
                 "n_ctx_train": 32768, "n_experts": 0, "n_nextn": 1}
         cfg_mtp = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
                          ctx_floor=8192, driver="server", hw=dict(hw_d))
-        assert _assert_no_inversion(build_factors(cfg_mtp), cfg_mtp) > 0
+        fm = build_factors(cfg_mtp)
+        # the exact cell issue #8 reported: spec_n_max=1 with the top min level
+        assert "1" in fm["spec_n_max"] and "1.0" in fm["spec_n_min_frac"]
+        assert derived_value("spec_n_min_frac",
+                             {"spec_n_max": "1", "spec_n_min_frac": "1.0"}) == 1
+        assert _assert_grid_cannot_invert(fm, cfg_mtp) >= 15
         cfg_tune = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
                           ctx_floor=8192, driver="server", ngram=True,
                           ngram_type="ngram-mod",
                           hw={**hw_d, "n_nextn": 0})
-        assert _assert_no_inversion(build_factors(cfg_tune), cfg_tune) > 0
+        assert _assert_grid_cannot_invert(build_factors(cfg_tune), cfg_tune) >= 25
+        # and after a refinement pass rebuilds the numeric grids
+        refined = dict(fm)
+        refined["spec_n_max"] = refine_numeric([1, 2, 3, 4, 6], 2)
+        refined["batch_ratio"] = refine_numeric([1, 4, 16], 1)
+        assert _assert_grid_cannot_invert(refined, cfg_mtp) > 0
         # llama-bench has no --fit; emitting one makes it exit non-zero, which
         # would fail every bench run. Verified against the binary: it answers
         # "error: invalid parameter for argument: --no-fit".

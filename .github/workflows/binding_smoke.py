@@ -56,4 +56,34 @@ cfg.factors = {"a": ["1", "2", "3"], "b": ["x", "y", "z"], "c": ["0", "1"]}
 exp, runs = lo.generate_runs(cfg.factors, lo.choose_array(cfg.factors))
 assert len(runs) == 9, len(runs)
 print("  L9: 9 runs — ok")
+
+
+# --- issue #8: no GENERATED row may invert an ordered sibling pair -----------
+# selftest proves the property over the full level cross-product (stdlib only);
+# this proves the array actually draws from that grid, on real generated rows.
+def check_no_inversion(cfg, label):
+    cfg.factors = lo.build_factors(cfg)
+    derived = lo.derived_names(cfg.factors)
+    assert derived, f"{label}: expected derived factors, got none"
+    _, runs = lo.generate_runs(cfg.factors, lo.choose_array(cfg.factors))
+    pairs = set()
+    for r in runs:
+        row = r["factors"]
+        for dn in derived:
+            base = lo.derived_base(dn, row, cfg)
+            val = lo.derived_value(dn, row, cfg)
+            pairs.add((dn, base, val))
+            if lo.FACTORS[dn]["relation"] == "at_most":
+                assert val <= base, (label, dn, row, val, base)
+            else:
+                assert val >= base, (label, dn, row, val, base)
+    print(f"  {label}: {len(runs)} runs, {len(derived)} derived factor(s), "
+          f"{len(pairs)} distinct (base, value) pairs, 0 inverted — ok")
+
+
+check_no_inversion(dense_server_cfg(n_nextn=1), "MTP surface")
+ngram_cfg = dense_server_cfg()
+ngram_cfg.ngram, ngram_cfg.ngram_type = True, "ngram-mod"
+check_no_inversion(ngram_cfg, "ngram-mod tuning stage")
+
 print("binding smoke test: all checks passed")
