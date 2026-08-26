@@ -114,7 +114,9 @@ Proposed generation for N devices with detected capacities `c_i`:
 
 - `1,1,…` — even, the baseline llama.cpp already picks
 - `c_0,c_1,…` — proportional to VRAM, the obvious prior
-- two or three interpolations either side of proportional
+- two or three interpolations either side of proportional, spanning **well
+  past** it — field evidence has the optimum at 1:4 where capacity said 1:2
+  ([`field-reports.md`](field-reports.md), F3)
 
 Levels must be **normalised and deduplicated** (`2,2` and `1,1` are the same
 split), or the OA wastes rows measuring one configuration twice and the main
@@ -160,6 +162,9 @@ same shape that took ngram from 9 knobs to 3 collapsed ones and L125 back to L25
    A cheap per-device bandwidth probe may be the more honest input — and since
    the sweep measures anyway, a VRAM-proportional prior plus interpolations
    either side lets the measurement settle it without us guessing.
+   A mixed Vega64+MI50 setup in [`field-reports.md`](field-reports.md) (F3)
+   is evidence for the bandwidth side: its tuned split favours the faster
+   card twice as hard as capacity alone would justify.
 3. Does `-mg` deserve sweeping under `row`, or is it a tie-breaker better left
    pinned?
 

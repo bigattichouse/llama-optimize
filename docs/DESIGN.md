@@ -5,6 +5,10 @@ usage and the tuning methodology; this document records *why* the factors and le
 were chosen and the heuristics we're treating as hypotheses to be confirmed by the
 sweep rather than assumed.
 
+[`field-reports.md`](field-reports.md) is the companion: priors that came from
+*other people's* tuned setups rather than from us, and what each one implies for
+the factor registry.
+
 ## Origin
 
 The goal: given a GGUF model and a `llama.cpp` build, automatically search the

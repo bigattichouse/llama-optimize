@@ -39,9 +39,14 @@ at L125 with big models that's 20+ minutes of known-doomed runs.
 No `-ts` (tensor-split), `-sm` (split-mode layer/row), or `--main-gpu` in the
 FACTORS registry — the biggest untuned lever on 2+-card boxes.
 
-- Detect device count via rocm-smi/nvidia-smi; only add the factors when >1
-  (same "only sweep where it varies" pattern as `numa`).
-- Sensible default levels: `sm=layer,row`; `ts` around the VRAM ratio.
+- Detect devices via llama.cpp's own `--list-devices` (landed for issue #7),
+  not the vendor tool — the orderings disagree on non-identical cards. Only
+  add the factors when >1 (same "only sweep where it varies" pattern as `numa`).
+- Sensible default levels: `sm=layer,row`; `ts` bracketing the VRAM ratio
+  *widely* — a published mixed-Vega setup tunes to 1:4 where capacity says 1:2
+  ([`docs/field-reports.md`](docs/field-reports.md), F3). Keep the
+  single-device configuration reachable: on that box the second GPU lost.
+- Full factor model and checklist: [`docs/multi-gpu-design.md`](docs/multi-gpu-design.md).
 - Needs multi-GPU hardware to validate.
 
 ## 4. ~~Results-diff mode~~ — done
@@ -68,6 +73,21 @@ Remaining (true measured TTFT):
 GitHub Action running the selftest on push/PR, plus a binding smoke test
 (builds the submodule, exercises L25/L125 generation and the analyzer — the
 paths the selftest deliberately skips).
+
+## 7. Speculative-decoding telemetry
+
+We sweep six speculative factors and record nothing about whether the drafter was
+actually accepted. llama.cpp already returns `draft_n` / `draft_n_accepted` in the
+`timings` dict that `ServerDriver.measure` reads for `predicted_per_second` — the
+data is free, we discard it.
+
+- Carry acceptance rate into the CSV so a speculative result can be explained.
+- llama.cpp emits those keys only when a draft ran, so their **absence** flags a
+  row where speculation was silently off — the issue #8 failure class that
+  `docs/CONSTRAINED-FACTORS.md` closes by construction. This is the independent
+  check that the construction held.
+- Testable in `--selftest` against a synthetic response payload; no GPU needed.
+- Background: [`docs/field-reports.md`](docs/field-reports.md), F1.
 
 ## Small cleanups
 

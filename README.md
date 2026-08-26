@@ -758,7 +758,9 @@ confirmation run detects when the additive model breaks. Sobol would also need a
 surrogate over a mixed continuous/categorical space, where a weak fit gives
 confidently-wrong indices. Not worth it.
 
-See [`docs/DESIGN.md`](docs/DESIGN.md) for the background and tuning hypotheses.
+See [`docs/DESIGN.md`](docs/DESIGN.md) for the background and tuning hypotheses,
+and [`docs/field-reports.md`](docs/field-reports.md) for tuned setups published by
+other people — what transfers to a llama.cpp command line and what does not.
 
 ## License
 
