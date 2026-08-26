@@ -175,7 +175,7 @@ def prepare_taguchi_cli():
 # produced it. A tuning tool's output outlives the run: when a fix changes what a
 # past measurement MEANS (see CHANGELOG "Affects existing results"), the only way
 # to answer "is this CSV affected?" is for the CSV to say what made it.
-__version__ = "0.2.0-dev"
+__version__ = "0.2.0"
 
 FIXED_FA = 1
 FIXED_MMAP = 1

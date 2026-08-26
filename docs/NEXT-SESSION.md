@@ -80,6 +80,26 @@ findings because each changes what gets measured and needs live validation:
 - **C-D `FIXED_BATCH`**, **C-E `DEFAULT_UBATCH_LEVELS` / `DEFAULT_MAX_DEPTH`** —
   literals where a derivation from VRAM or the model is available.
 
+## Watch: "n-gram tables" in Qwen3.8-Flash-Next — a name collision, and maybe a factor
+
+[Qwen3.8-Flash-Next](https://github.com/QwenLM/Qwen3.8-Flash-Next) ships **N-gram
+Embeddings**: 51B parameters of learned embeddings indexed by local context,
+alongside a 125B main model. **This is not our `ngram` factor.** Ours is
+`--spec-type ngram-*`, a runtime *self-speculation* strategy that drafts from
+n-grams already in the context. Theirs is a model *architecture* feature shipped
+inside the weights. Same word, unrelated mechanisms — worth writing down because
+the collision is confusing and someone will conflate them.
+
+Why it may matter later: the model card notes the embedding table "can be
+offloaded to host memory and overlapped with model computation through
+asynchronous prefetching". A 51B-parameter table whose placement is a choice is
+exactly our problem domain — the same question `-ot`, `-ncmoe`, `--no-host` and
+`--op-offload` already answer for other tensors.
+
+Nothing to do yet: `grep` finds no n-gram-embedding support in llama.cpp at
+`4d19b2876`. Revisit when llama.cpp gains it, and check whether the placement is
+flag-controlled — if it is, it is a factor.
+
 ## Smaller open items
 
 - **`-sps`/`--slot-prompt-similarity`** — the server-side prefix-reuse routing

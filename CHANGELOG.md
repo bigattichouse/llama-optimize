@@ -23,6 +23,10 @@ earlier.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.0] — 2026-08-26
+
 ### ⚠️ Affects existing results
 
 - **ngram sweep results are upper bounds, not estimates.** llama.cpp's n-gram
