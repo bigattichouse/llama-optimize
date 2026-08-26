@@ -98,19 +98,20 @@ their gains (int4 draft head, NVFP4 draft weights, an explicit 8 GB KV pin). On 
 that trade is a *placement* decision — exactly the kind this tool exists to
 measure.
 
-`--spec-draft-ngl` (`-ngld`) is llama.cpp's version and is absent from `FACTORS`,
+`--spec-draft-ngl` (`-ngld`, `common/arg.cpp` ~4146) is llama.cpp's version and is
+absent from `FACTORS`,
 so promoting it looked like an ordinary scalar factor and no new mechanism.
 
 **It is inert without a draft model.** Traced through llama.cpp (checkout
-`1d2869c6e`), the flag is consumed in one place:
+`4d19b2876`), the flag is consumed in one place:
 `common_base_params_to_speculative` copies `params_spec.n_gpu_layers` into the
 draft context's params **only inside `if (has_draft)`**
-(`common/speculative.cpp` ~2318), where `has_draft` is
+(`common/speculative.cpp` ~2331), where `has_draft` is
 `params.speculative.has_dft()` — simply "was a `-md` path given"
 (`common/common.h:382`). With no `-md`, MTP takes the other branch of
 `common_speculative_init_result` and builds the draft context from the
 already-loaded target model (`llama_init_from_model(model_tgt, cparams)`,
-~2405). No second model, nothing for `-ngld` to place.
+~2422). No second model, nothing for `-ngld` to place.
 
 **But "we never pass `-md`" is a fact about this tool, not about llama.cpp.** The
 first draft of this note treated it as a reason to drop the factor; that was
@@ -120,7 +121,7 @@ setup. The correct reading is the opposite one: **`-md` is a missing *input*, an
 adding it unlocks a whole factor family we currently cannot express.**
 
 That family is close to a complete mirror of the target-side registry
-(`common/arg.cpp` ~3896-4131):
+(`common/arg.cpp` ~3927-4165):
 
 | target factor | target flag | draft twin |
 |---|---|---|

@@ -10,7 +10,7 @@ must not break lives in [`measurement-validity.md`](measurement-validity.md).
 [`field-reports.md`](field-reports.md) F4. The largest single number in the whole
 field-report set is a prefix cache: 381 tok/s reproducing document context against
 124 tok/s otherwise. llama.cpp's analogues are `--cache-reuse N`
-(`common/arg.cpp` ~3524) and `--cache-ram` (~1706), and neither is in `FACTORS`.
+(`common/arg.cpp` ~3543) and `--cache-ram` (~1705), and neither is in `FACTORS`.
 
 Adding them today would return a confident null, and the reason is the interesting
 part.

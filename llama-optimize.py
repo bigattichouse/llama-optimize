@@ -1232,7 +1232,7 @@ FACTORS = {
     "ngram_mod_n_min":   {"bench": None, "server": ("--spec-ngram-mod-n-min",), "kind": "num",
                           "server_only": True, "active_when": ("ngram", {"ngram-mod"})},
     # n_max is DERIVED from n_min as an OFFSET above it — same defect as
-    # spec_n_min_frac: speculative.cpp:1920 discards a draft shorter than n_min,
+    # spec_n_min_frac: speculative.cpp:1927 discards a draft shorter than n_min,
     # so an inverted ngram-mod row measures the baseline, not ngram-mod.
     "ngram_mod_n_max_off": {"bench": None, "server": ("--spec-ngram-mod-n-max",), "kind": "num",
                             "server_only": True, "active_when": ("ngram", {"ngram-mod"}),
@@ -1728,7 +1728,7 @@ def parse_bench_json(stdout: str):
 # Measurement validity — docs/measurement-validity.md.
 # "OK" only ever meant the process exited cleanly and a number parsed; it never
 # meant the number could be true. llama-bench derives throughput as
-# 1e9 * n_tokens / t_ns using the NOMINAL token count (llama-bench.cpp:1473), so
+# 1e9 * n_tokens / t_ns using the NOMINAL token count (llama-bench.cpp:1529), so
 # a decode loop that returns without decoding keeps the numerator and collapses
 # the denominator — issue #3 saw 1,000,000 t/s (exactly 1.0 us/token for any
 # n_gen) crowned the winner on a box that really does ~25 t/s. Repetition does
@@ -2137,7 +2137,7 @@ class ServerSession:
                 tps.append(t.get("predicted_per_second", 0.0) or 0.0)
                 # Independent clock. The server derives its rate as
                 # 1e3 / t_token_generation * n_decoded from its own counter
-                # (server-context.cpp:390); when that counter is wrong nothing
+                # (server_slot stats, `n_gen_tps()`); when that counter is wrong nothing
                 # inside the response can reveal it. Our wall time is the one
                 # number the server does not supply, and the request cannot have
                 # produced tokens faster than it elapsed — so predicted_n / wall
@@ -4076,7 +4076,7 @@ def selftest() -> bool:
         # The bench driver needs the same wiring as the server driver above.
         # It reaches validate_measurement by a different route, and llama-bench
         # has the same exposure -- it divides the NOMINAL n_prompt + n_gen by
-        # measured time (llama-bench.cpp:1473), guarded upstream only since May
+        # measured time (llama-bench.cpp:1529), guarded upstream only since May
         # 2025, so older builds still report a huge rate for a decode that did
         # nothing. Drive run_one over a faked subprocess to prove the gate is
         # actually on this path too.

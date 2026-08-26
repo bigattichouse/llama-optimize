@@ -31,7 +31,8 @@ describe. `--factor` is no workaround: it rejects names absent from the registry
 The blast radius is larger than one flag. `has_dft()` is just "was a `-md` path
 given" (`common/common.h:382`), and it gates:
 
-- **`--spec-draft-ngl`** and the rest of the placement mirror (table in F2)
+- **`--spec-draft-ngl`** and the rest of the placement mirror (table in F2) —
+  the whole `--spec-draft-*` family, `common/arg.cpp` ~3927-4165
 - **`--spec-type draft-simple | draft-eagle3 | draft-dflash | draft-dspark`**
   (`common/speculative.cpp:34-38`) — every draft-*model* speculation strategy.
   Our `mtp` factor covers `draft-mtp`, which is the one variant that needs no
