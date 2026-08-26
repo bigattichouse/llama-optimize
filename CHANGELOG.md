@@ -100,6 +100,16 @@ earlier.
 
 ### Fixed
 
+- **One failed request no longer discards the whole measurement.** A concurrent
+  round died on the first exception (`ThreadPoolExecutor.map` re-raises while
+  iterating), so "7 of 8 requests served quickly" was recorded as `ERROR` —
+  identical to "the model would not load". Those are very different configs to
+  deploy. Failures are now counted into a new `err_rate` column; only a config
+  where *every* request fails is an `ERROR`. No extra score penalty was added,
+  because a round's wall clock already covers the failed requests: a config that
+  serves less measures slower, which is the proportional penalty, arrived at
+  honestly. What throughput cannot say is *why* it is low, so a recommended
+  config that dropped requests now carries an explicit warning.
 - **A completed-but-empty run could be recommended as the max-context config.**
   A run that finishes without generating anything keeps `status == "OK"` with a
   zero score — `implausible_reason` deliberately passes on `tg <= 0`, since

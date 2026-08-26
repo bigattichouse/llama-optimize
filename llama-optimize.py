@@ -2230,13 +2230,34 @@ def _completion(port: int, prompt, n_gen: int, timeout: int, cache: bool = False
         return raise_for_server_error(json.loads(r.read()))
 
 
-def _measure_round(port: int, prompt, n_gen: int, par: int, timeout: int, cache=False):
-    """One round of `par` concurrent completions; returns (responses, wall_s)."""
+def _measure_round(port: int, prompts, n_gen: int, par: int, timeout: int, cache=False):
+    """One round of `par` concurrent completions.
+
+    Returns (responses, n_failed, wall_s) — responses only for requests that
+    SUCCEEDED. A round used to die on the first exception (`ex.map` re-raises
+    while iterating), which collapsed "one of eight requests failed" into the
+    same ERROR as "the model would not load". Those are different configurations
+    and the report should be able to tell them apart, so failures are counted
+    rather than fatal (docs/measurement-validity.md).
+
+    `prompts` is a list of one prompt per slot, so a round can issue distinct
+    requests; a bare string is broadcast to every slot."""
+    if isinstance(prompts, str):
+        prompts = [prompts] * par
+    ok, failed = [], 0
+
+    def one(i):
+        return _completion(port, prompts[i % len(prompts)], n_gen, timeout, cache)
+
     with ThreadPoolExecutor(max_workers=par) as ex:
         w0 = time.time()
-        res = list(ex.map(
-            lambda _: _completion(port, prompt, n_gen, timeout, cache), range(par)))
-        return res, time.time() - w0
+        futures = [ex.submit(one, i) for i in range(par)]
+        for fut in futures:
+            try:
+                ok.append(fut.result())
+            except (urllib.error.URLError, OSError, json.JSONDecodeError):
+                failed += 1
+        return ok, failed, time.time() - w0
 
 
 # ---------------------------------------------------------------------------
@@ -2355,22 +2376,41 @@ class ServerSession:
                             f"server not healthy within {cfg.server_start_timeout}s")
 
     def measure(self, prompt_len, n_gen, par, reps, timeout):
-        """Returns (pp_tps, tg_tps, problem, draft) — problem is a string when
-        the numbers cannot be believed, else None (docs/measurement-validity.md);
-        draft carries llama.cpp's speculative counters over the measured reps,
-        or {} when no draft ran (docs/field-reports.md, F1)."""
+        """Measure one config. Returns a dict:
+
+            pp, tg      throughput (prefill / decode)
+            problem     why the numbers cannot be believed, else None
+            draft       llama.cpp's speculative counters, {} if no draft ran
+            err_rate    fraction of requests that failed (0.0 when all succeeded)
+
+        A dict rather than a tuple because this has grown three times and each
+        caller wants a different subset.
+
+        `err_rate` exists because a failure used to be fatal to the whole
+        measurement: one bad request out of eight raised, and the config was
+        recorded as ERROR — indistinguishable from a model that would not load.
+        A config that serves 7 of 8 requests quickly is a real and different
+        thing, and the sweep should be able to see it (F7)."""
         prompt = _realistic_prompt(prompt_len)
+        n_err = 0
         if par == 1:
             # Single stream: prefill once (warm request → real pp + primes the KV
             # cache), then reuse the cached prompt so each rep measures pure decode
             # (tg) without re-prefilling — much faster at high context, and a
             # cleaner decode number.
-            warm = _completion(self.port, prompt, n_gen, timeout, cache=True)
-            pp = warm.get("timings", {}).get("prompt_per_second", 0.0) or 0.0
+            try:
+                warm = _completion(self.port, prompt, n_gen, timeout, cache=True)
+                pp = warm.get("timings", {}).get("prompt_per_second", 0.0) or 0.0
+            except (urllib.error.URLError, OSError, json.JSONDecodeError):
+                pp, n_err = 0.0, n_err + 1
             tps, ceilings, timings = [], [], []
             for _ in range(max(1, reps)):
                 w0 = time.time()
-                r = _completion(self.port, prompt, n_gen, timeout, cache=True)
+                try:
+                    r = _completion(self.port, prompt, n_gen, timeout, cache=True)
+                except (urllib.error.URLError, OSError, json.JSONDecodeError):
+                    n_err += 1
+                    continue
                 wall = time.time() - w0
                 t = r.get("timings", {})
                 timings.append(t)   # draft counters live here too (F1)
@@ -2385,24 +2425,36 @@ class ServerSession:
                 n_dec = t.get("predicted_n", 0) or 0
                 if wall > 0 and n_dec > 0:
                     ceilings.append(n_dec / wall)
-            tg = sum(tps) / len(tps)
-            # the warm request is excluded here exactly as it is from `tps`:
-            # it primes the cache and is not one of the measured reps
-            return pp, tg, exceeds_wall_clock(tg, ceilings), _draft_totals(timings)
+            tg = sum(tps) / len(tps) if tps else 0.0
+            # the warm request is excluded from `tps` (it primes the cache and is
+            # not a measured rep) but IS counted in err_rate: a config that
+            # cannot serve the first request has failed a request.
+            return {"pp": pp, "tg": tg,
+                    "problem": exceeds_wall_clock(tg, ceilings),
+                    "draft": _draft_totals(timings),
+                    "err_rate": n_err / (max(1, reps) + 1)}
         # Concurrency: realistic serving — every request prefills; aggregate over
         # the streams. Warmup once, then average per-round throughput over reps.
         # These rates are computed from our own wall clock already, so they
         # cannot exceed it by construction — no cross-check needed.
         _measure_round(self.port, prompt, n_gen, par, timeout)  # warmup, discard
         pps, tps, timings = [], [], []
+        n_req = 0
         for _ in range(max(1, reps)):
-            res, wall = _measure_round(self.port, prompt, n_gen, par, timeout)
+            res, failed, wall = _measure_round(self.port, prompt, n_gen, par, timeout)
+            n_err += failed
+            n_req += par
             timings.extend(r.get("timings", {}) for r in res)
             tg_tok = sum(r.get("timings", {}).get("predicted_n", 0) for r in res)
             pp_tok = sum(r.get("timings", {}).get("prompt_n", 0) for r in res)
+            # Throughput stays whole-round: the wall clock covers the failures
+            # too, so a config that drops requests does not get to look faster
+            # for having done less work.
             tps.append(tg_tok / wall if wall > 0 else 0.0)
             pps.append(pp_tok / wall if wall > 0 else 0.0)
-        return sum(pps) / len(pps), sum(tps) / len(tps), None, _draft_totals(timings)
+        return {"pp": sum(pps) / len(pps), "tg": sum(tps) / len(tps),
+                "problem": None, "draft": _draft_totals(timings),
+                "err_rate": n_err / n_req if n_req else 0.0}
 
     def close(self):
         if self.proc and self.proc.poll() is None:
@@ -2468,21 +2520,27 @@ def measure_in_session(cfg: Config, f: dict, session, timeout: int) -> dict:
     prompt_len = cfg.n_prompt + int(f.get("n_depth", 0))
     par = int(f.get("parallel", cfg.parallel))
     sampler = VRAMSampler().__enter__() if cfg.measure_vram else None
-    status, pp, tg, problem, draft = "OK", 0.0, 0.0, None, {}
+    status, m = "OK", {}
     try:
-        pp, tg, problem, draft = session.measure(
-            prompt_len, cfg.n_gen, par, cfg.reps, timeout)
+        m = session.measure(prompt_len, cfg.n_gen, par, cfg.reps, timeout)
     except (urllib.error.URLError, OSError, json.JSONDecodeError):
         status = "ERROR"
     finally:
         if sampler:
             sampler.__exit__()
+    pp, tg = m.get("pp", 0.0), m.get("tg", 0.0)
+    err_rate = float(m.get("err_rate", 0.0))
+    # Every request failed: there is no measurement here, whatever the timers
+    # say. A partial failure is a different thing and stays OK, penalised.
+    if status == "OK" and err_rate >= 1.0:
+        status = "ERROR"
     res = {"status": status, "pp_tps": pp, "tg_tps": tg,
+           "err_rate": round(err_rate, 4),
            "secs": time.time() - t0, "vram_mib": sampler.peak if sampler else 0}
     if status == "OK":                     # speculative telemetry (F1) — a
-        res.update(draft_cols(cfg, f, draft))  # diagnostic: never sets status
-    if status == "OK" and problem:         # the wall-clock cross-check (I5)
-        res.update(status="IMPLAUSIBLE", implausible=problem,
+        res.update(draft_cols(cfg, f, m.get("draft", {})))  # never sets status
+    if status == "OK" and m.get("problem"):   # the wall-clock cross-check (I5)
+        res.update(status="IMPLAUSIBLE", implausible=m["problem"],
                    pp_tps=0.0, tg_tps=0.0)
     # parallel scales the ceiling: the server driver reports throughput
     # aggregated across concurrent streams (I2).
@@ -2644,6 +2702,27 @@ def kv_downgrade_hint(r: dict) -> str | None:
             "headroom, at a small decode-speed cost.")
 
 
+def error_note(r: dict) -> str | None:
+    """One-line warning when a config dropped requests, or None.
+
+    Throughput already carries the cost — a round's wall clock covers the failed
+    requests too, so a config that serves less scores less, with no extra penalty
+    needed. What the number cannot say is *why* it is low. A config that is fast
+    but drops one request in eight and a config that is simply slower are the
+    same eff_tps and very different things to deploy, so the distinction is
+    stated where the command gets copied."""
+    try:
+        rate = float(r.get("err_rate") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if rate <= 0:
+        return None
+    return (f"warning: {rate * 100:.0f}% of requests FAILED at this config — the "
+            "throughput above already reflects the lost work, but a config that "
+            "drops requests under load is usually not one to deploy. Re-run it "
+            "with --verify-picks before trusting it.")
+
+
 def ttft_note(r: dict, ctx: int) -> str | None:
     """One-line prefill-cost estimate for the emitted -c: filling the context
     at this config's measured pp speed. A giant -c can mean many minutes before
@@ -2713,8 +2792,8 @@ def report(cfg: Config, rows: list[dict], probe: dict | None = None):
         ctx = recommended_ctx(cfg, r, verified_depth_of(cfg, rows, r))
         print("  suggested llama-server command:")
         print("    " + server_command(cfg, r, ctx))
-        for extra in (kv_downgrade_hint(r), ctx_floor_note(cfg, r, ctx),
-                      ttft_note(r, ctx)):
+        for extra in (error_note(r), kv_downgrade_hint(r),
+                      ctx_floor_note(cfg, r, ctx), ttft_note(r, ctx)):
             if extra:
                 print("  " + extra)
 
@@ -2734,7 +2813,8 @@ def report(cfg: Config, rows: list[dict], probe: dict | None = None):
         print(f"  suggested llama-server command (-c {probe['safe_ctx']}, "
               "~10% headroom under the ceiling):")
         print("    " + server_command(cfg, r, probe["safe_ctx"]))
-        for extra in (kv_downgrade_hint(r), ttft_note(r, probe["safe_ctx"])):
+        for extra in (error_note(r), kv_downgrade_hint(r),
+                      ttft_note(r, probe["safe_ctx"])):
             if extra:
                 print("  " + extra)
 
@@ -2945,7 +3025,7 @@ def write_html_report(cfg: Config, rows: list[dict], path: Path,
         ver = (f"verified: median of {r['verify_n']} measurements "
                f"(spread {r['spread_pct']:.0f}%)" if r.get("verify_n") else None)
         tip = "".join(f"<div class=muted>{esc(x)}</div>"
-                      for x in (ver, kv_downgrade_hint(r),
+                      for x in (ver, error_note(r), kv_downgrade_hint(r),
                                 ctx_floor_note(cfg, r, ctx), ttft_note(r, ctx)) if x)
         raw = ((f"tg {r['tg_tps']:.1f} · " if cfg.score == "eff" else "")
                + f"pp {r['pp_tps']:.1f}")
@@ -4474,6 +4554,48 @@ def selftest() -> bool:
             assert r_off["status"] == "OK" and r_off["tg_tps"] == 600.0, r_off
             assert "draft_acc" not in r_off, r_off
 
+            # --- partial failure is a measurement, not an ERROR (F7) ---
+            # One bad request out of `par` used to raise out of the whole round,
+            # so "7 of 8 served quickly" was recorded identically to "the model
+            # would not load". Those are different configs to deploy.
+            _calls = {"n": 0}
+
+            def _flaky(port, prompt, n_gen, timeout, cache=False):
+                _calls["n"] += 1
+                if _calls["n"] % 4 == 0:          # every 4th request fails
+                    raise OSError("simulated request failure")
+                time.sleep(0.01)
+                return {"content": "x",
+                        "timings": {"prompt_per_second": 400.0,
+                                    "predicted_per_second": 50.0,
+                                    "predicted_n": 64, "prompt_n": 128}}
+
+            par_cfg = SimpleNamespace(n_prompt=0, n_gen=64, parallel=4, reps=1,
+                                      measure_vram=False, factors={},
+                                      emit_mtp=False, ngram=False, hw={})
+            globals()["_completion"] = _flaky
+            _calls["n"] = 0
+            r_part = measure_in_session(par_cfg, {"n_depth": "0"}, sess, 30)
+            assert r_part["status"] == "OK", r_part      # NOT collapsed to ERROR
+            assert 0.0 < r_part["err_rate"] < 1.0, r_part
+            assert r_part["tg_tps"] > 0, r_part          # the survivors measured
+            # throughput is whole-round, so lost work shows up as lower tg
+            # rather than needing a separate penalty
+            assert error_note(r_part), r_part
+
+            # every request failing IS an error: there is no measurement
+            def _dead(port, prompt, n_gen, timeout, cache=False):
+                raise OSError("server gone")
+            globals()["_completion"] = _dead
+            r_dead = measure_in_session(par_cfg, {"n_depth": "0"}, sess, 30)
+            assert r_dead["status"] == "ERROR", r_dead
+            # a clean config reports no error rate and gets no warning
+            globals()["_completion"] = _fake(600.0)
+            r_clean = measure_in_session(par_cfg, {"n_depth": "0"}, sess, 30)
+            assert r_clean["err_rate"] == 0.0, r_clean
+            assert error_note(r_clean) is None
+            assert error_note({}) is None and error_note({"err_rate": ""}) is None
+
             # an error payload is a failure, not a zero-time measurement, and
             # the raise it produces is what measure_in_session turns into ERROR
             def _err(port, prompt, n_gen, timeout, cache=False):
@@ -4713,7 +4835,7 @@ def load_results_csv(path: Path, factors: dict) -> list[dict]:
 # header is a factor column (must match the writer's `cols` in main)
 RESULT_COLS = {"run_id", "pp_tps", "tg_tps", "eff_tps", "status", "secs",
                "temp_c", "vram_mib", "implausible", "draft_acc", "spec_off",
-               "tool_version", "llama_build", "backend"}
+               "tool_version", "llama_build", "backend", "err_rate"}
 
 
 def merge_result_rows(cfg: Config, rows: list[dict],
@@ -5889,7 +6011,7 @@ def main():
             + ["pp_tps", "tg_tps", "eff_tps", "status", "secs", "temp_c"]
             + (["vram_mib"] if cfg.measure_vram else [])
             + (["draft_acc", "spec_off"] if spec_cols_wanted(cfg) else [])
-            + (["backend"] if cfg.driver == "bench" else [])
+            + (["backend"] if cfg.driver == "bench" else ["err_rate"])
             + ["tool_version", "llama_build"])
 
     # Resume keys on run_id (unique per array row), not config values, because

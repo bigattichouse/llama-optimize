@@ -246,6 +246,34 @@ prevent spurious Pareto dominance" ([`field-reports.md`](field-reports.md) F6).
 Our Pareto was already guarded; our *recommendations* were not, which is the more
 user-visible of the two.
 
+## A partial failure is a measurement
+
+The mirror of the section above. There a row was *too readily* believed; here one
+was too readily thrown away.
+
+A concurrent round used `ThreadPoolExecutor.map`, which re-raises the first
+exception while iterating, so a single failed request out of `--parallel N` blew
+up the round and the config landed as `ERROR`. That is the same verdict a model
+that will not load receives, and the two are not the same thing: one config
+cannot run at all, the other serves most of its traffic quickly and drops some.
+A tuning tool that cannot tell them apart cannot warn about the second.
+
+Failures are now counted (`err_rate`), and only an all-requests-failed config is
+an `ERROR`.
+
+**The throughput penalty is intrinsic and was left alone.** A round's tokens are
+divided by the round's wall clock, and that clock covers the failed requests too —
+so a config that drops a quarter of its work measures roughly a quarter slower
+without any explicit penalty. Adding a score multiplier on top would double-count
+the same fact. This is worth stating because the obvious "fix" is the wrong one:
+the honest penalty was already there, hidden in the denominator.
+
+What the number *cannot* express is the difference between "slower" and "faster
+but lossy" — identical `eff_tps`, very different things to deploy. That
+distinction is surfaced as a warning on the recommended command rather than
+folded into the score, because folding it in would make the score mean two things
+at once.
+
 ## What this does not do
 
 It does not explain *why* generation returned early on the reporter's
