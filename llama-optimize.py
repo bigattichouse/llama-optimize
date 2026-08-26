@@ -192,11 +192,22 @@ BENCH_REPS = 3
 #   (P + G) / (P/pp_tps + G/tg_tps)   -- combines prefill and decode as the
 # workload actually experiences them. "multi" needs the server driver (real
 # concurrency), which llama-bench cannot do.
+# `prefix_reuse` is part of the request SHAPE and so lives here with the sizes.
+# Default 0.0 — assume nothing is shared unless the workload says otherwise. That
+# is a statement, not a guess: an identical-request default silently inflates
+# n-gram speculation (1.00 acceptance vs 0.31 at a realistic 90%), and the
+# failure modes are asymmetric. Overstating speculation is invisible and ships a
+# config that will not deliver; understating it is visible and recoverable.
+# `agents` is the exception because the name is itself a claim about traffic —
+# long tool-use prompts behind a fixed system preamble. It is an estimate to
+# override, not a measurement (docs/constants-audit.md).
 PROFILES = {
-    "single": {"n_prompt": 512,  "n_gen": 256, "ctx_floor": 8192,  "driver": "bench"},
-    "agents": {"n_prompt": 8192, "n_gen": 256, "ctx_floor": 32768, "driver": "bench"},
+    "single": {"n_prompt": 512,  "n_gen": 256, "ctx_floor": 8192,  "driver": "bench",
+               "prefix_reuse": 0.0},
+    "agents": {"n_prompt": 8192, "n_gen": 256, "ctx_floor": 32768, "driver": "bench",
+               "prefix_reuse": 0.9},
     "multi":  {"n_prompt": 1024, "n_gen": 256, "ctx_floor": 8192,  "driver": "server",
-               "parallel": 4},
+               "parallel": 4, "prefix_reuse": 0.0},
 }
 
 # Use-cases are high-level "runbooks": a friendly name that expands into a bundle
@@ -2274,15 +2285,69 @@ def calibrate_chars_per_token(prompt: str, prompt_n) -> float | None:
     return ratio if 1.0 <= ratio <= 20.0 else None
 
 
+# A fixed corpus cannot fill a long prompt without repeating itself, and n-gram
+# speculation feeds on that repetition. The literal banks above total ~1.5k
+# characters; the `agents` profile asks for 32k-character prompts, so every one
+# of them would contain the whole corpus about twenty times over. Measured
+# consequence: acceptance pinned near 1.00 even at 0% prefix reuse.
+#
+# So sentences are COMBINATORIAL rather than literal. These fragments generate
+# ~14k distinct sentences from a few lines of source, which is enough that a
+# 32k-character prompt draws each at most once (docs/workload-shape-design.md).
+_FRAGMENTS = {
+    "subj": ["the compiler", "a distributed cache", "the harbour authority",
+             "our field biologist", "the second violinist", "a tidal turbine",
+             "the archive clerk", "this alloy", "the referee", "a monsoon front",
+             "the pension fund", "her thesis committee"],
+    "verb": ["reconsidered", "quietly abandoned", "measured", "argued against",
+             "reproduced", "underestimated", "catalogued", "escalated",
+             "deferred", "audited"],
+    "obj": ["the third revision", "an inherited assumption", "eleven anomalies",
+            "the winter schedule", "a contested boundary", "its own baseline",
+            "the fallback path", "two conflicting reports", "the settlement terms",
+            "a rounding convention", "the spare capacity", "last season's data"],
+    "tail": ["before the deadline", "without telling anyone", "under protest",
+             "for reasons never minuted", "on the strength of one sample",
+             "after the storm passed", "despite the cost", "in a footnote",
+             "over three consecutive quarters", "at considerable expense"],
+}
+
+
 def _sentences() -> list:
-    """Every bank split into sentences — the pool prompts are composed from."""
+    """A large pool of distinct sentences, generated rather than transcribed.
+
+    Combinatorial so that a long prompt does not have to repeat itself: the
+    product of the fragment lists is ~14k sentences, against the ~360 a 32k-char
+    prompt consumes. Deterministic order — callers shuffle."""
     out = []
-    for _, _, text in PROMPT_BANKS:
-        for part in text.replace("; ", ". ").split(". "):
-            part = part.strip()
-            if len(part) > 20:
-                out.append(part + ". ")
+    for a in _FRAGMENTS["subj"]:
+        for b in _FRAGMENTS["verb"]:
+            for c in _FRAGMENTS["obj"]:
+                for d in _FRAGMENTS["tail"]:
+                    out.append(f"{a} {b} {c} {d}. ")
     return out
+
+
+def repeated_fraction(text: str, n: int = 8) -> float:
+    """Fraction of `text`'s n-grams (word-level) that are not the first of their
+    kind — i.e. how self-similar it is.
+
+    This is the property that decides whether a prompt can honestly measure
+    speculative decoding, and it is measurable, so it is measured rather than
+    reasoned about. A prompt built by tiling a corpus scores near 1.0; genuinely
+    varied prose scores near 0."""
+    words = text.split()
+    if len(words) <= n:
+        return 0.0
+    seen, repeats, total = set(), 0, 0
+    for i in range(len(words) - n + 1):
+        gram = " ".join(words[i:i + n])
+        total += 1
+        if gram in seen:
+            repeats += 1
+        else:
+            seen.add(gram)
+    return round(repeats / total, 4) if total else 0.0
 
 
 def _fill(n_chars: int, rnd) -> str:
@@ -2472,7 +2537,7 @@ def _draft_totals(timings: list) -> dict:
     (tools/server/server-common.cpp), so responses carrying neither are positive
     evidence that speculation did not happen — not merely a gap in the telemetry.
     Returns {} in that case; `draft_cols` turns it into the `spec_off` flag."""
-    drafted = accepted = 0
+    drafted = accepted = generated = 0
     ran = False
     for t in timings:
         if not isinstance(t, dict) or "draft_n" not in t:
@@ -2480,7 +2545,9 @@ def _draft_totals(timings: list) -> dict:
         ran = True
         drafted += int(t.get("draft_n") or 0)
         accepted += int(t.get("draft_n_accepted") or 0)
-    return {"drafted": drafted, "accepted": accepted} if ran else {}
+        generated += int(t.get("predicted_n") or 0)
+    return ({"drafted": drafted, "accepted": accepted, "generated": generated}
+            if ran else {})
 
 
 def speculation_requested(cfg, f: dict) -> bool:
@@ -2522,9 +2589,16 @@ def spec_cols_wanted(cfg) -> bool:
 def draft_cols(cfg, f: dict, draft: dict) -> dict:
     """Speculative telemetry columns for one measurement.
 
-    `draft_acc` is the fraction of drafted tokens llama.cpp accepted — the number
-    that explains why a speculative config won or lost, and which we swept six
-    factors against while recording nothing.
+    `draft_acc` is the fraction of DRAFTED tokens llama.cpp accepted: draft
+    *quality*. `draft_cov` is the fraction of GENERATED tokens that came from an
+    accepted draft: how much speculation actually contributed.
+
+    Both are needed, because acc alone is misleading in the exact case that
+    matters. Measured on ngram-mod: a config drafting 59 tokens and accepting all
+    59 scores acc=1.00 and ran at 579 t/s, while one drafting 124 and accepting
+    104 scores acc=0.84 and ran at 846. Acceptance ranked them backwards; cov
+    (0.46 vs 0.81) tracks throughput. A drafter that is always right about the
+    few tokens it dares to guess is not helping much.
 
     `spec_off` is the guard: the row asked for speculation and no draft ever ran.
     That is the issue #8 shape — a row recording `mtp=1` that silently measured
@@ -2538,8 +2612,10 @@ def draft_cols(cfg, f: dict, draft: dict) -> dict:
     it simply is not measuring what its factor column claims."""
     if draft:
         drafted = draft.get("drafted", 0)
+        generated = draft.get("generated", 0)
         acc = draft.get("accepted", 0) / drafted if drafted else 0.0
-        return {"draft_acc": round(acc, 4)}
+        cov = draft.get("accepted", 0) / generated if generated else 0.0
+        return {"draft_acc": round(acc, 4), "draft_cov": round(cov, 4)}
     return {"spec_off": 1} if speculation_requested(cfg, f) else {}
 
 
@@ -3813,16 +3889,32 @@ def selftest() -> bool:
 
         # --- speculative telemetry (docs/field-reports.md, F1) ---
         # Acceptance sums over the measured responses.
-        assert _draft_totals([{"draft_n": 10, "draft_n_accepted": 6},
-                              {"draft_n": 10, "draft_n_accepted": 4}]) == \
-            {"drafted": 20, "accepted": 10}
+        assert _draft_totals([{"draft_n": 10, "draft_n_accepted": 6, "predicted_n": 32},
+                              {"draft_n": 10, "draft_n_accepted": 4, "predicted_n": 32}]) == \
+            {"drafted": 20, "accepted": 10, "generated": 64}
         assert draft_cols(cfg_mtp, {"mtp": "1"},
-                          {"drafted": 20, "accepted": 10}) == {"draft_acc": 0.5}
+                          {"drafted": 20, "accepted": 10, "generated": 40}) == \
+            {"draft_acc": 0.5, "draft_cov": 0.25}
         # A drafted-but-never-accepted run is a real (bad) result, not the guard:
         # speculation ran, it just never paid. Conflating the two would hide the
         # one case we most want to see.
         assert draft_cols(cfg_mtp, {"mtp": "1"},
-                          {"drafted": 40, "accepted": 0}) == {"draft_acc": 0.0}
+                          {"drafted": 40, "accepted": 0, "generated": 64}) == \
+            {"draft_acc": 0.0, "draft_cov": 0.0}
+        # acc measures draft QUALITY, cov measures how much speculation actually
+        # contributed, and acc alone ranks configs BACKWARDS in the case that
+        # matters. These are the real measured shapes: a drafter that is always
+        # right about the few tokens it dares to guess (acc 1.00) ran at 579 t/s;
+        # one that is right 84% of the time but guesses twice as often ran at 846.
+        timid = draft_cols(cfg_mtp, {"mtp": "1"},
+                           {"drafted": 59, "accepted": 59, "generated": 128})
+        bold = draft_cols(cfg_mtp, {"mtp": "1"},
+                          {"drafted": 124, "accepted": 104, "generated": 128})
+        assert timid["draft_acc"] > bold["draft_acc"], (timid, bold)
+        assert timid["draft_cov"] < bold["draft_cov"], (timid, bold)
+        # generated missing (older llama.cpp) must not divide by zero
+        assert draft_cols(cfg_mtp, {"mtp": "1"},
+                          {"drafted": 10, "accepted": 5})["draft_cov"] == 0.0
         # llama.cpp omits BOTH keys when no draft ran, so their absence is the
         # signal and must never be read as "0 tokens drafted".
         assert _draft_totals([{"predicted_n": 64}, {"predicted_n": 64}]) == {}
@@ -4888,6 +4980,17 @@ def selftest() -> bool:
         # and None falls back to the bootstrap constant
         assert len(prompt_battery(100, 1, 0.0)[0]) == 100 * CHARS_PER_TOKEN
 
+        # Profile-level reuse defaults. 0.0 everywhere except `agents`, whose
+        # name is itself a claim about traffic (a fixed system preamble in front
+        # of long tool-use prompts). Asymmetric failure modes decide the rest:
+        # overstating speculation is invisible and ships a config that will not
+        # deliver, understating it is visible and recoverable.
+        assert PROFILES["single"]["prefix_reuse"] == 0.0
+        assert PROFILES["multi"]["prefix_reuse"] == 0.0
+        assert PROFILES["agents"]["prefix_reuse"] == 0.9
+        for _n, _p in PROFILES.items():
+            assert 0.0 <= _p["prefix_reuse"] <= 1.0, _n
+
         # C-F: the sweep estimate must scale with model size, not be flat
         _big = Config(model=Path("/nonexistent-big.gguf"), llama_bench=Path("b"),
                       array="auto", ctx_floor=8192, n_gen=256, reps=3)
@@ -5136,7 +5239,8 @@ def load_results_csv(path: Path, factors: dict) -> list[dict]:
 # header is a factor column (must match the writer's `cols` in main)
 RESULT_COLS = {"run_id", "pp_tps", "tg_tps", "eff_tps", "status", "secs",
                "temp_c", "vram_mib", "implausible", "draft_acc", "spec_off",
-               "tool_version", "llama_build", "backend", "err_rate", "reuse"}
+               "tool_version", "llama_build", "backend", "err_rate", "reuse",
+               "draft_cov"}
 
 
 def merge_result_rows(cfg: Config, rows: list[dict],
@@ -6022,6 +6126,8 @@ def main():
     n_gen = (args.n_gen if args.n_gen is not None
              else 2048 if args.thinking else prof["n_gen"])
     ctx_floor = args.ctx_floor if args.ctx_floor is not None else prof["ctx_floor"]
+    prefix_reuse = (args.prefix_reuse / 100.0 if args.prefix_reuse is not None
+                    else prof.get("prefix_reuse", 0.0))
     driver = args.driver or uc.get("driver") or prof["driver"]
     parallel = (args.parallel if args.parallel is not None
                 else uc.get("parallel", prof.get("parallel", 1)))
@@ -6059,12 +6165,8 @@ def main():
         n_gen=n_gen,
         max_depth=args.max_depth,
         emit_mtp=not args.no_mtp,
-        # 1.0 preserves the historical identical-prompt behaviour exactly, so
-        # this release adds the capability without silently re-defining what
-        # every measurement means. See CHANGELOG for why the default is the
-        # unrealistic one, and NEXT-SESSION for flipping it.
-        prefix_reuse=(1.0 if args.prefix_reuse is None
-                      else args.prefix_reuse / 100.0),
+        # request shape, from the profile unless --prefix-reuse says otherwise
+        prefix_reuse=prefix_reuse,
         ngram=args.ngram,
         ngram_type=args.ngram_type,
         ngram_keep=args.ngram_keep,
@@ -6254,7 +6356,8 @@ def main():
     if cfg.driver == "server":
         shape = (f"{cfg.prefix_reuse * 100:.0f}% shared prefix across requests")
         warn = ("  <-- identical requests; INFLATES n-gram speculation, see "
-                "CHANGELOG" if cfg.prefix_reuse >= 1.0 else "")
+                "CHANGELOG" if cfg.prefix_reuse >= 1.0 else
+                "  (set --prefix-reuse to match your traffic)")
         print(f"workload   : {shape}{warn}")
     print("objective  : " + ("eff (effective t/s: blends pp + tg)"
                              if cfg.score == "eff" else
@@ -6335,7 +6438,8 @@ def main():
     cols = (["run_id"] + list(cfg.factors.keys()) + abs_cols
             + ["pp_tps", "tg_tps", "eff_tps", "status", "secs", "temp_c"]
             + (["vram_mib"] if cfg.measure_vram else [])
-            + (["draft_acc", "spec_off"] if spec_cols_wanted(cfg) else [])
+            + (["draft_acc", "draft_cov", "spec_off"]
+               if spec_cols_wanted(cfg) else [])
             + (["backend"] if cfg.driver == "bench" else ["err_rate", "reuse"])
             + ["tool_version", "llama_build"])
 

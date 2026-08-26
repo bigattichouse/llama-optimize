@@ -13,8 +13,8 @@ Four separate pieces of work all wait on the same question:
 
 ```
   measure MTP acceptance  ─┬─►  flip --prefix-reuse default  ─►  re-measure ngram screen
-      DONE: unaffected     │            (small, next)                 (needs GPU)
-                           └─►  MTP advisory: NOT needed  ─────►  cut 0.2.0
+      DONE: unaffected     │            DONE                          (needs GPU)
+                           └─►  MTP advisory: NOT needed  ─────►  cut 0.2.0  <-- next
 ```
 
 n-gram speculation turned out inflated 2.3x by the identical-prompt harness
@@ -48,14 +48,16 @@ only ngram needs the advisory. Full table and the thermal control in
 
 Unblocks steps 2 and 3.
 
-### 2. Flip the `--prefix-reuse` default — *small, no GPU*
+### 2. ~~Flip the `--prefix-reuse` default~~ — **done**
 
 The blast radius is already measured: non-speculative `tg` is flat across reuse
 (371.6 / 372.0 / 368.9 / 368.6 t/s, a spread smaller than run-to-run noise), so
 changing the default moves *only* speculative results — exactly the ones
-currently wrong. Recommended shape: default 0, with `agents` at 90 because that
-use case is itself a claim about traffic. Waits on step 1 only because the result
-may change what the advisory says.
+currently wrong. Landed as default 0, with `agents` at 90 because that use case is itself a claim
+about traffic. Validating it on the GPU found two further contamination layers in
+the prompt generator and one defect in `draft_acc` itself — see
+[`workload-shape-design.md`](workload-shape-design.md). Corrected figures: ngram
+inflation is ~1.46x, not the 2.3x earlier drafts claimed.
 
 ### 3. Cut 0.2.0 — *mechanical*
 

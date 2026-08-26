@@ -34,7 +34,9 @@ earlier.
 
   Since the harness discards the first request as warmup, *every measured rep*
   sat in the saturated regime. Two consequences: ngram-vs-off is inflated
-  roughly **2.3-3.4x**, and the variant screen has been ranking `ngram-simple`,
+  (**~1.46x** on throughput, ~1.75x on speculative coverage — earlier drafts said
+  2.3-3.4x, from a generator that was itself contaminated), and the variant screen
+  has been ranking `ngram-simple`,
   `ngram-mod`, `ngram-map-k` and `ngram-map-k4v` at a shared ceiling where the
   differences it exists to resolve cannot appear.
 
@@ -44,9 +46,8 @@ earlier.
 
   **MTP is unaffected — now measured, not assumed.** On Qwen3.8-27B with
   `--spec-type draft-mtp`, acceptance moves only 0.78 → 0.70 across the whole
-  reuse range and reproduces to ±0.02, against n-gram's 1.00 → 0.31. MTP drafts
-  from the model's own NextN head rather than from cross-request n-gram state.
-  **MTP sweep results stand.** See
+  reuse range and reproduces to ±0.02. MTP drafts from the model's own NextN head
+  rather than from cross-request n-gram state. **MTP sweep results stand.** See
   [`docs/workload-shape-design.md`](docs/workload-shape-design.md).
 
 - **Concurrency sweeps have never measured `kv_unified = true`.** llama.cpp
@@ -84,14 +85,14 @@ earlier.
   reuse level. Sweeping it would report "your workload should have more prefix
   reuse", which is not advice.
 
-  **The default is 100 — every request identical, exactly today's behaviour.**
-  That is the unrealistic setting, and it is the default on purpose: shipping the
-  capability and silently redefining every measurement are separable decisions,
-  and the second needs a GPU re-measurement behind it. Server runs now print the
-  shape and flag the default. Measured on gemma-3-270m/ROCm with `ngram-mod`:
-  100% reuse gives 100% draft acceptance and 889 t/s, while a realistic 90% gives
-  31% acceptance and 379 t/s — the 2.3x inflation the ngram advisory describes,
-  now reproducible with a flag.
+  **Defaults per profile: 0 everywhere except `agents` at 90**, whose name is
+  itself a claim about traffic. 0 means "assume nothing shared unless told
+  otherwise" — chosen because the failure modes are asymmetric: overstating
+  speculation is invisible and ships a config that will not deliver, while
+  understating it is visible and recoverable. Non-speculative results are
+  unaffected either way (`tg` measured flat across the whole reuse range:
+  371.6 / 372.0 / 368.9 / 368.6), so the change moves only the results that were
+  wrong.
 - **Category-weighted prompt battery** — 40% short-QA, 20% reasoning, 20% code,
   15% RAG, 5% long-context, following the reasoning that real traffic is
   dominated by cheap requests but conditioned at high percentiles by expensive
@@ -145,14 +146,22 @@ earlier.
   and `n_gen` — 20m / 1h18m / 3h21m for 270M / 8B / 27B — and says it is a guess.
   The decode-rate prior inside it scales too, since a fixed "20 tok/s" would just
   have moved the hardcoded assumption somewhere less visible.
-- **The prompt generator was inflating speculative acceptance on its own.**
-  Prompts were built by tiling a short passage to length, which made each one
-  heavily self-similar — and n-gram speculation feeds on repetition inside a
-  single context, not just across requests. With distinct requests but tiled
-  text, acceptance stayed pinned at 100% at *every* reuse level, which reads as
-  "reuse does not matter" and means "the prompts are still pathological".
-  `_fill` now composes from a shuffled sentence pool, and `_realistic_prompt` —
-  which had the same defect while its docstring claimed varied prose — shares it.
+- **The prompt generator was inflating speculative acceptance, at two scales.**
+  First, prompts were built by tiling a short passage, making each internally
+  self-similar — n-gram speculation feeds on repetition inside one context, not
+  just across requests. Second, after switching to a sentence pool, the pool held
+  14 sentences / 1,529 characters against the 32,768 an `agents` prompt needs, so
+  the whole corpus repeated ~20x per prompt. Both pinned acceptance at 100% even
+  at 0% reuse. Sentences are now generated combinatorially (~14,400 distinct from
+  a few lines of source), and `repeated_fraction` measures the property directly
+  rather than assuming it: 0.000 at 256 and 512 tokens, 0.094 at 8,192.
+- **`draft_acc` alone ranked speculative configs backwards.** Acceptance is
+  accepted/*drafted* — draft quality — and the two slowest ngram configurations
+  measured scored a perfect 1.00 while the fastest scored 0.84. A drafter that is
+  always right about the few tokens it dares to guess is not helping much. The
+  new **`draft_cov`** column is accepted/*generated*, the share of output that
+  came free from speculation, and it tracks throughput (0.81 → 846 t/s, 0.46 →
+  579). Both are kept: quality and contribution are different questions.
 - **One failed request no longer discards the whole measurement.** A concurrent
   round died on the first exception (`ThreadPoolExecutor.map` re-raises while
   iterating), so "7 of 8 requests served quickly" was recorded as `ERROR` —

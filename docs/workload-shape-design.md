@@ -162,18 +162,40 @@ built to catch a *config* that silently did not speculate — is what made a
 ## Landed, and what it measured
 
 `--prefix-reuse PCT` is implemented, along with the category-weighted battery and
-achieved-reuse reporting. Measured on gemma-3-270m-it-Q8_0 / ROCm with
-`--spec-type ngram-mod`, 256-token prompts, 3 reps:
+achieved-reuse reporting. Profiles default it: 0 everywhere except `agents` at
+90, whose name is itself a claim about traffic.
 
-| requested reuse | achieved | drafted | accepted | tg t/s |
-|---|---|---|---|---|
-| 100% (historical) | 1.0000 | 159 | 159 (**100%**) | **889.5** |
-| 90% | 0.8994 | 42 | 13 (31%) | 378.9 |
-| 50% | 0.5000 | — none — | — | 369.5 |
-| 0% | 0.0000 | 12 | 12 | 387.6 |
+**These numbers were corrected twice before they were right, and the corrections
+are the useful part** — each one was a defect in the measuring apparatus, not in
+llama.cpp.
 
-The identical-request default measures **2.3x** the throughput of any realistic
-reuse level, and its 100% acceptance falls to **31%** at a realistic 90%.
+Final figures (gemma-3-270m-it-Q8_0 / ROCm, `--spec-type ngram-mod`, 512-token
+prompts, run interleaved so thermal drift cannot masquerade as an effect):
+
+| reuse | drafted | accepted | generated | acc | **cov** | tg t/s |
+|---|---|---|---|---|---|---|
+| 100% (identical requests) | 124 | 104 | 128 | 0.84 | **0.81** | **846** |
+| 90% | 59 | 59 | 128 | 1.00 | **0.46** | 579 |
+| 0% | 62 | 62 | 128 | 1.00 | **0.48** | 578 |
+
+Identical requests inflate ngram throughput by **~1.46x** (846 vs 579), and
+speculative coverage by **~1.75x**. Earlier drafts of this document said 2.3x;
+that figure came from a contaminated generator and is withdrawn.
+
+### Acceptance rate alone ranks configs backwards
+
+The instrument needed fixing before the measurement meant anything.
+
+`draft_acc` is accepted/drafted — draft *quality*. Read the table: the two
+*slowest* configurations score a perfect **1.00**, and the fastest scores 0.84. A
+drafter that is always right about the few tokens it dares to guess is not
+helping much.
+
+What tracks throughput is `accepted / generated` — the fraction of output tokens
+that came free from speculation. 0.81 → 846 t/s, 0.46 → 579, 0.48 → 578. That is
+now recorded as **`draft_cov`** alongside `draft_acc`; both are kept, because
+quality and contribution are different questions and the pair distinguishes "the
+drafter is wrong a lot" from "the drafter barely tries".
 
 ### MTP is not affected — measured, not assumed
 
@@ -226,7 +248,33 @@ exactly this reason. These ad-hoc measurements did neither, and a monotonic
 confound appeared immediately. That is a point in favour of the machinery, not
 against the finding.
 
-### The generator was a second contamination source
+### The generator was contaminated twice, at two different scales
+
+Worth recording in full, because each layer looked like a finding until it was
+measured.
+
+**First layer — tiled text.** Prompts were built by repeating a short passage to
+length, so requests differed *from each other* while each was internally
+self-similar. Acceptance stayed pinned at 1.00 at every reuse level including 0%.
+
+**Second layer — a corpus too small to fill a prompt.** After switching to
+composition from a sentence pool, the pool held **14 sentences / 1,529
+characters**. A 512-token prompt needs 2,048; the `agents` profile's 8,192-token
+prompts need 32,768, so the entire corpus repeated about twenty times inside
+every one of them. Acceptance went straight back to 1.00 at 0% reuse. The fix was
+not a longer literal but a **combinatorial** one: sentences generated from
+interchangeable fragments, ~14,400 distinct from a few lines of source.
+
+`repeated_fraction` now measures the property directly — the share of a text's
+8-grams that are repeats. Tiled text scores near 1.0; the current generator
+scores 0.000 at 256 and 512 tokens and 0.094 at 8,192.
+
+**The lesson, three times over: "the requests differ" is not "the text is
+varied", and "the text is varied" is not "the corpus is large enough to stay
+varied at this length."** A prompt generator is measuring apparatus. It gets a
+measurable acceptance criterion, like any other instrument.
+
+
 
 Worth recording because it was missed twice and only a measurement caught it.
 

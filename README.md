@@ -790,14 +790,14 @@ python3 llama-optimize.py model-UD.gguf --run --driver server \
 - **Describe your traffic with `--prefix-reuse`** — how much of each prompt is a
   prefix shared across requests (0–100). It is an input, not a tuned knob: an
   agent stack with a fixed system prompt sits near 90, independent requests at 0.
-  The default is 100 (every request identical), which is the historical behaviour
-  and inflates n-gram speculation — see the caveat below. Each row records the
-  reuse it *actually* achieved, not the one requested.
+  Defaults to 0, or 90 for `--use-case agents`. Each row records the reuse it
+  *actually* achieved, not the one requested.
 - **Known caveat — ngram results are upper bounds.** n-gram speculation keeps
-  state across requests, and the sweep sends one identical prompt per rep by
-  default, which drives acceptance to 100%. Measured at 2.3x: 100% reuse gives
-  100% acceptance and 889 t/s, a realistic 90% gives 31% and 379 t/s. Set
-  `--prefix-reuse 90` (or whatever matches your traffic) for an honest number. `-ngl`, threads, batch and KV results are unaffected; MTP
+  state across requests, so sweeps run before 0.2.0 — which sent one identical
+  prompt per rep — inflated it by ~1.46x on throughput (846 vs 579 t/s) and
+  ~1.75x on speculative coverage. `--prefix-reuse` now defaults to 0 (90 for
+  `agents`); set it to match your traffic. MTP is **not** affected: measured, its
+  acceptance moves only 0.78 → 0.70 across the whole reuse range. `-ngl`, threads, batch and KV results are unaffected; MTP
   very likely is too, but that has not been measured. Fix in progress — see
   [`docs/workload-shape-design.md`](docs/workload-shape-design.md).
 - **The build is checked before the sweep** — a llama.cpp without a GPU backend
