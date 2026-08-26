@@ -175,6 +175,57 @@ achieved-reuse reporting. Measured on gemma-3-270m-it-Q8_0 / ROCm with
 The identical-request default measures **2.3x** the throughput of any realistic
 reuse level, and its 100% acceptance falls to **31%** at a realistic 90%.
 
+### MTP is not affected — measured, not assumed
+
+The open question the plan was blocked on. Qwen3.8-27B-UD-Q6_K_XL,
+`--spec-type draft-mtp --spec-draft-n-max 4`, 512-token prompts, 3 reps, run once
+forward through the reuse levels and once in reverse:
+
+| reuse | acceptance (fwd) | acceptance (rev) | tg (fwd) | tg (rev) |
+|---|---|---|---|---|
+| 100% | 0.78 | 0.78 | 32.7 | 18.4 |
+| 90% | 0.70 | 0.70 | 30.4 | 17.4 |
+| 50% | 0.68 | 0.68 | 29.2 | 22.7 |
+| 0% | 0.72 | 0.74 | 27.3 | 28.2 |
+
+**Acceptance is stable and reproducible to ±0.02**, and it moves ~8 points across
+the whole reuse range (0.78 → 0.70). Compare n-gram over the same range: 1.00 →
+0.31, sixty-nine points, with no drafting at all in between. MTP drafts from the
+model's own NextN head rather than from cross-request n-gram state, and the
+measurement bears that out.
+
+**So MTP results stand and only ngram needs the advisory.** That was the word
+"probably" being converted into a number, which is the whole reason the check
+came first.
+
+### The throughput column is thermal drift, and the reverse run is what proved it
+
+Read the tg columns above. Forward, tg falls 32.7 → 27.3 as reuse decreases —
+which looks exactly like a reuse effect. Reversed, it falls 28.2 → 18.4 as reuse
+*increases*. It declines with **time** in both directions, not with reuse. GPU
+temperature climbed 92 °C → 96 °C across the sequence, and sustained tg nearly
+halved.
+
+Two things follow.
+
+**Acceptance is thermally invariant; throughput is not.** The same reuse level
+gave 0.78 acceptance in both runs while its throughput differed by 78%. For any
+speculative question, `draft_acc` is therefore the more robust signal — it
+answers "is the drafter working?" without needing the thermal conditions to
+match. This is a good reason to have recorded it beyond the issue-#8 guard it was
+built for.
+
+**The earlier tables here were taken back-to-back without settle.** Their
+*absolute* throughput figures are only loosely comparable within a sequence. The
+ngram finding survives that caveat because it is an acceptance result — 1.00 →
+0.31 — and acceptance does not drift with temperature; the 2.3x throughput figure
+should be read as indicative rather than precise.
+
+The tool already randomises run order and settles thermally between runs for
+exactly this reason. These ad-hoc measurements did neither, and a monotonic
+confound appeared immediately. That is a point in favour of the machinery, not
+against the finding.
+
 ### The generator was a second contamination source
 
 Worth recording because it was missed twice and only a measurement caught it.

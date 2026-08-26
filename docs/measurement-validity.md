@@ -287,6 +287,31 @@ distinction is surfaced as a warning on the recommended command rather than
 folded into the score, because folding it in would make the score mean two things
 at once.
 
+## Some numbers survive conditions the headline number does not
+
+`temp_c` and the thermal settle exist because throughput drifts. What was not
+obvious until it was measured is that **not every recorded number drifts with
+it**, and that changes which one to trust when conditions are imperfect.
+
+Measuring MTP acceptance across prefix-reuse levels on a 27B model, once forward
+and once in reverse: acceptance reproduced to ±0.02 at every level, while the
+same configuration's throughput differed by 78% between the two runs as the card
+went from 92 °C to 96 °C. Throughput fell monotonically with *time* in both
+directions — which, run once, looks exactly like an effect of the thing being
+varied.
+
+Two consequences worth keeping:
+
+- **Prefer the invariant signal for the question it can answer.** "Is the drafter
+  working, and how well?" is answerable from `draft_acc` under thermal conditions
+  that would make a throughput comparison meaningless. `draft_acc` was added as a
+  guard against silently-off speculation (F1); it turns out to be the more robust
+  instrument for speculative questions generally.
+- **A monotonic trend in a sequentially-run series is not evidence.** It took one
+  reversed re-run to separate a real effect from thermal drift, and reversal is
+  cheap. The sweep already randomises run order and settles between runs; ad-hoc
+  measurements taken outside that machinery need the control done by hand.
+
 ## What this does not do
 
 It does not explain *why* generation returned early on the reporter's

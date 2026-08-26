@@ -13,8 +13,8 @@ Four separate pieces of work all wait on the same question:
 
 ```
   measure MTP acceptance  ─┬─►  flip --prefix-reuse default  ─►  re-measure ngram screen
-      (needs GPU, ~10m)    │            (small)                       (needs GPU)
-                           └─►  MTP advisory: needed or not?  ─►  cut 0.2.0
+      DONE: unaffected     │            (small, next)                 (needs GPU)
+                           └─►  MTP advisory: NOT needed  ─────►  cut 0.2.0
 ```
 
 n-gram speculation turned out inflated 2.3x by the identical-prompt harness
@@ -23,7 +23,11 @@ model's own NextN head rather than from cross-request n-gram state, so it is
 *probably* unaffected — which is the exact word used about ngram before anyone
 measured it.
 
-Until that is measured:
+Measured 2026-08-26: **MTP is unaffected**, so the advisory stays ngram-only and
+steps 2 and 3 are clear to proceed. The reasoning below is kept because it is why
+this went first.
+
+Until it was measured:
 
 - the 0.2.0 advisory cannot say whether MTP results are affected;
 - the right `--prefix-reuse` default is unclear for MTP-capable models;
@@ -35,13 +39,14 @@ free.**
 
 ## Order
 
-### 1. Measure MTP acceptance across reuse levels — *needs GPU, ~10 min*
+### 1. ~~Measure MTP acceptance across reuse levels~~ — **done**
 
-Method already proven on ngram: load an MTP model with `--spec-type draft-mtp`,
-send identical prompts then distinct ones, compare `draft_acc`. Flat across reuse
-means MTP results stand and only ngram needs the advisory; not flat means the
-advisory widens, and it is far better to know before a three-hour sweep than
-after.
+**MTP is unaffected.** Acceptance moves 0.78 → 0.70 across the whole reuse range
+and reproduces to ±0.02, against n-gram's 1.00 → 0.31. MTP sweep results stand;
+only ngram needs the advisory. Full table and the thermal control in
+[`workload-shape-design.md`](workload-shape-design.md).
+
+Unblocks steps 2 and 3.
 
 ### 2. Flip the `--prefix-reuse` default — *small, no GPU*
 

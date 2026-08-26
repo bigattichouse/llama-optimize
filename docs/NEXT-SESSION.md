@@ -30,10 +30,14 @@ The changelog's **⚠️ Affects existing results** section is the point of the
 release: ngram numbers are upper bounds, and concurrency sweeps never measured
 `kv_unified`. Both need to reach users who have already run sweeps.
 
-### 3. Measure whether MTP acceptance is inflated (needs GPU, ~10 min)
+### 3. ~~Measure whether MTP acceptance is inflated~~ — done: it is not
 
-**This blocks trusting any MTP sweep**, including on the Qwen3.8-27B that
-prompted the field reports.
+**Answered 2026-08-26.** Acceptance moves 0.78 → 0.70 across the whole reuse
+range and reproduces to ±0.02, versus n-gram's 1.00 → 0.31. MTP sweep results
+stand. The reverse-order control also showed the accompanying throughput trend
+was thermal drift, not reuse — see
+[`workload-shape-design.md`](workload-shape-design.md). Original reasoning kept
+below.
 
 We proved n-gram speculation is inflated by the identical-prompt harness
 ([`workload-shape-design.md`](workload-shape-design.md)): 100% acceptance and

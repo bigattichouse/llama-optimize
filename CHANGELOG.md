@@ -40,9 +40,13 @@ earlier.
 
   **Re-run any sweep that used `--ngram`.** Unaffected: `ngl`, `threads`,
   `ubatch`, `batch`, `kv_type`, `nkvo`, `poll`, `ot` — these do not depend on
-  what the tokens say. MTP drafts from the model's NextN head rather than from
-  context n-grams and is very likely fine, but this has not been measured and
-  should not be assumed. Fix in progress:
+  what the tokens say.
+
+  **MTP is unaffected — now measured, not assumed.** On Qwen3.8-27B with
+  `--spec-type draft-mtp`, acceptance moves only 0.78 → 0.70 across the whole
+  reuse range and reproduces to ±0.02, against n-gram's 1.00 → 0.31. MTP drafts
+  from the model's own NextN head rather than from cross-request n-gram state.
+  **MTP sweep results stand.** See
   [`docs/workload-shape-design.md`](docs/workload-shape-design.md).
 
 - **Concurrency sweeps have never measured `kv_unified = true`.** llama.cpp
