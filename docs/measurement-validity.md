@@ -142,6 +142,54 @@ whatever produces the next impossible number.
 Neither layer is sufficient alone. I5 cannot see a bench-driver result; I1/I2
 would accept a server row that is wrong by 5× rather than 2000×. Both are cheap.
 
+## The build itself can be the invalid measurement
+
+Everything above rejects a number that cannot be true. There is a quieter failure
+one level up: a number that is entirely possible, correctly measured, and answers
+a different question than the one asked.
+
+A llama.cpp built without a GPU backend does not fail. It runs on the CPU and
+reports plausible throughput. For a *tuning* tool that is the worst available
+shape of wrong: every `-ngl` level measures the same CPU run, the sweep still
+crowns a winner, main effects are computed over columns that are secretly equal,
+and the recommended command claims layers on a GPU that was never touched.
+
+Observed here on 2026-08-26, not hypothesised. Reconfiguring a stale build
+directory after an upstream restructure left `GGML_HIP=OFF` despite
+`-DGGML_HIP=ON` on the command line. The same 270M model then measured:
+
+| build | backend | tg |
+|---|---|---|
+| stale cache, HIP silently off | CPU | 115 t/s |
+| HIP actually compiled in | ROCm | 444 t/s |
+
+3.9x, no error, no warning, and `llama-bench` names the backend in a column
+nobody was reading.
+
+**`gpu_visibility` diagnoses it from evidence already collected.**
+`detect_vram_mib` asks llama.cpp first and falls back to `rocm-smi`/`nvidia-smi`,
+so the *source* of the answer is the whole diagnosis and no second probe is
+needed:
+
+- llama.cpp listed a device → nothing to say
+- a vendor tool sees a GPU that llama.cpp does not → **`blind`**: the build cannot
+  reach the card this machine has
+- nobody reports a GPU → `cpu-only`, a legitimate sweep
+- the binary predates `--list-devices` → `unknown`; llama.cpp's silence is not
+  evidence, so this must not be reported as a broken build
+
+**It warns; it does not refuse.** CPU-only sweeps are a real use case, and
+arguably the one where tuning matters most — `threads`, `ubatch`, `numa` and
+affinity are the whole game when there is no GPU to hide behind. What must never
+pass silently is a CPU-only *build* on a machine that has a GPU, which is a
+mistake rather than a choice. The two are distinguishable and are reported
+differently: an alarm for the first, a one-line note for the second saying which
+factors cannot vary.
+
+The warning names both causes it cannot separate — a missing backend and a GPU
+hidden by `HIP_VISIBLE_DEVICES`/`CUDA_VISIBLE_DEVICES` — because guessing between
+them would send half of readers down the wrong path.
+
 ## What this does not do
 
 It does not explain *why* generation returned early on the reporter's

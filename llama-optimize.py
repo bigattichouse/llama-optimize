@@ -426,6 +426,83 @@ def vram_used_mib() -> int | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# GPU visibility. A llama.cpp built without a GPU backend does not fail — it
+# runs everything on the CPU and reports perfectly plausible numbers. For a
+# TUNING tool that is the worst shape of wrong: every -ngl level measures the
+# same CPU run, the sweep still crowns a winner, and the recommended command
+# claims layers on a GPU that was never touched. Observed for real: the same
+# 270M model measured 115 t/s tg on a silently CPU-only build and 444 t/s once
+# the HIP backend was actually compiled in — a 3.9x error with no error message.
+#
+# CPU-only sweeps are legitimate and worth doing (threads, ubatch, numa, affinity
+# all matter there). What must never pass silently is a CPU-only *build* on a
+# machine that HAS a GPU, which is a mistake rather than a choice.
+# ---------------------------------------------------------------------------
+# Factors that can only do something when llama.cpp can see a GPU. On a CPU-only
+# build every level of these is the same run.
+GPU_ONLY_FACTORS = ("ngl", "ncmoe", "nkvo", "ot")
+
+
+def gpu_visibility(vram, vram_src: str, can_ask: bool) -> str:
+    """Which of four worlds we are in, read off what detect_vram_mib returned.
+
+    That function already asks llama.cpp first and falls back to the vendor tool,
+    so its *source* string carries the whole diagnosis — no second probe needed:
+
+    - "gpu"      llama.cpp itself listed a device; nothing to say
+    - "blind"    a vendor tool sees a GPU that llama.cpp does not. The build has
+                 no GPU backend on a machine that has one
+    - "cpu-only" nothing reports a GPU: a real CPU box, a legitimate sweep
+    - "unknown"  the binary predates --list-devices, so llama.cpp's silence is
+                 not evidence and the two answers cannot be compared
+    """
+    if vram and vram_src.startswith("llama.cpp"):
+        return "gpu"
+    if not can_ask:
+        return "unknown"
+    return "blind" if vram else "cpu-only"
+
+
+def warn_gpu_visibility(verdict: str, vram_src: str, factors) -> None:
+    """Say so, loudly, when the build cannot see the GPU it is being tuned for."""
+    inert = [n for n in GPU_ONLY_FACTORS if n in factors]
+    if verdict == "blind":
+        print()
+        print("!" * 70)
+        print("!! llama.cpp reports NO GPU devices, but " + (vram_src or "the vendor tool")
+              + " sees one.")
+        print("!!")
+        print("!! Every run will execute on the CPU, and the numbers will look")
+        print("!! entirely plausible while being wrong for your hardware — the same")
+        print("!! model measured 115 t/s on a CPU-only build and 444 t/s once the GPU")
+        print("!! backend was really there. 3.9x, with no error at any point.")
+        if inert:
+            print("!!")
+            print("!! " + ", ".join(inert) + " cannot do anything here: every level is the same")
+            print("!! CPU run. The sweep would spend rows telling identical configurations")
+            print("!! apart, then recommend GPU layers that never load.")
+        print("!!")
+        print("!! Two causes, and this check cannot tell them apart:")
+        print("!!  1. The build has no GPU backend. A STALE BUILD DIRECTORY DOES THIS")
+        print("!!     SILENTLY — reconfiguring over an old cache can leave GGML_HIP=OFF")
+        print("!!     even when -DGGML_HIP=ON was passed. Check build/CMakeCache.txt,")
+        print("!!     or configure a clean build directory.")
+        print("!!  2. The GPU is hidden from it — check HIP_VISIBLE_DEVICES /")
+        print("!!     CUDA_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES in this shell.")
+        print("!!")
+        print("!! Either way: fix it, then confirm `llama-bench --list-devices` lists")
+        print("!! your card before sweeping. If you meant to tune for CPU, this is")
+        print("!! still worth doing — but drop the GPU factors so the rows aren't wasted.")
+        print("!" * 70)
+        print()
+    elif verdict == "cpu-only" and inert:
+        print(f"CPU-only   : no GPU detected — {', '.join(inert)} cannot vary here "
+              "(every level is the same run);")
+        print("             consider --factor to drop them and spend the rows on "
+              "threads/ubatch/numa instead")
+
+
 def gpu_temp_c() -> float | None:
     """Best-effort GPU temperature in °C (AMD rocm-smi then NVIDIA nvidia-smi);
     None if no sensor is readable. Returns the hottest sensor reported."""
@@ -3948,6 +4025,43 @@ def selftest() -> bool:
             {"id": "ROCm0", "name": "some accelerator",
              "total_mib": 0, "free_mib": 0}]
 
+        # --- GPU visibility: a CPU-only BUILD vs a CPU-only MACHINE ---
+        # detect_vram_mib's source string already carries the diagnosis, which is
+        # why this needs no second probe.
+        assert gpu_visibility(32752, "llama.cpp: ROCm0", True) == "gpu"
+        # the vendor tool sees a card llama.cpp does not: no GPU backend
+        assert gpu_visibility(32752, "rocm-smi", True) == "blind"
+        assert gpu_visibility(24576, "nvidia-smi", True) == "blind"
+        # nobody sees a GPU: a real CPU box, and a legitimate sweep
+        assert gpu_visibility(None, "", True) == "cpu-only"
+        # a binary too old to ask cannot be caught lying: silence is not evidence,
+        # so this must NOT be reported as a broken build
+        assert gpu_visibility(32752, "rocm-smi", False) == "unknown"
+        assert gpu_visibility(None, "", False) == "unknown"
+        # llama.cpp answering wins even when a vendor tool could have too
+        assert gpu_visibility(30438, "llama.cpp: ROCm0", False) == "gpu"
+
+        _out = io.StringIO()
+        with contextlib.redirect_stdout(_out):
+            warn_gpu_visibility("blind", "rocm-smi", {"ngl": [], "threads": []})
+        _blind = _out.getvalue()
+        assert "NO GPU devices" in _blind and "rocm-smi" in _blind, _blind
+        assert "ngl" in _blind and "threads" not in _blind, _blind  # only the inert ones
+        assert "CMakeCache" in _blind, _blind      # names the actual cause
+        # a genuine CPU box gets a note, never the alarm
+        _out = io.StringIO()
+        with contextlib.redirect_stdout(_out):
+            warn_gpu_visibility("cpu-only", "", {"ngl": [], "threads": []})
+        _cpu = _out.getvalue()
+        assert "!!" not in _cpu and "ngl" in _cpu, _cpu
+        # and a CPU sweep with no GPU factors has nothing to warn about at all
+        _out = io.StringIO()
+        with contextlib.redirect_stdout(_out):
+            warn_gpu_visibility("cpu-only", "", {"threads": [], "ubatch": []})
+            warn_gpu_visibility("gpu", "llama.cpp: ROCm0", {"ngl": []})
+            warn_gpu_visibility("unknown", "rocm-smi", {"ngl": []})
+        assert _out.getvalue() == "", _out.getvalue()
+
         # --- measurement validity (docs/measurement-validity.md) ---
         # Issue #3: a server-driver sweep reported tg=1000000.0 t/s alongside
         # pp=444.1 and crowned it the winner on a box that really does ~25 t/s.
@@ -5366,6 +5480,13 @@ def main():
     # where it came from is what makes that diagnosable from a paste.
     print(f"VRAM       : {vram} MiB ({vram_src})" if vram
           else "VRAM       : (undetected)")
+    # A build that cannot see the GPU produces plausible numbers, not an error,
+    # so this is the only place it can be caught before a whole sweep is wasted.
+    warn_gpu_visibility(
+        gpu_visibility(vram, vram_src,
+                       supports_flag(cfg.llama_bench, "--list-devices")
+                       or supports_flag(cfg.llama_server, "--list-devices")),
+        vram_src, cfg.factors)
     if cfg.oom_prune and vram and cfg.fit_params.exists():
         print(f"OOM prune  : on (llama-fit-params, {cfg.fit_headroom_mib} MiB headroom)")
     elif cfg.oom_prune:

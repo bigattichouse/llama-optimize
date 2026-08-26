@@ -122,6 +122,20 @@ Plus ~12 uncovered perf-relevant knobs aimed at the partial-offload case
 `--swa-full`, batch-phase CPU affinity, `--prio`), and an `--audit-flags` mode so
 coverage stops rotting silently.
 
+## 11. ~~Warn when the build cannot see the GPU~~ — done
+
+A llama.cpp without a GPU backend reports plausible CPU numbers rather than
+failing, so every `-ngl` level measures the same run and the sweep recommends
+layers that never load. Hit for real: a stale build directory left `GGML_HIP=OFF`
+despite `-DGGML_HIP=ON`, and the same model measured 115 t/s (CPU) vs 444 t/s
+(ROCm). Now diagnosed from `detect_vram_mib`'s existing answer — a vendor tool
+seeing a card llama.cpp cannot is the signal. Warns loudly, never refuses: CPU-only
+sweeps are legitimate and get a one-line note instead. See
+[`docs/measurement-validity.md`](docs/measurement-validity.md).
+
+Remaining: `llama-bench -o json` reports the backend per row. Recording it would
+make the same fault visible *after* a sweep, not just before it.
+
 ## Small cleanups
 
 - ~~`--merge-results` rows aren't deduplicated against the current pass~~ —

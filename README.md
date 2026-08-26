@@ -739,6 +739,11 @@ python3 llama-optimize.py model-UD.gguf --run --driver server \
   with each row's start temp recorded (`temp_c`); **pick verification**
   (`--verify-picks`, default on) re-measures the final picks and reports medians
   with the observed spread, so the headline number isn't one lucky rep.
+- **The build is checked before the sweep** — a llama.cpp without a GPU backend
+  reports plausible CPU numbers instead of failing, which would make every `-ngl`
+  level the same run. If a vendor tool sees a card llama.cpp cannot, you get a
+  loud warning (with both likely causes) rather than a wasted sweep. CPU-only
+  boxes are a supported case and get a note, not an alarm.
 - **Speculation is measured, not assumed** — when a draft can run, each row
   records `draft_acc` (the fraction of drafted tokens llama.cpp accepted, the
   number that explains why a speculative config won or lost) and flags
