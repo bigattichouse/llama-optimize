@@ -87,11 +87,16 @@ earlier.
   sweep whose rows all say `CPU` while `ngl` varies is the same fault, still
   visible in the results file long after the console output is gone — and
   visible to whoever is handed the CSV, who never saw the warning.
-- Documentation: [`docs/field-reports.md`](docs/field-reports.md) (published
-  third-party setups and what transfers),
+- Documentation: [`docs/NEXT-SESSION.md`](docs/NEXT-SESSION.md) (working handoff
+  — what is in flight, blocked on what, and already verified),
+  [`docs/field-reports.md`](docs/field-reports.md) (published third-party setups
+  *and methods*, and what transfers — including a Bayesian/TPE autotuner whose own
+  numbers show BO tying random search at our dimensionality),
   [`docs/flag-coverage.md`](docs/flag-coverage.md) (every llama.cpp flag audited
   against the registry), [`docs/draft-model-design.md`](docs/draft-model-design.md),
-  [`docs/workload-shape-design.md`](docs/workload-shape-design.md).
+  [`docs/workload-shape-design.md`](docs/workload-shape-design.md),
+  [`docs/concurrency-kv-design.md`](docs/concurrency-kv-design.md),
+  [`docs/remaining-factors-design.md`](docs/remaining-factors-design.md).
 
 ### Fixed
 
