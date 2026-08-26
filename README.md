@@ -739,6 +739,10 @@ python3 llama-optimize.py model-UD.gguf --run --driver server \
   with each row's start temp recorded (`temp_c`); **pick verification**
   (`--verify-picks`, default on) re-measures the final picks and reports medians
   with the observed spread, so the headline number isn't one lucky rep.
+- **Changelog with result advisories** — [`CHANGELOG.md`](CHANGELOG.md) carries an
+  **Affects existing results** section per release: when a fix changes what past
+  measurements *mean*, it says so and whether to re-run. Results CSVs are stamped
+  with `tool_version` and `llama_build` so a file can be matched against it later.
 - **Known caveat — ngram results are upper bounds.** n-gram speculation keeps
   state across requests, and the sweep currently sends one identical prompt per
   rep, which drives acceptance to 100%. Measured at 2.3-3.4x inflation against

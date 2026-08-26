@@ -1,0 +1,122 @@
+# Changelog
+
+Notable changes to `llama-optimize`. Format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## Why this file has an extra section
+
+Most changelogs answer "what changed?". A measurement tool has to answer a
+second question: **"does this change what my existing results mean?"**
+
+A fix that makes a measurement more honest also makes every earlier measurement
+less trustworthy, and nothing in the standard Added/Changed/Fixed categories says
+so. Filing "ngram throughput was inflated 2.3-3.4x" under *Fixed* would be true
+and useless. So each release carries an **Affects existing results** section
+naming which past numbers moved and whether to re-run. If a release has none,
+it says so explicitly rather than leaving you to infer it.
+
+Results CSVs are stamped with `tool_version` and `llama_build` from 0.2.0 onward,
+so a file found later can be matched against this list without relying on memory.
+Files produced before 0.2.0 carry no stamp — that absence dates them to 0.1.0 or
+earlier.
+
+## [Unreleased]
+
+### ⚠️ Affects existing results
+
+- **ngram sweep results are upper bounds, not estimates.** llama.cpp's n-gram
+  speculation keeps state *across requests*, and the sweep sends one identical
+  prompt for every rep. Measured 2026-08-26 (gemma-3-270m-it-Q8_0, ROCm,
+  `--spec-type ngram-mod`): the first request drafts nothing, every subsequent
+  one reaches **100% draft acceptance**, and throughput goes 273 -> 601 t/s. On
+  genuinely distinct prompts the drafter never fires at all (176-259 t/s).
+
+  Since the harness discards the first request as warmup, *every measured rep*
+  sat in the saturated regime. Two consequences: ngram-vs-off is inflated
+  roughly **2.3-3.4x**, and the variant screen has been ranking `ngram-simple`,
+  `ngram-mod`, `ngram-map-k` and `ngram-map-k4v` at a shared ceiling where the
+  differences it exists to resolve cannot appear.
+
+  **Re-run any sweep that used `--ngram`.** Unaffected: `ngl`, `threads`,
+  `ubatch`, `batch`, `kv_type`, `nkvo`, `poll`, `ot` — these do not depend on
+  what the tokens say. MTP drafts from the model's NextN head rather than from
+  context n-grams and is very likely fine, but this has not been measured and
+  should not be assumed. Fix in progress:
+  [`docs/workload-shape-design.md`](docs/workload-shape-design.md).
+
+- **Concurrency sweeps have never measured `kv_unified = true`.** llama.cpp
+  enables the unified KV cache only when slot count is automatic
+  (`tools/server/server.cpp:153`); the struct default is `false`. This tool
+  always passes `--parallel` explicitly, so every `--parallel` sweep ran with
+  unified KV *off* — while a user starting `llama-server` with no `--parallel`
+  gets it *on*, with 4 slots. The emitted command is self-consistent, so this is
+  not a wrong recommendation; it is an unexplored regime, and the one the default
+  lands in. No factor currently reaches it. See
+  [`docs/flag-coverage.md`](docs/flag-coverage.md) C2.
+
+### Added
+
+- `draft_acc` column: the fraction of drafted tokens llama.cpp accepted, for
+  every run where speculation can happen. Sourced from `draft_n` /
+  `draft_n_accepted`, which llama.cpp already returned in the same `timings`
+  block the throughput rate is read from.
+- `spec_off` flag: set when a run asked for speculation and llama.cpp drafted
+  nothing. This is the [issue #8] shape — a row recording `mtp=1` that silently
+  measured the baseline. It is a flag, never a status: the measurement is real,
+  it simply is not measuring what its factor column claims.
+- Loud warning when llama.cpp reports no GPU but a vendor tool sees one. A build
+  without a GPU backend does not fail; it runs on the CPU and reports plausible
+  numbers, making every `-ngl` level the same run. Observed at **3.9x** (115 vs
+  444 t/s on the same model) after a stale build directory silently left
+  `GGML_HIP=OFF`. CPU-only *machines* are a supported case and get a one-line
+  note instead of the alarm.
+- `tool_version` and `llama_build` columns stamped on every results row, so a
+  CSV can be traced to what produced it after the fact.
+- Documentation: [`docs/field-reports.md`](docs/field-reports.md) (published
+  third-party setups and what transfers),
+  [`docs/flag-coverage.md`](docs/flag-coverage.md) (every llama.cpp flag audited
+  against the registry), [`docs/draft-model-design.md`](docs/draft-model-design.md),
+  [`docs/workload-shape-design.md`](docs/workload-shape-design.md).
+
+### Fixed
+
+- Source citations across the docs and in-code comments refreshed against
+  llama.cpp `4d19b2876`; four of twelve had drifted.
+
+### Known issues
+
+- `bench_command` emits `-mmp`, which llama-bench marks *DEPRECATED IN FAVOUR OF
+  `--load-mode`*. It still parses today. llama.cpp does remove deprecated
+  arguments — `--draft`, `--draft-min` and `--spec-ngram-size-n` are already gone
+  — and when `-mmp` follows, **every bench run will fail at argument parsing**,
+  not just one row. See [`docs/flag-coverage.md`](docs/flag-coverage.md) C1.
+
+## [0.1.0] — 2026-08-24
+
+Baseline: the tool as it stood before provenance stamping, at commit `bbb206a`.
+Results CSVs from this era carry no `tool_version` column.
+
+Highlights of what was already in place: Taguchi orthogonal-array sweeps over the
+llama.cpp parameter space with `llama-bench` and `llama-server` drivers,
+conditional factors ([`docs/CONDITIONAL-FACTORS.md`](docs/CONDITIONAL-FACTORS.md)),
+constrained/derived factors ([`docs/CONSTRAINED-FACTORS.md`](docs/CONSTRAINED-FACTORS.md)),
+measurement-validity checks ([`docs/measurement-validity.md`](docs/measurement-validity.md)),
+crash journal, `--resume`, `--iterate`, `--diff`, and a GPU-free `--selftest`.
+
+### ⚠️ Affects results from before this release
+
+- **The batch floor hid the low-batch regime** (fixed in `f7ed38d`, issue #8).
+  `-b` was swept as an absolute at `2048, 4096, 8192` so that `-b >= -ub` held
+  without llama.cpp's silent clamp firing. The cost was that no configuration
+  below `-b 2048` was reachable *by construction* — including one audited user's
+  own hand-tuned optimum of `-b 512 -ub 128`. `-b` is now swept as a multiple of
+  each row's `-ub` (1x/4x/16x) and spans 128-32768.
+- **Inverted speculative rows measured the baseline** (fixed in `f7ed38d`).
+  `--spec-draft-n-min` above `--spec-draft-n-max` is not rejected by llama.cpp:
+  it drafts at most `n_max` tokens and discards any draft shorter than `n_min`,
+  so the row ran with speculation silently off while recording `mtp=1` —
+  poisoning the `mtp` main effect rather than just its own score. Both
+  ordered pairs are now derived so the inverted assignment cannot be constructed.
+
+[issue #8]: https://github.com/bigattichouse/llama-optimize/issues/8

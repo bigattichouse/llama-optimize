@@ -171,6 +171,12 @@ def prepare_taguchi_cli():
 # Fixed parameters (see design notes): flash-attn is a precondition for KV-quant
 # and a near-certain win on gfx906; mmap on is the sane default; batch fixed to
 # avoid invalid batch<ubatch combinations.
+# Stamped into every results CSV so a file found later can be traced to what
+# produced it. A tuning tool's output outlives the run: when a fix changes what a
+# past measurement MEANS (see CHANGELOG "Affects existing results"), the only way
+# to answer "is this CSV affected?" is for the CSV to say what made it.
+__version__ = "0.2.0-dev"
+
 FIXED_FA = 1
 FIXED_MMAP = 1
 FIXED_BATCH = 2048
@@ -501,6 +507,55 @@ def warn_gpu_visibility(verdict: str, vram_src: str, factors) -> None:
               "(every level is the same run);")
         print("             consider --factor to drop them and spend the rows on "
               "threads/ubatch/numa instead")
+
+
+_build_cache: dict = {}
+
+
+def llama_build(*binaries) -> str:
+    """llama.cpp's own build identity, e.g. "build 10636 (4d19b2876)", or "".
+
+    Stamped alongside our version because a result depends on BOTH: half the
+    findings in this project's changelog are about llama.cpp behaviour, and
+    `--diff` exists precisely to compare sweeps across llama.cpp upgrades.
+
+    Only llama-server answers `--version` (llama-bench rejects it and prints its
+    build in the run output instead), so several binaries may be offered and the
+    first that answers wins — the same pattern detect_vram_mib uses."""
+    for binary in binaries:
+        if binary is None or not Path(binary).exists():
+            continue
+        key = str(binary)
+        if key in _build_cache:
+            if _build_cache[key]:
+                return _build_cache[key]
+            continue
+        try:
+            out = subprocess.run([str(binary), "--version"],
+                                 capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            _build_cache[key] = ""
+            continue
+        got = parse_llama_version((out.stdout or "") + "\n" + (out.stderr or ""))
+        _build_cache[key] = got
+        if got:
+            return got
+    return ""
+
+
+# llama.cpp prints: "version: 0.3.0-dev (build 10636, commit 4d19b2876)"
+_VERSION_LINE = re.compile(
+    r"\bbuild\s+(\d+)\s*,\s*commit\s+([0-9a-f]{7,40})\b")
+
+
+def parse_llama_version(text: str) -> str:
+    """"build 10636 (4d19b2876)" from a --version banner, or "".
+
+    Matches on the build/commit pair rather than the leading "version:" token so
+    a binary that reorders or reworks that line keeps working; a build number
+    with no commit is not enough to identify what ran, so both are required."""
+    m = _VERSION_LINE.search(text or "")
+    return f"build {m.group(1)} ({m.group(2)})" if m else ""
 
 
 def gpu_temp_c() -> float | None:
@@ -4041,6 +4096,20 @@ def selftest() -> bool:
         # llama.cpp answering wins even when a vendor tool could have too
         assert gpu_visibility(30438, "llama.cpp: ROCm0", False) == "gpu"
 
+        # --- provenance stamp (CHANGELOG "Affects existing results") ---
+        assert parse_llama_version(
+            "version: 0.3.0-dev (build 10636, commit 4d19b2876)\n"
+            "built with Clang 22.0.0 for Linux x86_64") == "build 10636 (4d19b2876)"
+        # the banner may be reworded; the build/commit pair is what identifies a run
+        assert parse_llama_version(
+            "llama.cpp  (build 42, commit abc1234)") == "build 42 (abc1234)"
+        assert parse_llama_version("version: 0.3.0-dev (build 10636)") == ""
+        assert parse_llama_version("error: invalid parameter: --version") == ""
+        assert parse_llama_version("") == ""
+        # a stamp is bookkeeping, never a factor column
+        assert "tool_version" in RESULT_COLS and "llama_build" in RESULT_COLS
+        assert __version__
+
         _out = io.StringIO()
         with contextlib.redirect_stdout(_out):
             warn_gpu_visibility("blind", "rocm-smi", {"ngl": [], "threads": []})
@@ -4414,7 +4483,8 @@ def load_results_csv(path: Path, factors: dict) -> list[dict]:
 # results-CSV columns that are measurements/bookkeeping; everything else in a
 # header is a factor column (must match the writer's `cols` in main)
 RESULT_COLS = {"run_id", "pp_tps", "tg_tps", "eff_tps", "status", "secs",
-               "temp_c", "vram_mib", "implausible", "draft_acc", "spec_off"}
+               "temp_c", "vram_mib", "implausible", "draft_acc", "spec_off",
+               "tool_version", "llama_build"}
 
 
 def merge_result_rows(cfg: Config, rows: list[dict],
@@ -5589,7 +5659,8 @@ def main():
     cols = (["run_id"] + list(cfg.factors.keys()) + abs_cols
             + ["pp_tps", "tg_tps", "eff_tps", "status", "secs", "temp_c"]
             + (["vram_mib"] if cfg.measure_vram else [])
-            + (["draft_acc", "spec_off"] if spec_cols_wanted(cfg) else []))
+            + (["draft_acc", "spec_off"] if spec_cols_wanted(cfg) else [])
+            + ["tool_version", "llama_build"])
 
     # Resume keys on run_id (unique per array row), not config values, because
     # orthogonal arrays can repeat a config across rows (intentional replication).
@@ -5611,6 +5682,12 @@ def main():
                     done.add(str(r["run_id"]))
         print(f"resuming: {len(done)} run(s) already in {args.results}, "
               "skipping them")
+
+    # Provenance stamped on every row rather than in a sidecar: a results CSV
+    # gets copied, merged (--merge-results) and mailed around on its own, and the
+    # question it must answer later — "what produced this?" — travels with it.
+    stamp = {"tool_version": __version__,
+             "llama_build": llama_build(cfg.llama_server, cfg.llama_bench)}
 
     fresh = not (args.resume and args.results.exists())
     fh = open(args.results, "w" if fresh else "a", newline="")
@@ -5637,7 +5714,7 @@ def main():
             crow = {"run_id": rid, **{k: fac.get(k, "") for k in cfg.factors},
                     **derived_abs_cols(cfg, fac),
                     "pp_tps": 0.0, "tg_tps": 0.0, "eff_tps": 0.0,
-                    "status": "CRASH", "secs": 0.0}
+                    "status": "CRASH", "secs": 0.0, **stamp}
             rows.append(crow)
             writer.writerow(crow)
             done.add(rid)
@@ -5724,7 +5801,7 @@ def main():
                                    "tg_tps": 0.0, "secs": 0.0, "vram_mib": 0}
                             res["eff_tps"] = 0.0
                             row = {"run_id": rid, **f, **derived_abs_cols(cfg, f),
-                                   **res, "temp_c": ""}
+                                   **res, "temp_c": "", **stamp}
                             rows.append(row)
                             writer.writerow(row)
                             fh.flush()
@@ -5742,7 +5819,8 @@ def main():
                         res = run_with_progress(cfg, f, args.timeout, prefix)
                     res["eff_tps"] = objective_tps(cfg, res["pp_tps"], res["tg_tps"])
                     row = {"run_id": rid, **f, **derived_abs_cols(cfg, f), **res,
-                           "temp_c": f"{temp0:.0f}" if temp0 is not None else ""}
+                           "temp_c": f"{temp0:.0f}" if temp0 is not None else "",
+                           **stamp}
                     rows.append(row)
                     writer.writerow(row)   # incremental save: survive a crash/kill
                     fh.flush()
