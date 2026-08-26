@@ -4,8 +4,9 @@ Improvement ideas, roughly ordered by expected value. Items get checked off (and
 their design notes trimmed) as they land.
 
 **Picking up mid-stream?** [`docs/NEXT-SESSION.md`](docs/NEXT-SESSION.md) is the
-working handoff: what is in flight, what is blocked on what, and what has already
-been verified so you do not re-check it.
+working handoff (current state, already verified) and
+[`docs/PLAN.md`](docs/PLAN.md) is the execution order and its dependencies. This
+file stays the idea backlog.
 
 ## 1. Noise-aware picks — partially done
 

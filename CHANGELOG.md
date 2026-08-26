@@ -110,7 +110,8 @@ earlier.
   sweep whose rows all say `CPU` while `ngl` varies is the same fault, still
   visible in the results file long after the console output is gone — and
   visible to whoever is handed the CSV, who never saw the warning.
-- Documentation: [`docs/constants-audit.md`](docs/constants-audit.md) (every
+- Documentation: [`docs/PLAN.md`](docs/PLAN.md) (execution order and what blocks
+  what), [`docs/constants-audit.md`](docs/constants-audit.md) (every
   hardcoded value classified as universal / derivable / ours — the
   hardware-poisoning audit),
   [`docs/NEXT-SESSION.md`](docs/NEXT-SESSION.md) (working handoff

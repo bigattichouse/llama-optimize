@@ -1,6 +1,7 @@
 # Handoff — open work as of 2026-08-26
 
-Working state at the end of the 2026-08-25/26 sessions. Unlike the other files in
+Working state at the end of the 2026-08-25/26 sessions. For what order to do the
+remaining work in and why, see [`PLAN.md`](PLAN.md). Unlike the other files in
 `docs/`, this one is **transient**: it records what is in flight and what to pick
 up next, and should be pruned as items land. Durable reasoning belongs in the
 design docs it points at.
@@ -10,14 +11,13 @@ working tree is clean, and `--selftest` passes.
 
 ## Do these first
 
-### 1. Confirm CI is actually green
+### 1. ~~Confirm CI is actually green~~ — done
 
-The last several runs failed with *"The job was not acquired by Runner of type
-hosted even after multiple attempts"* — empty step list, conclusion `cancelled`.
-That is GitHub runner starvation, **not** a test failure; `--selftest` passes
-locally on every one of those commits. A re-run was queued and had not been
-picked up either. Check `gh run list` and re-run if still red before assuming any
-of the recent work broke something.
+Several runs had failed with *"The job was not acquired by Runner of type hosted
+even after multiple attempts"* — empty step list, conclusion `cancelled`. That was
+GitHub runner starvation, not a test failure. Confirmed: the four most recent runs
+all pass in ~20s. Worth remembering the signature, since it looks alarming and
+means nothing.
 
 ### 2. Cut 0.2.0
 
