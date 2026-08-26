@@ -23,7 +23,7 @@ reachability. There is no escape hatch.
 
 ## Two live defects
 
-**C1 — we emit a deprecated flag on every bench run.** `bench_command` emits
+**C1 — FIXED (0.2.0-dev). We emitted a deprecated flag on every bench run.** `bench_command` emits
 `-mmp 1` unconditionally (`FIXED_MMAP`), and `llama-bench --help` now says
 `-mmp, --mmap <0|1> (DEPRECATED IN FAVOUR OF --load-mode)`. The server path is
 the same family: `--no-mmap`/`--mlock` are deprecated in favour of `-lm`.
@@ -164,8 +164,10 @@ about is how inert columns get created.
 
 ## Checklist
 
-- [ ] **C1** — replace `-mmp`/`--no-mmap` emission with `-lm`, probed via
-      `supports_flag` for builds that predate it; then `load_mode` as a factor
+- [x] **C1** — `load_mode_args` emits `--load-mode`, probed via `supports_flag`,
+      falling back to the per-driver legacy spellings on older builds
+- [ ] `load_mode` as a *factor* (mmap / mlock / mmap+mlock / dio), now that
+      emitting it is settled — the partial-offload case is where it should pay
 - [ ] **C2** — `kv_unified` factor, and decide whether `--parallel` auto is
       reachable at all (a `parallel=auto` level pins slots to 4 — it is a
       constrained pair, not two free columns)

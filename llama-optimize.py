@@ -558,6 +558,40 @@ def parse_llama_version(text: str) -> str:
     return f"build {m.group(1)} ({m.group(2)})" if m else ""
 
 
+# ---------------------------------------------------------------------------
+# Model loading mode. `-mmp`/`--mmap`/`--no-mmap`/`--mlock`/`-dio` are all
+# DEPRECATED in favour of `--load-mode`, and llama.cpp does remove deprecated
+# arguments rather than carrying them forever — `--draft`, `--draft-min` and
+# `--spec-ngram-size-n` are already gone. Emitting `-mmp` on every bench command
+# is therefore a latent whole-sweep failure: when it goes, argument parsing
+# fails and no row runs. common/arg.cpp also warns that the old and new spellings
+# must not be combined ("only the last flag takes effect"), so a user who passes
+# `--load-mode` today silently conflicts with the flag we insert for them.
+#
+# The old spellings stay as the fallback: a build predating `--load-mode` is a
+# perfectly good build, and probing is what lets both work.
+# ---------------------------------------------------------------------------
+def load_mode_args(binary, driver: str,
+                   mmap_on: bool = bool(FIXED_MMAP)) -> list[str]:
+    """The flags that pin model loading, preferring `--load-mode`.
+
+    `mmap` and `none` are the exact translations of the old pair: `-mmp 1`
+    memory-maps, `--no-mmap`/`-mmp 0` asks for no special loading. `auto` is
+    llama.cpp's own default and is deliberately NOT used — the point of pinning
+    this is that every row loads the model the same way, and `auto` is free to
+    decide differently per device.
+
+    The legacy spellings are not symmetric and never were: llama-bench takes
+    `-mmp 0|1`, while llama-server has only `--no-mmap` and mmaps by default, so
+    "mmap on" is the absence of a flag there. `--load-mode` is what makes the two
+    drivers finally say the same thing."""
+    if supports_flag(binary, "--load-mode"):
+        return ["--load-mode", "mmap" if mmap_on else "none"]
+    if driver == "bench":
+        return ["-mmp", "1" if mmap_on else "0"]
+    return [] if mmap_on else ["--no-mmap"]
+
+
 def gpu_temp_c() -> float | None:
     """Best-effort GPU temperature in °C (AMD rocm-smi then NVIDIA nvidia-smi);
     None if no sensor is readable. Returns the hottest sensor reported."""
@@ -1722,7 +1756,7 @@ def bench_command(cfg: Config, f: dict) -> list[str]:
     cmd = [
         str(cfg.llama_bench),
         "-m", str(cfg.model),
-        "-mmp", str(FIXED_MMAP),
+        *load_mode_args(cfg.llama_bench, "bench"),
         "-p", str(cfg.n_prompt),
         "-n", str(cfg.n_gen),
         "-r", str(cfg.reps),
@@ -1795,8 +1829,11 @@ def _merge_spec_type_args(args: list[str]) -> list[str]:
 def server_command(cfg: Config, f: dict, ctx: int) -> str:
     ub = int(f.get("ubatch", 512))
     parts = [f"-m {cfg.model.name}", f"-c {ctx}"]
-    if not FIXED_MMAP:
-        parts.append("--no-mmap")
+    # one part per flag+value: `parts` is rendered one-per-line in the emitted
+    # command, and a bare "--load-mode" over "mmap" reads like two flags
+    _lm = load_mode_args(cfg.llama_server, "server")
+    if _lm:
+        parts.append(" ".join(_lm))
     if "fa" not in f:
         parts.append(f"-fa {FIXED_FA}")
     if "batch_ratio" not in f:
@@ -1854,6 +1891,25 @@ def parse_bench_json(stdout: str):
         elif n_prompt and not n_gen:
             pp = ts
     return pp, tg
+
+
+def parse_bench_backend(stdout: str) -> str:
+    """llama-bench's own name for what actually ran ("ROCm", "CPU", ...), or "".
+
+    The companion to gpu_visibility: that check runs BEFORE a sweep and infers a
+    CPU-only build from a device list, this records what the binary says AFTER
+    each run. A sweep whose rows all say "CPU" while `ngl` varies is the same
+    3.9x fault, visible in the results file long after the console output is
+    gone — and visible to whoever is handed the CSV, who did not see the warning
+    at all."""
+    try:
+        rows = json.loads(stdout)
+    except json.JSONDecodeError:
+        return ""
+    for row in rows:
+        if isinstance(row, dict) and row.get("backends"):
+            return str(row["backends"])
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -1961,6 +2017,7 @@ def run_one(cfg: Config, f: dict, timeout: int):
     t0 = time.time()
     status, pp, tg = "OK", 0.0, 0.0
     sampler = VRAMSampler().__enter__() if cfg.measure_vram else None
+    backend = ""
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
                               env=run_env(cfg, f))
@@ -1969,6 +2026,7 @@ def run_one(cfg: Config, f: dict, timeout: int):
             status = "OOM" if _OOM_PAT.search(combined) else "ERROR"
         else:
             pp_, tg_ = parse_bench_json(proc.stdout)
+            backend = parse_bench_backend(proc.stdout)
             if tg_ is None:
                 status = "PARSE_FAIL"
             else:
@@ -1979,7 +2037,7 @@ def run_one(cfg: Config, f: dict, timeout: int):
         if sampler:
             sampler.__exit__()
     return validate_measurement(
-        {"status": status, "pp_tps": pp, "tg_tps": tg,
+        {"status": status, "pp_tps": pp, "tg_tps": tg, "backend": backend,
          "secs": time.time() - t0, "vram_mib": sampler.peak if sampler else 0})
 
 
@@ -2007,8 +2065,7 @@ def build_server_args(cfg: Config, f: dict, port: int, n_ctx: int) -> list[str]:
     # unknown arguments outright. Spelled `--fit off`; there is no `--no-fit`.
     if supports_flag(cfg.llama_server, "--fit"):
         args += ["--fit", "off"]
-    if not FIXED_MMAP:
-        args.append("--no-mmap")                   # llama-server flag (NOT -mmp)
+    args += load_mode_args(cfg.llama_server, "server")
     if "fa" not in f:                              # flash-attn fixed unless swept
         args += ["-fa", str(FIXED_FA)]
     if "batch_ratio" not in f:
@@ -3151,6 +3208,16 @@ def selftest() -> bool:
         ])
         assert parse_bench_json(sample) == (123.4, 45.6)
         assert parse_bench_json("not json") == (None, None)
+        # what actually ran, recorded per row: the after-the-fact companion to
+        # gpu_visibility, and the only form of it that survives into the CSV
+        assert parse_bench_backend(
+            '[{"backends": "ROCm", "avg_ts": 1.0}]') == "ROCm"
+        assert parse_bench_backend(
+            '[{"backends": "CPU", "avg_ts": 1.0}]') == "CPU"
+        assert parse_bench_backend("not json") == ""
+        assert parse_bench_backend("[]") == ""
+        assert parse_bench_backend('[{"avg_ts": 1.0}]') == ""   # older build
+        assert "backend" in RESULT_COLS          # bookkeeping, never a factor
 
         # OOM detection
         assert _OOM_PAT.search("ggml_backend_alloc failed: out of memory")
@@ -3435,6 +3502,31 @@ def selftest() -> bool:
             assert not supports_flag(Path("bench"), "--fit")   # the substring trap
             assert supports_flag(Path("bench"), "--fit-target")
             assert not supports_flag(Path("old"), "--fit")
+
+            # --- load mode (CHANGELOG C1) ---
+            # -mmp/--no-mmap are deprecated in favour of --load-mode, and
+            # llama.cpp does delete deprecated args. Prefer the new spelling
+            # where the binary has it, keep the old where it does not, and never
+            # emit both (arg.cpp: "only the last flag takes effect").
+            _help_cache["lm"] = "-lm, --load-mode MODE   model loading mode\n"
+            assert load_mode_args(Path("lm"), "bench", True) == ["--load-mode", "mmap"]
+            assert load_mode_args(Path("lm"), "bench", False) == ["--load-mode", "none"]
+            # one spelling, both drivers -- the legacy pair never agreed
+            assert load_mode_args(Path("lm"), "server", True) == ["--load-mode", "mmap"]
+            assert load_mode_args(Path("lm"), "server", False) == ["--load-mode", "none"]
+            # older build: llama-bench takes -mmp 0|1 ...
+            assert load_mode_args(Path("old"), "bench", True) == ["-mmp", "1"]
+            assert load_mode_args(Path("old"), "bench", False) == ["-mmp", "0"]
+            # ... while llama-server has only --no-mmap and mmaps by default, so
+            # "on" is the ABSENCE of a flag. Emitting -mmp there would be fatal.
+            assert load_mode_args(Path("old"), "server", True) == []
+            assert load_mode_args(Path("old"), "server", False) == ["--no-mmap"]
+            for drv in ("bench", "server"):
+                for binary in (Path("lm"), Path("old")):
+                    for on in (True, False):
+                        got = load_mode_args(binary, drv, on)
+                        assert not ({"-mmp", "--no-mmap"} & set(got)
+                                    and "--load-mode" in got), got
         finally:
             _help_cache.clear()
             _help_cache.update(_saved_help)
@@ -4484,7 +4576,7 @@ def load_results_csv(path: Path, factors: dict) -> list[dict]:
 # header is a factor column (must match the writer's `cols` in main)
 RESULT_COLS = {"run_id", "pp_tps", "tg_tps", "eff_tps", "status", "secs",
                "temp_c", "vram_mib", "implausible", "draft_acc", "spec_off",
-               "tool_version", "llama_build"}
+               "tool_version", "llama_build", "backend"}
 
 
 def merge_result_rows(cfg: Config, rows: list[dict],
@@ -5660,6 +5752,7 @@ def main():
             + ["pp_tps", "tg_tps", "eff_tps", "status", "secs", "temp_c"]
             + (["vram_mib"] if cfg.measure_vram else [])
             + (["draft_acc", "spec_off"] if spec_cols_wanted(cfg) else [])
+            + (["backend"] if cfg.driver == "bench" else [])
             + ["tool_version", "llama_build"])
 
     # Resume keys on run_id (unique per array row), not config values, because

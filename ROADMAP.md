@@ -141,8 +141,8 @@ seeing a card llama.cpp cannot is the signal. Warns loudly, never refuses: CPU-o
 sweeps are legitimate and get a one-line note instead. See
 [`docs/measurement-validity.md`](docs/measurement-validity.md).
 
-Remaining: `llama-bench -o json` reports the backend per row. Recording it would
-make the same fault visible *after* a sweep, not just before it.
+Also landed: the `backend` column, from `llama-bench -o json`, so the same fault
+is visible after a sweep and to whoever receives the CSV.
 
 ## Small cleanups
 

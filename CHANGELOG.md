@@ -73,6 +73,11 @@ earlier.
   note instead of the alarm.
 - `tool_version` and `llama_build` columns stamped on every results row, so a
   CSV can be traced to what produced it after the fact.
+- `backend` column on bench-driver rows, recording what llama.cpp says actually
+  ran ("ROCm", "CPU", ...). The after-the-fact companion to the GPU warning: a
+  sweep whose rows all say `CPU` while `ngl` varies is the same fault, still
+  visible in the results file long after the console output is gone — and
+  visible to whoever is handed the CSV, who never saw the warning.
 - Documentation: [`docs/field-reports.md`](docs/field-reports.md) (published
   third-party setups and what transfers),
   [`docs/flag-coverage.md`](docs/flag-coverage.md) (every llama.cpp flag audited
@@ -81,16 +86,25 @@ earlier.
 
 ### Fixed
 
+- **Stop emitting the deprecated `-mmp` / `--no-mmap`.** Model loading is now
+  pinned with `--load-mode`, probed via `supports_flag` so builds predating it
+  keep the old spelling. This was a latent whole-sweep failure: llama.cpp does
+  remove deprecated arguments (`--draft`, `--draft-min` and
+  `--spec-ngram-size-n` are already gone), and argument parsing failing takes
+  every row with it, not one. It also removes a silent conflict — `common/arg.cpp`
+  warns that the old and new spellings must not be combined, so a user passing
+  `--load-mode` was fighting a flag we inserted for them. A side benefit: the two
+  drivers finally say the same thing, where `-mmp 0|1` and a bare `--no-mmap`
+  never agreed.
 - Source citations across the docs and in-code comments refreshed against
   llama.cpp `4d19b2876`; four of twelve had drifted.
 
 ### Known issues
 
-- `bench_command` emits `-mmp`, which llama-bench marks *DEPRECATED IN FAVOUR OF
-  `--load-mode`*. It still parses today. llama.cpp does remove deprecated
-  arguments — `--draft`, `--draft-min` and `--spec-ngram-size-n` are already gone
-  — and when `-mmp` follows, **every bench run will fail at argument parsing**,
-  not just one row. See [`docs/flag-coverage.md`](docs/flag-coverage.md) C1.
+- Roughly a dozen perf-relevant llama.cpp flags are still unreachable, several
+  aimed squarely at the partial-offload case: `--repack`, `--op-offload`,
+  `--no-host`, `-kvu`, `-sps`, `--swa-full`, `--prio`, and the batch-phase CPU
+  affinity twins. Audited in [`docs/flag-coverage.md`](docs/flag-coverage.md).
 
 ## [0.1.0] — 2026-08-24
 
