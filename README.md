@@ -739,6 +739,11 @@ python3 llama-optimize.py model-UD.gguf --run --driver server \
   with each row's start temp recorded (`temp_c`); **pick verification**
   (`--verify-picks`, default on) re-measures the final picks and reports medians
   with the observed spread, so the headline number isn't one lucky rep.
+- **Speculation is measured, not assumed** — when a draft can run, each row
+  records `draft_acc` (the fraction of drafted tokens llama.cpp accepted, the
+  number that explains why a speculative config won or lost) and flags
+  `spec_off` when a run asked for speculation and drafted nothing at all — a row
+  that looks like a speculative measurement but isn't one.
 - **Robust** — incremental save + `--resume`; **crash journal** so a config that
   reboots the machine is skipped, not retried (`--retry-crashed` to override);
   clear errors; `--selftest` (no GPU); max-context probe by default (`--no-probe` to skip).

@@ -1999,6 +1999,89 @@ def _measure_round(port: int, prompt, n_gen: int, par: int, timeout: int, cache=
         return res, time.time() - w0
 
 
+# ---------------------------------------------------------------------------
+# Speculative telemetry (docs/field-reports.md, F1). Acceptance is the number
+# that explains a speculative result, and llama.cpp hands it to us for free in
+# the same `timings` block we already read for the throughput rate.
+# ---------------------------------------------------------------------------
+def _draft_totals(timings: list) -> dict:
+    """Sum llama.cpp's draft counters across a set of `timings` blocks.
+
+    llama.cpp emits `draft_n`/`draft_n_accepted` only when a draft actually ran
+    (tools/server/server-common.cpp), so responses carrying neither are positive
+    evidence that speculation did not happen — not merely a gap in the telemetry.
+    Returns {} in that case; `draft_cols` turns it into the `spec_off` flag."""
+    drafted = accepted = 0
+    ran = False
+    for t in timings:
+        if not isinstance(t, dict) or "draft_n" not in t:
+            continue
+        ran = True
+        drafted += int(t.get("draft_n") or 0)
+        accepted += int(t.get("draft_n_accepted") or 0)
+    return {"drafted": drafted, "accepted": accepted} if ran else {}
+
+
+def speculation_requested(cfg, f: dict) -> bool:
+    """Whether this run asks llama.cpp for speculative decoding at all.
+
+    Both gates ride `--spec-type`: `mtp` selects draft-mtp and `ngram` selects a
+    self-speculative variant, and each spells "off" as a level that translates to
+    an omitted flag (FACTORS). But a gate is not always a *factor* — when it is
+    not swept, `build_server_args` emits it fixed-on (MTP whenever the model has
+    a NextN head and --no-mtp was not given; ngram-mod whenever --ngram is on).
+    Reading only the assignment would miss exactly those runs, which are the
+    common case."""
+    if "mtp" in f:
+        if str(f["mtp"]) == "1":
+            return True
+    elif cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0:
+        return True                        # fixed on, not swept
+    if "ngram" in f:
+        if str(f["ngram"]) not in ("none", "", "0"):
+            return True
+    elif cfg.ngram:
+        return True                        # fixed on (ngram-mod), not swept
+    return False
+
+
+def spec_cols_wanted(cfg) -> bool:
+    """Whether the results CSV should carry the speculative telemetry columns.
+
+    Only the server driver can speculate (every speculative knob is server_only),
+    and only a run that can actually produce a draft has anything to record.
+    Elsewhere these would be blank in every row — the inert-column problem the
+    factor design already rejects (docs/multi-gpu-design.md, M1)."""
+    if cfg.driver != "server":
+        return False
+    return bool((cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0) or cfg.ngram
+                or "mtp" in cfg.factors or "ngram" in cfg.factors)
+
+
+def draft_cols(cfg, f: dict, draft: dict) -> dict:
+    """Speculative telemetry columns for one measurement.
+
+    `draft_acc` is the fraction of drafted tokens llama.cpp accepted — the number
+    that explains why a speculative config won or lost, and which we swept six
+    factors against while recording nothing.
+
+    `spec_off` is the guard: the row asked for speculation and no draft ever ran.
+    That is the issue #8 shape — a row recording `mtp=1` that silently measured
+    the baseline and poisoned the `mtp` main effect. `spec_n_min_frac` and
+    `ngram_mod_n_max_off` now make the inverted assignment unconstructible
+    (docs/CONSTRAINED-FACTORS.md); this is the independent check that the
+    construction held, in the same spirit as the wall-clock ceiling over the
+    server's self-reported rate (docs/measurement-validity.md).
+
+    It is a flag, never a status: the measurement is real and correctly scored,
+    it simply is not measuring what its factor column claims."""
+    if draft:
+        drafted = draft.get("drafted", 0)
+        acc = draft.get("accepted", 0) / drafted if drafted else 0.0
+        return {"draft_acc": round(acc, 4)}
+    return {"spec_off": 1} if speculation_requested(cfg, f) else {}
+
+
 class ServerSession:
     """A running llama-server, reusable across runs that share load-time params
     (only the request — prompt length via n_depth — varies). Launch once, issue
@@ -2032,8 +2115,10 @@ class ServerSession:
                             f"server not healthy within {cfg.server_start_timeout}s")
 
     def measure(self, prompt_len, n_gen, par, reps, timeout):
-        """Returns (pp_tps, tg_tps, problem) — problem is a string when the
-        numbers cannot be believed, else None (docs/measurement-validity.md)."""
+        """Returns (pp_tps, tg_tps, problem, draft) — problem is a string when
+        the numbers cannot be believed, else None (docs/measurement-validity.md);
+        draft carries llama.cpp's speculative counters over the measured reps,
+        or {} when no draft ran (docs/field-reports.md, F1)."""
         prompt = _realistic_prompt(prompt_len)
         if par == 1:
             # Single stream: prefill once (warm request → real pp + primes the KV
@@ -2042,12 +2127,13 @@ class ServerSession:
             # cleaner decode number.
             warm = _completion(self.port, prompt, n_gen, timeout, cache=True)
             pp = warm.get("timings", {}).get("prompt_per_second", 0.0) or 0.0
-            tps, ceilings = [], []
+            tps, ceilings, timings = [], [], []
             for _ in range(max(1, reps)):
                 w0 = time.time()
                 r = _completion(self.port, prompt, n_gen, timeout, cache=True)
                 wall = time.time() - w0
                 t = r.get("timings", {})
+                timings.append(t)   # draft counters live here too (F1)
                 tps.append(t.get("predicted_per_second", 0.0) or 0.0)
                 # Independent clock. The server derives its rate as
                 # 1e3 / t_token_generation * n_decoded from its own counter
@@ -2060,20 +2146,23 @@ class ServerSession:
                 if wall > 0 and n_dec > 0:
                     ceilings.append(n_dec / wall)
             tg = sum(tps) / len(tps)
-            return pp, tg, exceeds_wall_clock(tg, ceilings)
+            # the warm request is excluded here exactly as it is from `tps`:
+            # it primes the cache and is not one of the measured reps
+            return pp, tg, exceeds_wall_clock(tg, ceilings), _draft_totals(timings)
         # Concurrency: realistic serving — every request prefills; aggregate over
         # the streams. Warmup once, then average per-round throughput over reps.
         # These rates are computed from our own wall clock already, so they
         # cannot exceed it by construction — no cross-check needed.
         _measure_round(self.port, prompt, n_gen, par, timeout)  # warmup, discard
-        pps, tps = [], []
+        pps, tps, timings = [], [], []
         for _ in range(max(1, reps)):
             res, wall = _measure_round(self.port, prompt, n_gen, par, timeout)
+            timings.extend(r.get("timings", {}) for r in res)
             tg_tok = sum(r.get("timings", {}).get("predicted_n", 0) for r in res)
             pp_tok = sum(r.get("timings", {}).get("prompt_n", 0) for r in res)
             tps.append(tg_tok / wall if wall > 0 else 0.0)
             pps.append(pp_tok / wall if wall > 0 else 0.0)
-        return sum(pps) / len(pps), sum(tps) / len(tps), None
+        return sum(pps) / len(pps), sum(tps) / len(tps), None, _draft_totals(timings)
 
     def close(self):
         if self.proc and self.proc.poll() is None:
@@ -2139,9 +2228,10 @@ def measure_in_session(cfg: Config, f: dict, session, timeout: int) -> dict:
     prompt_len = cfg.n_prompt + int(f.get("n_depth", 0))
     par = int(f.get("parallel", cfg.parallel))
     sampler = VRAMSampler().__enter__() if cfg.measure_vram else None
-    status, pp, tg, problem = "OK", 0.0, 0.0, None
+    status, pp, tg, problem, draft = "OK", 0.0, 0.0, None, {}
     try:
-        pp, tg, problem = session.measure(prompt_len, cfg.n_gen, par, cfg.reps, timeout)
+        pp, tg, problem, draft = session.measure(
+            prompt_len, cfg.n_gen, par, cfg.reps, timeout)
     except (urllib.error.URLError, OSError, json.JSONDecodeError):
         status = "ERROR"
     finally:
@@ -2149,6 +2239,8 @@ def measure_in_session(cfg: Config, f: dict, session, timeout: int) -> dict:
             sampler.__exit__()
     res = {"status": status, "pp_tps": pp, "tg_tps": tg,
            "secs": time.time() - t0, "vram_mib": sampler.peak if sampler else 0}
+    if status == "OK":                     # speculative telemetry (F1) — a
+        res.update(draft_cols(cfg, f, draft))  # diagnostic: never sets status
     if status == "OK" and problem:         # the wall-clock cross-check (I5)
         res.update(status="IMPLAUSIBLE", implausible=problem,
                    pp_tps=0.0, tg_tps=0.0)
@@ -3149,6 +3241,47 @@ def selftest() -> bool:
         refined["spec_n_max"] = refine_numeric([1, 2, 3, 4, 6], 2)
         refined["batch_ratio"] = refine_numeric([1, 4, 16], 1)
         assert _assert_grid_cannot_invert(refined, cfg_mtp) > 0
+
+        # --- speculative telemetry (docs/field-reports.md, F1) ---
+        # Acceptance sums over the measured responses.
+        assert _draft_totals([{"draft_n": 10, "draft_n_accepted": 6},
+                              {"draft_n": 10, "draft_n_accepted": 4}]) == \
+            {"drafted": 20, "accepted": 10}
+        assert draft_cols(cfg_mtp, {"mtp": "1"},
+                          {"drafted": 20, "accepted": 10}) == {"draft_acc": 0.5}
+        # A drafted-but-never-accepted run is a real (bad) result, not the guard:
+        # speculation ran, it just never paid. Conflating the two would hide the
+        # one case we most want to see.
+        assert draft_cols(cfg_mtp, {"mtp": "1"},
+                          {"drafted": 40, "accepted": 0}) == {"draft_acc": 0.0}
+        # llama.cpp omits BOTH keys when no draft ran, so their absence is the
+        # signal and must never be read as "0 tokens drafted".
+        assert _draft_totals([{"predicted_n": 64}, {"predicted_n": 64}]) == {}
+        # Asked for speculation, drafted nothing: the issue-#8 shape. Flagged,
+        # but the measurement stays real — draft_cols returns no status.
+        assert draft_cols(cfg_mtp, {"mtp": "1"}, {}) == {"spec_off": 1}
+        assert draft_cols(cfg_mtp, {"mtp": "0"}, {}) == {}
+        # The gate is not always a factor. MTP fixed-on (NextN head, no --no-mtp)
+        # is the common case, and reading only the assignment would miss it.
+        assert draft_cols(cfg_mtp, {"ngl": "32"}, {}) == {"spec_off": 1}
+        cfg_nospec = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
+                            ctx_floor=8192, driver="server",
+                            hw={**hw_d, "n_nextn": 0})
+        assert draft_cols(cfg_nospec, {"ngl": "32"}, {}) == {}
+        assert draft_cols(cfg_nospec, {"ngram": "ngram-mod"}, {}) == {"spec_off": 1}
+        # Columns appear only where a draft is possible at all (no inert columns).
+        cfg_sc = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
+                        ctx_floor=8192, driver="server", hw=dict(hw_d))
+        cfg_sc.factors = build_factors(cfg_sc)
+        assert spec_cols_wanted(cfg_sc)
+        cfg_nospec.factors = build_factors(cfg_nospec)
+        assert not spec_cols_wanted(cfg_nospec)
+        cfg_bn = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
+                        ctx_floor=8192, driver="bench", hw=dict(hw_d))
+        cfg_bn.factors = build_factors(cfg_bn)
+        assert not spec_cols_wanted(cfg_bn)      # bench cannot speculate
+        # A telemetry column is never mistaken for a factor column by the report.
+        assert "draft_acc" in RESULT_COLS and "spec_off" in RESULT_COLS
         # llama-bench has no --fit; emitting one makes it exit non-zero, which
         # would fail every bench run. Verified against the binary: it answers
         # "error: invalid parameter for argument: --no-fit".
@@ -3882,19 +4015,21 @@ def selftest() -> bool:
         # measure; keep them small.
         _real_completion = _completion
         try:
-            def _fake(per_second):
+            def _fake(per_second, draft=None):
                 def f(port, prompt, n_gen, timeout, cache=False):
                     time.sleep(0.02)
-                    return {"content": "x",
-                            "timings": {"prompt_per_second": 444.1,
-                                        "predicted_per_second": per_second,
-                                        "predicted_n": 128, "prompt_n": 8192}}
+                    t = {"prompt_per_second": 444.1,
+                         "predicted_per_second": per_second,
+                         "predicted_n": 128, "prompt_n": 8192}
+                    t.update(draft or {})     # llama.cpp adds these only when
+                    return {"content": "x", "timings": t}   # a draft ran (F1)
                 return f
 
             sess = ServerSession.__new__(ServerSession)   # no server launched
             sess.port, sess.ok, sess.err = 1, True, ""
             fake_cfg = SimpleNamespace(n_prompt=0, n_gen=128, parallel=1, reps=1,
-                                       measure_vram=False, factors={})
+                                       measure_vram=False, factors={},
+                                       emit_mtp=False, ngram=False, hw={})
 
             globals()["_completion"] = _fake(1_000_000.0)
             r_bad = measure_in_session(fake_cfg, {"n_depth": "8192"}, sess, 30)
@@ -3905,6 +4040,27 @@ def selftest() -> bool:
             r_ok = measure_in_session(fake_cfg, {"n_depth": "8192"}, sess, 30)
             assert r_ok["status"] == "OK", r_ok
             assert r_ok["tg_tps"] == 600.0
+            assert "draft_acc" not in r_ok and "spec_off" not in r_ok, r_ok
+
+            # Same wiring for the speculative telemetry (F1): the counters must
+            # survive the trip from the response through measure() into the row.
+            spec_cfg = SimpleNamespace(n_prompt=0, n_gen=128, parallel=1, reps=1,
+                                       measure_vram=False, factors={},
+                                       emit_mtp=True, ngram=False,
+                                       hw={"n_nextn": 1})
+            globals()["_completion"] = _fake(600.0, {"draft_n": 40,
+                                                     "draft_n_accepted": 26})
+            r_spec = measure_in_session(spec_cfg, {"mtp": "1"}, sess, 30)
+            assert r_spec["status"] == "OK", r_spec
+            assert r_spec["draft_acc"] == 0.65, r_spec
+            assert "spec_off" not in r_spec, r_spec
+
+            # and the guard: MTP asked for, no draft counters in any response
+            globals()["_completion"] = _fake(600.0)
+            r_off = measure_in_session(spec_cfg, {"mtp": "1"}, sess, 30)
+            assert r_off["spec_off"] == 1, r_off
+            assert r_off["status"] == "OK" and r_off["tg_tps"] == 600.0, r_off
+            assert "draft_acc" not in r_off, r_off
 
             # an error payload is a failure, not a zero-time measurement, and
             # the raise it produces is what measure_in_session turns into ERROR
@@ -4144,7 +4300,7 @@ def load_results_csv(path: Path, factors: dict) -> list[dict]:
 # results-CSV columns that are measurements/bookkeeping; everything else in a
 # header is a factor column (must match the writer's `cols` in main)
 RESULT_COLS = {"run_id", "pp_tps", "tg_tps", "eff_tps", "status", "secs",
-               "temp_c", "vram_mib", "implausible"}
+               "temp_c", "vram_mib", "implausible", "draft_acc", "spec_off"}
 
 
 def merge_result_rows(cfg: Config, rows: list[dict],
@@ -5311,7 +5467,8 @@ def main():
     abs_cols = [derived_abs_name(n) for n in derived_names(cfg.factors)]
     cols = (["run_id"] + list(cfg.factors.keys()) + abs_cols
             + ["pp_tps", "tg_tps", "eff_tps", "status", "secs", "temp_c"]
-            + (["vram_mib"] if cfg.measure_vram else []))
+            + (["vram_mib"] if cfg.measure_vram else [])
+            + (["draft_acc", "spec_off"] if spec_cols_wanted(cfg) else []))
 
     # Resume keys on run_id (unique per array row), not config values, because
     # orthogonal arrays can repeat a config across rows (intentional replication).
@@ -5478,6 +5635,9 @@ def main():
                           f"ETA ~{fmt_dur(eta)}]", flush=True)
                     if res.get("implausible"):      # P4: never discard quietly
                         print(f"  discarded: {res['implausible']}", flush=True)
+                    if res.get("spec_off"):        # F1: the row is not measuring
+                        print("  speculation did not run: this config asks for "
+                              "it, but llama.cpp drafted no tokens", flush=True)
                     if i < len(runs):                  # settle before the next run
                         if thermal_wait and thermal_baseline is not None:
                             wait_until_cool(thermal_baseline)

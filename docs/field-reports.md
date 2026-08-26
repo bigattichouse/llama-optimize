@@ -98,10 +98,34 @@ their gains (int4 draft head, NVFP4 draft weights, an explicit 8 GB KV pin). On 
 VRAM, and that trade is a *placement* decision.
 
 `--spec-draft-ngl` (`-ngld`, `common/arg.cpp` ~line 4112) is llama.cpp's version
-and is absent from `FACTORS`. We sweep four MTP knobs but not where the draft
-model sits. This was already on the known-gaps list; two independent tuned setups
-choosing to spend effort exactly there is the argument for promoting it. It is an
-ordinary scalar numeric factor — no new mechanism needed, unlike F3.
+and is absent from `FACTORS`, so promoting it looked like an ordinary scalar
+factor and no new mechanism.
+
+**It would be an inert column, and this is why.** Tracing the flag through
+llama.cpp (checkout `1d2869c6e`) it is consumed in exactly one place:
+`common_base_params_to_speculative` copies `params_spec.n_gpu_layers` into the
+draft context's params **only inside `if (has_draft)`**
+(`common/speculative.cpp` ~2318), and `has_draft` is
+`params.speculative.has_dft()` — true only when a separate draft model path
+(`-md`) was given.
+
+We never pass `-md`. Our speculation is MTP against the target model's own NextN
+head, which takes the other branch of
+`common_speculative_init_result`: `llama_init_from_model(model_tgt, cparams)`
+(`common/speculative.cpp` ~2405) reuses the already-loaded target model, so there
+is no second model to place and nothing for `-ngld` to move. Sweeping it would
+add a column whose every level produces an identical run — the "no inert columns"
+defect ([`multi-gpu-design.md`](multi-gpu-design.md), M1), and worse than an
+omission because a null main effect would read as "draft placement doesn't
+matter" rather than "we never tested it".
+
+So F2 is **blocked on a prerequisite, not merely unimplemented**: it needs a
+draft-model input (`-md`) before `-ngld` means anything, and a draft model is a
+*model-selection* decision — a second GGUF the user supplies — not a tuning knob
+we can derive. Worth revisiting if a `--draft-model` input is ever added; the
+vLLM evidence for it being a real lever stands, it just does not reach our
+configuration surface yet. Recorded in place of the entry, so the next reader
+does not re-derive the same dead end from the same two repos.
 
 ## F3 — The `-ts` optimum sits well off VRAM-proportional
 
@@ -174,13 +198,15 @@ that card will hit *before* they can run a sweep at all.
 
 ## Checklist
 
-- [ ] **F1** — parse `draft_n` / `draft_n_accepted` from the `timings` dict in
-      `ServerDriver.measure`; carry acceptance rate into the results CSV
-- [ ] **F1** — flag rows where a speculative factor is on but `draft_n` is absent
-      ("speculation did not run"), and cover it in `--selftest` with a synthetic
-      response payload — no GPU needed
-- [ ] **F2** — `--spec-draft-ngl` registry entry, conditional on the speculation
-      gate the way the ngram knobs are
+- [x] **F1** — `draft_acc` column: `_draft_totals` sums `draft_n` /
+      `draft_n_accepted` over the measured reps in `ServerSession.measure`
+- [x] **F1** — `spec_off` flag for a run that asked for speculation and drafted
+      nothing, covered in `--selftest` against a synthetic response payload
+      (no GPU). Note the gate is often *not* a factor — `build_server_args`
+      emits MTP fixed-on — so the check reads the config, not just the row
+- [x] **F2** — investigated and **rejected**: `-ngld` is inert without a `-md`
+      draft model, which we never pass. Blocked on a draft-model input, not on
+      the factor entry (see above)
 - [ ] **F3** — fold the `1,4`-on-1:2 datapoint into `ts_levels()` span selection
       when [`multi-gpu-design.md`](multi-gpu-design.md) is implemented; keep the
       single-device configuration reachable

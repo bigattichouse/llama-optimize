@@ -74,20 +74,19 @@ GitHub Action running the selftest on push/PR, plus a binding smoke test
 (builds the submodule, exercises L25/L125 generation and the analyzer — the
 paths the selftest deliberately skips).
 
-## 7. Speculative-decoding telemetry
+## 7. ~~Speculative-decoding telemetry~~ — done
 
-We sweep six speculative factors and record nothing about whether the drafter was
-actually accepted. llama.cpp already returns `draft_n` / `draft_n_accepted` in the
-`timings` dict that `ServerDriver.measure` reads for `predicted_per_second` — the
-data is free, we discard it.
+We swept six speculative factors while recording nothing about whether the
+drafter was ever accepted. llama.cpp hands both counters to us in the same
+`timings` block `ServerSession.measure` already reads for the throughput rate.
 
-- Carry acceptance rate into the CSV so a speculative result can be explained.
-- llama.cpp emits those keys only when a draft ran, so their **absence** flags a
-  row where speculation was silently off — the issue #8 failure class that
-  `docs/CONSTRAINED-FACTORS.md` closes by construction. This is the independent
-  check that the construction held.
-- Testable in `--selftest` against a synthetic response payload; no GPU needed.
-- Background: [`docs/field-reports.md`](docs/field-reports.md), F1.
+Landed: a `draft_acc` column (accepted/drafted over the measured reps), plus a
+`spec_off` flag for a run that asked for speculation and drafted nothing — the
+issue #8 failure class that `docs/CONSTRAINED-FACTORS.md` closes by construction,
+now independently checked rather than assumed. It is a flag, never a status: the
+measurement is real, it just isn't measuring what its factor column claims. Both
+columns appear only where a draft is possible at all. Background:
+[`docs/field-reports.md`](docs/field-reports.md), F1.
 
 ## Small cleanups
 
