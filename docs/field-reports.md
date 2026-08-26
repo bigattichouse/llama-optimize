@@ -23,7 +23,8 @@ The risk is copying a number instead of a question. So:
 
 ## Sources
 
-Collected 2026-08-25 (was `faster-inference-qwen.txt` at the repo root).
+Collected 2026-08-25 (was `faster-inference-qwen.txt` at the repo root), plus
+a tuning *method* added 2026-08-26 — see F6.
 
 | Source | Engine | Hardware | Headline |
 |---|---|---|---|
@@ -207,6 +208,83 @@ and better than double its honest throughput. The workload gap is not only
 hiding a knob; it has been actively distorting one we already ship. Worth noting that
 the `agents` profile (8192-token prompts, 32768 ctx floor) is exactly where a
 long shared system prompt would live in practice.
+
+## F6 — A Bayesian autotuner, and what a different search method teaches
+
+[SergioMorillas/vllm-bayesian-autotuner](https://github.com/SergioMorillas/vllm-bayesian-autotuner)
+is the odd one out here: not a tuned *configuration* but a tuning *method* — Optuna
+TPE over a 24-dimensional vLLM configuration space, 50–100 trials, with random
+search as the baseline. Its `docs/` are unusually explicit about methodology
+(mostly Spanish), which is what makes it worth reading rather than just noting.
+
+**It reports the honest negative result.** On complex spaces TPE beats random by
++5.4% objective / +3.1% peak throughput; on a simpler 6-dimensional space the
+advantage collapses to +0.4% — a tie. Their reading is that "the advantage of
+Bayesian optimization grows with configuration-space complexity."
+
+That is a useful calibration rather than a threat. Our surviving factor count
+after Morris screening is single digits, which is exactly where their own data
+says BO buys ~nothing over much simpler search. It also marks where the argument
+would change: if `--factor` counts ever ran to twenty-plus *without* screening,
+their result says a surrogate would start to pay.
+
+The deeper difference is what the two methods return.
+[`DESIGN.md`](DESIGN.md) exists because a Taguchi array yields **per-knob main
+effects** and Morris yields **μ\* and σ** — which knob matters, and whether its
+effect depends on the others. BO returns a good point and a surrogate that is not
+meant to be read. For a tool whose output is "here is the command, and here is
+which knobs mattered on your box", attribution is not a nice-to-have; it is half
+the product. Neither method dominates — they answer different questions.
+
+### Independent convergence on our own invariants
+
+Two of their design decisions are ours arrived at from the other direction, which
+is the strongest evidence available that the principles are real and not just
+house style:
+
+- **Conditional sampling.** Mamba parameters are sampled *only* when prefix
+  caching is on, explicitly to avoid "poisoning the surrogate on phantom
+  configurations". That is [`CONDITIONAL-FACTORS.md`](CONDITIONAL-FACTORS.md)'s
+  I2/I3 restated in Bayesian terms: an inactive parameter must not participate,
+  or it corrupts the model of every other parameter.
+- **Inactive dimensions emit no flag** and retain engine defaults — the same rule
+  as our `is_active` emission gate.
+
+Where we differ is in *how* an invalid combination is prevented. They **prune**
+(discard the trial) or **repair** (force to feasible). We **derive**, so the
+invalid assignment cannot be constructed at all
+([`CONSTRAINED-FACTORS.md`](CONSTRAINED-FACTORS.md)). Ours needs no runtime check
+and cannot be forgotten at a new call site, but it only works where the
+constraint is a simple ordering; their repair strategy covers constraints ours
+cannot express, and is worth remembering if a future factor pair is messier than
+`b >= ub`.
+
+### What is worth taking
+
+**Their memory model is our OOM pruner, already specified.** ROADMAP item 2 asks
+for a predictive VRAM footprint and has been blocked on what to actually sum.
+They sum six terms — model weights, KV cache, Mamba state, CUDA-graph capture
+overhead, activations, and a safety margin — against two inequalities: total
+within `gpu_memory_utilization × VRAM`, and total plus driver context within
+physical VRAM. Deliberately first-order additive rather than empirical,
+*because* a conservative estimate is the point. That matches our own standard for
+the pruner exactly ("a wrongly-skipped viable config is worse than a wasted OOM
+run"), and it is a blueprint rather than an idea. The llama.cpp translation drops
+Mamba and CUDA graphs, keeps weights/KV/activations/margin, and gains the
+partial-offload split that has no vLLM analogue.
+
+**Objectives we do not measure.** Their multi-objective mode runs NSGA-II over up
+to seven axes: throughput, context, latency, goodput, TTFT, TPOT, and
+**tokens/joule**. Our Pareto is two axes (context vs tg). TTFT is already ROADMAP
+item 5 and currently *derived* rather than measured; TPOT and goodput are cheap
+once per-request timings are recorded, which F1 now does. Energy is a genuinely
+new axis and an interesting one on an MI50, where the thermal ceiling is already
+the dominant noise source.
+
+**A designed prompt battery.** They have a whole document on it
+(`06-diseno-bateria-prompts.md`). We send one identical prompt for every rep,
+which F4 established is not a neutral choice but an active distortion. Worth
+reading before building `--prefix-reuse`.
 
 ## F5 — Legacy/mixed-vendor builds (recorded, out of scope)
 

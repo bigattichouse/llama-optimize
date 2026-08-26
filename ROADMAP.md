@@ -3,6 +3,10 @@
 Improvement ideas, roughly ordered by expected value. Items get checked off (and
 their design notes trimmed) as they land.
 
+**Picking up mid-stream?** [`docs/NEXT-SESSION.md`](docs/NEXT-SESSION.md) is the
+working handoff: what is in flight, what is blocked on what, and what has already
+been verified so you do not re-check it.
+
 ## 1. Noise-aware picks — partially done
 
 Landed: `--verify-picks` (default on, 2 extra reps; `--full`=3) re-measures the
@@ -160,6 +164,18 @@ orthogonal array as free columns. Worse than the audit said: single-stream
 sweeps silently run 4 auto slots with unified KV, concurrency sweeps never see
 unified at all, and `parallel = auto` is not expressible. Design:
 [`docs/concurrency-kv-design.md`](docs/concurrency-kv-design.md).
+
+## 14. Objectives we do not measure
+
+From a Bayesian vLLM autotuner ([`docs/field-reports.md`](docs/field-reports.md),
+F6), which runs NSGA-II over up to seven axes against our two. Measured TTFT is
+already item 5; TPOT and goodput are cheap now that per-request timings are
+recorded (item 7). **tokens/joule** is the genuinely new one, and interesting on a
+card whose thermal ceiling is already the dominant noise source.
+
+The same source also specifies the memory model item 2 has been blocked on:
+weights + KV + state + graph overhead + activations + margin, against a usable
+pool and a hard VRAM limit, deliberately first-order so it stays conservative.
 
 ## Small cleanups
 

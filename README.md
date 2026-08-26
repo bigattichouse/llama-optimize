@@ -121,6 +121,17 @@ straight to Taguchi, and `--screen --iterate N --confirm` runs the whole funnel.
 (**Sobol** variance attribution was considered and dropped — see Roadmap; Morris `σ`
 already flags interactions cheaply.)
 
+**Why not Bayesian optimization?** It's a reasonable alternative and a
+[vLLM autotuner](https://github.com/SergioMorillas/vllm-bayesian-autotuner) does
+exactly that with Optuna TPE. Its own published numbers are the argument for our
+choice at this scale: TPE beats random search by +5.4% on a complex
+24-dimensional space, but by only **+0.4% — a tie — on a 6-dimensional one**, and
+after Morris screening our surviving factor count is single digits. The other half
+of the reason is what each method *returns*: a Taguchi array gives per-knob main
+effects and Morris gives μ\*/σ, so the report can say **which** knobs mattered and
+whether they interact. BO returns a good point and a surrogate not meant to be
+read. Fuller comparison in [`docs/field-reports.md`](docs/field-reports.md) (F6).
+
 ---
 
 ## What it tunes
