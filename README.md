@@ -739,6 +739,12 @@ python3 llama-optimize.py model-UD.gguf --run --driver server \
   with each row's start temp recorded (`temp_c`); **pick verification**
   (`--verify-picks`, default on) re-measures the final picks and reports medians
   with the observed spread, so the headline number isn't one lucky rep.
+- **Known caveat — ngram results are upper bounds.** n-gram speculation keeps
+  state across requests, and the sweep currently sends one identical prompt per
+  rep, which drives acceptance to 100%. Measured at 2.3-3.4x inflation against
+  distinct prompts. `-ngl`, threads, batch and KV results are unaffected; MTP
+  very likely is too, but that has not been measured. Fix in progress — see
+  [`docs/workload-shape-design.md`](docs/workload-shape-design.md).
 - **The build is checked before the sweep** — a llama.cpp without a GPU backend
   reports plausible CPU numbers instead of failing, which would make every `-ngl`
   level the same run. If a vendor tool sees a card llama.cpp cannot, you get a

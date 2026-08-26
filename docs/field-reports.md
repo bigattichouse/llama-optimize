@@ -198,7 +198,13 @@ workload defect rather than a registry gap:
 
 So this is a **workload gap first, a factor gap second**, and the ordering
 matters: the factor is worthless without traffic that can move it. Design and
-checklist: [`workload-shape-design.md`](workload-shape-design.md). Worth noting that
+checklist: [`workload-shape-design.md`](workload-shape-design.md).
+
+Chasing this turned up something worse than a missing capability. Because every
+request in a sweep is byte-identical, n-gram speculation — which feeds on
+repetition and keeps state across requests — has been measured at 100% acceptance
+and better than double its honest throughput. The workload gap is not only
+hiding a knob; it has been actively distorting one we already ship. Worth noting that
 the `agents` profile (8192-token prompts, 32768 ctx floor) is exactly where a
 long shared system prompt would live in practice.
 

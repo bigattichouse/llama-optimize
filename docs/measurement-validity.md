@@ -190,6 +190,36 @@ The warning names both causes it cannot separate — a missing backend and a GPU
 hidden by `HIP_VISIBLE_DEVICES`/`CUDA_VISIBLE_DEVICES` — because guessing between
 them would send half of readers down the wrong path.
 
+## The harness can create the effect it measures
+
+A sibling of the section above, and the subtler of the two. There the *build*
+answered a different question than the one asked; here the *request shape* does.
+
+`ServerSession.measure` sends one identical prompt for the warm request and every
+rep, deliberately: it keeps the prefill out of the measured window so a rep is
+pure decode. That is sound for `-ngl` or `-ub`, which do not care what the tokens
+say. It is not sound for any parameter that feeds on repetition — and n-gram
+speculation is exactly that.
+
+Measured 2026-08-26: on a repeated prompt, ngram reaches 100% draft acceptance and
+better than doubles tg; on distinct prompts it never drafts at all. The full table
+and consequences are in
+[`workload-shape-design.md`](workload-shape-design.md). The harness was not
+measuring ngram's value — it was manufacturing the conditions under which ngram
+looks best, then reporting the result.
+
+The lesson generalises past ngram: **a measurement is only valid for the request
+shape it was taken under, and the harness's shape is a choice, not a neutral
+default.** A factor whose payoff depends on how requests relate to each other
+cannot be measured by a loop that sends the same request every time — it will
+read as either free or worthless depending on which way the loop happens to
+lean, and both readings will be reproducible.
+
+There is no check that catches this class automatically the way `gpu_visibility`
+catches a CPU-only build; it was caught because `draft_acc` recorded acceptance
+and the number was implausibly perfect. That is the argument for recording
+diagnostics you do not yet know you need.
+
 ## What this does not do
 
 It does not explain *why* generation returned early on the reporter's

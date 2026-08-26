@@ -105,20 +105,59 @@ gated on a non-zero `--prefix-reuse`, the same way draft factors gate on a draft
 model ([`draft-model-design.md`](draft-model-design.md), DM1). At reuse 0 they
 would be columns whose every level gives an identical run.
 
-## An open question this raises about existing results
+## Confirmed: every ngram measurement so far was taken in a regime real traffic does not reproduce
 
-`--spec-type ngram-*` variants speculate from repetition in the context. Every
-rep of every sweep so far has sent a byte-identical prompt, and at temperature 0
-generates byte-identical output. If any n-gram state survives between requests on
-a slot, measured ngram acceptance is inflated relative to real traffic, and the
-ngram screen has been grading on a curve.
+This started as an open question — n-gram speculation feeds on repetition, every
+rep of every sweep has sent a byte-identical prompt, so *if* n-gram state survives
+between requests, measured acceptance is inflated and the ngram screen has been
+grading on a curve.
 
-This is a question, not a finding — it depends on whether the n-gram structures
-are per-request or per-slot in llama.cpp, which has not been checked. It is worth
-checking before the shape work lands, because if it is true then `--prefix-reuse`
-is not only a new capability but a correction, and the existing ngram
-recommendations deserve re-measuring. `draft_acc` (F1) is now recorded, so the
-before/after is directly observable rather than inferred.
+Measured on 2026-08-26 (gemma-3-270m-it-Q8_0, ROCm, `--spec-type ngram-mod`,
+`temperature 0`, `cache_prompt: true` — the harness's own request shape). Three
+identical requests in a row, then three distinct ones:
+
+| request | `draft_n` | accepted | tg t/s |
+|---|---|---|---|
+| identical prompt, 1st | *absent* | — | 273 |
+| identical prompt, 2nd | 53 | 53 (100%) | **601** |
+| identical prompt, 3rd | 53 | 53 (100%) | **578** |
+| distinct prompt A | *absent* | — | 176 |
+| distinct prompt B | *absent* | — | 259 |
+| distinct prompt C | *absent* | — | 236 |
+
+State persists across requests, and the effect is not subtle. On a repeated
+prompt the drafter reaches **100% acceptance** and better than doubles throughput.
+On genuinely distinct prompts it **never drafts at all**.
+
+**This maps exactly onto `ServerSession.measure`.** It issues a warm request and
+then `reps` more, all with the same prompt. The warm request is row 1 above — cold
+state, no speculation, and discarded. Every *measured* rep is row 2 or later, in
+the saturated regime. So the numbers behind every ngram result this tool has
+produced sit at a ceiling that a real workload reaches only when it re-sends
+prompts verbatim.
+
+Two consequences, and the second is worse than the first:
+
+- **ngram-vs-off is inflated**, by something like 2.3-3.4x on this model. That is
+  the comparison users actually act on.
+- **ngram-variant-vs-variant is compressed.** Every variant saturates at 100%, so
+  the screen that picks between `ngram-simple`, `ngram-mod`, `ngram-map-k` and
+  `ngram-map-k4v` has been ranking configurations at a shared ceiling, where the
+  differences it is trying to resolve cannot appear.
+
+MTP is very likely unaffected — it drafts from the model's own NextN head rather
+than from context n-grams — but that has not been measured and should not be
+assumed.
+
+**This turns `--prefix-reuse` from a capability into a correction.** The shape
+input is no longer only "let users describe their traffic"; it is the mechanism
+by which ngram gets measured honestly at all. Until it lands, ngram findings
+should be treated as upper bounds, not estimates.
+
+Worth noting how this was found: `draft_acc` ([`field-reports.md`](field-reports.md)
+F1) had been recording for less than a day. The absent-`draft_n` signal — the one
+built to catch a *config* that silently did not speculate — is what made a
+*harness* that silently over-speculates visible in a single six-request run.
 
 ## Cost
 
@@ -157,8 +196,11 @@ dimension and should not be smuggled into the first one.
       limit deletes configs silently
 - [ ] `--cache-reuse` registry entry, gated on non-zero reuse (W-I3)
 - [ ] `--cache-ram` and a rotating-conversation shape — separate, later
-- [ ] Check whether n-gram state survives across requests; if so, re-measure the
-      ngram screen and say so in the report
+- [x] Check whether n-gram state survives across requests — **it does**, and the
+      distortion is 2.3-3.4x (table above)
+- [ ] Re-measure the ngram screen under distinct prompts once `--prefix-reuse`
+      lands, and say plainly in the report that earlier ngram numbers were upper
+      bounds
 - [ ] `--selftest`: generator produces a byte-identical prefix and distinct
       suffixes; the gate keeps cache factors out of the design at reuse 0; the
       revised validity limit accepts a plausible high-reuse row and still rejects

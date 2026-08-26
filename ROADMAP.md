@@ -95,13 +95,21 @@ surface — `-ngld`, `-ctkd`/`-ctvd`, `-ncmoed`, the `draft-simple`/`draft-dflas
 spec types — is unaskable. Design and checklist:
 [`docs/draft-model-design.md`](docs/draft-model-design.md).
 
-## 9. Workload shape
+## 9. Workload shape — now a correctness fix, not a feature
 
 Every request a sweep issues is byte-identical, so any parameter whose payoff
-depends on how requests *relate* (prefix caching above all) measures zero by
-construction. Shape is an input describing the user's traffic, not a factor to
-optimize. Design and checklist:
-[`docs/workload-shape-design.md`](docs/workload-shape-design.md).
+depends on how requests *relate* measures zero by construction — prefix caching
+above all. Shape is an input describing the user's traffic, not a factor to
+optimize.
+
+Measured 2026-08-26, this is worse than a gap. n-gram speculation keeps state
+across requests, so a repeated prompt drives it to **100% draft acceptance and
+2.3-3.4x the honest throughput**; on distinct prompts it never drafts at all.
+Every ngram number this tool has produced was taken in that saturated regime:
+ngram-vs-off is inflated, and the variant screen has been ranking configurations
+at a shared ceiling where the differences it exists to resolve cannot appear.
+Until `--prefix-reuse` lands, ngram results are upper bounds. Design, data and
+checklist: [`docs/workload-shape-design.md`](docs/workload-shape-design.md).
 
 ## 10. Flag coverage — two live defects
 
