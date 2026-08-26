@@ -88,6 +88,21 @@ measurement is real, it just isn't measuring what its factor column claims. Both
 columns appear only where a draft is possible at all. Background:
 [`docs/field-reports.md`](docs/field-reports.md), F1.
 
+## 8. Draft-model tuning
+
+We accept no `-md`, so for anyone who owns a draft model the entire draft-side
+surface — `-ngld`, `-ctkd`/`-ctvd`, `-ncmoed`, the `draft-simple`/`draft-dflash`
+spec types — is unaskable. Design and checklist:
+[`docs/draft-model-design.md`](docs/draft-model-design.md).
+
+## 9. Workload shape
+
+Every request a sweep issues is byte-identical, so any parameter whose payoff
+depends on how requests *relate* (prefix caching above all) measures zero by
+construction. Shape is an input describing the user's traffic, not a factor to
+optimize. Design and checklist:
+[`docs/workload-shape-design.md`](docs/workload-shape-design.md).
+
 ## Small cleanups
 
 - ~~`--merge-results` rows aren't deduplicated against the current pass~~ —

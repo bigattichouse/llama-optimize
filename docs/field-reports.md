@@ -90,42 +90,59 @@ has to the server's self-reported rate in
 [`measurement-validity.md`](measurement-validity.md): a number the component
 cannot fake because it does not produce it.
 
-## F2 — Where the draft model lives is a first-class knob
+## F2 — The draft-side surface is a mirror we cannot reach yet
 
 Both vLLM repos put the drafter's placement and quantization at the centre of
 their gains (int4 draft head, NVFP4 draft weights, an explicit 8 GB KV pin). On a
-24 GB card the draft model is in direct competition with the target model for
-VRAM, and that trade is a *placement* decision.
+24 GB card the draft model competes directly with the target model for VRAM, and
+that trade is a *placement* decision — exactly the kind this tool exists to
+measure.
 
-`--spec-draft-ngl` (`-ngld`, `common/arg.cpp` ~line 4112) is llama.cpp's version
-and is absent from `FACTORS`, so promoting it looked like an ordinary scalar
-factor and no new mechanism.
+`--spec-draft-ngl` (`-ngld`) is llama.cpp's version and is absent from `FACTORS`,
+so promoting it looked like an ordinary scalar factor and no new mechanism.
 
-**It would be an inert column, and this is why.** Tracing the flag through
-llama.cpp (checkout `1d2869c6e`) it is consumed in exactly one place:
+**It is inert without a draft model.** Traced through llama.cpp (checkout
+`1d2869c6e`), the flag is consumed in one place:
 `common_base_params_to_speculative` copies `params_spec.n_gpu_layers` into the
 draft context's params **only inside `if (has_draft)`**
-(`common/speculative.cpp` ~2318), and `has_draft` is
-`params.speculative.has_dft()` — true only when a separate draft model path
-(`-md`) was given.
+(`common/speculative.cpp` ~2318), where `has_draft` is
+`params.speculative.has_dft()` — simply "was a `-md` path given"
+(`common/common.h:382`). With no `-md`, MTP takes the other branch of
+`common_speculative_init_result` and builds the draft context from the
+already-loaded target model (`llama_init_from_model(model_tgt, cparams)`,
+~2405). No second model, nothing for `-ngld` to place.
 
-We never pass `-md`. Our speculation is MTP against the target model's own NextN
-head, which takes the other branch of
-`common_speculative_init_result`: `llama_init_from_model(model_tgt, cparams)`
-(`common/speculative.cpp` ~2405) reuses the already-loaded target model, so there
-is no second model to place and nothing for `-ngld` to move. Sweeping it would
-add a column whose every level produces an identical run — the "no inert columns"
-defect ([`multi-gpu-design.md`](multi-gpu-design.md), M1), and worse than an
-omission because a null main effect would read as "draft placement doesn't
-matter" rather than "we never tested it".
+**But "we never pass `-md`" is a fact about this tool, not about llama.cpp.** The
+first draft of this note treated it as a reason to drop the factor; that was
+scoped to the machine it was written on. Nothing stops a user from owning a draft
+model, and a tuning tool that cannot ask their question is the gap, not their
+setup. The correct reading is the opposite one: **`-md` is a missing *input*, and
+adding it unlocks a whole factor family we currently cannot express.**
 
-So F2 is **blocked on a prerequisite, not merely unimplemented**: it needs a
-draft-model input (`-md`) before `-ngld` means anything, and a draft model is a
-*model-selection* decision — a second GGUF the user supplies — not a tuning knob
-we can derive. Worth revisiting if a `--draft-model` input is ever added; the
-vLLM evidence for it being a real lever stands, it just does not reach our
-configuration surface yet. Recorded in place of the entry, so the next reader
-does not re-derive the same dead end from the same two repos.
+That family is close to a complete mirror of the target-side registry
+(`common/arg.cpp` ~3896-4131):
+
+| target factor | target flag | draft twin |
+|---|---|---|
+| `ngl` | `-ngl` | `-ngld` |
+| `kv_type` | `-ctk` / `-ctv` | `-ctkd` / `-ctvd` |
+| `ncmoe` | `-ncmoe` | `-ncmoed` |
+| `ot` | `-ot` | `-otd` |
+| `threads` | `-t` | `-td` |
+| `threads_batch` | `-tb` | `-tbd` |
+| `cpu_mask` / `cpu_range` / `cpu_strict` | `-C` / `-Cr` / `--cpu-strict` | `-Cd` / `-Crd` / `--spec-draft-cpu-strict` |
+| `poll` | `--poll` | `--spec-draft-poll` |
+| (multi-GPU, planned) | `--device` | `-devd` |
+
+There is no `--spec-draft-head`: the int4 draft-head requantization in the vLLM
+sources is a model-artifact change, not a flag. What llama.cpp does have is the
+`--spec-type` family — `draft-simple`, `draft-eagle3`, `draft-dflash`,
+`draft-dspark` (`common/speculative.cpp:34-38`) — all of which need `-md` and are
+therefore invisible to us today. `draft-dflash`/`draft-dspark` are the direct
+llama.cpp analogue of the DFlash2 drafter in the NVFP4 source, so the one thing
+that source is *about* is reachable here, just not by us yet.
+
+Design and checklist: [`draft-model-design.md`](draft-model-design.md).
 
 ## F3 — The `-ts` optimum sits well off VRAM-proportional
 
@@ -178,8 +195,9 @@ workload defect rather than a registry gap:
   shared-prefix-with-varying-suffix workload, which is the shape that makes it pay
   — and the shape real agent and app traffic actually has.
 
-So this is a **profile gap first, a factor gap second**, and the ordering matters:
-the factor is worthless without a workload that can move it. Worth noting that
+So this is a **workload gap first, a factor gap second**, and the ordering
+matters: the factor is worthless without traffic that can move it. Design and
+checklist: [`workload-shape-design.md`](workload-shape-design.md). Worth noting that
 the `agents` profile (8192-token prompts, 32768 ctx floor) is exactly where a
 long shared system prompt would live in practice.
 
@@ -204,11 +222,15 @@ that card will hit *before* they can run a sweep at all.
       nothing, covered in `--selftest` against a synthetic response payload
       (no GPU). Note the gate is often *not* a factor — `build_server_args`
       emits MTP fixed-on — so the check reads the config, not just the row
-- [x] **F2** — investigated and **rejected**: `-ngld` is inert without a `-md`
-      draft model, which we never pass. Blocked on a draft-model input, not on
-      the factor entry (see above)
+- [ ] **F2** — a `--draft-model` input, then the draft-side mirror as conditional
+      factors gated on it ([`draft-model-design.md`](draft-model-design.md)).
+      `-ngld` alone was the wrong unit of work: inert without `-md`, and one of a
+      dozen twins once `-md` exists
 - [ ] **F3** — fold the `1,4`-on-1:2 datapoint into `ts_levels()` span selection
       when [`multi-gpu-design.md`](multi-gpu-design.md) is implemented; keep the
       single-device configuration reachable
-- [ ] **F4** — a shared-prefix workload profile *before* any `--cache-reuse` /
-      `--cache-ram` factor
+- [ ] **F4** — a workload *shape* input (`--prefix-reuse`) before any
+      `--cache-reuse` / `--cache-ram` factor
+      ([`workload-shape-design.md`](workload-shape-design.md)). The profile was
+      the wrong unit too: shape is an input describing the user's traffic, not a
+      canned profile to pick from
