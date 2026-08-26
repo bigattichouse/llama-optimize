@@ -1028,6 +1028,7 @@ class Config:
     score: str = "tg"             # objective: "tg" (decode only) or "eff" (blend pp+tg)
     factors: dict = field(default_factory=dict)
     hw: dict = field(default_factory=dict)
+    prefix_reuse: float = 1.0   # workload SHAPE: shared-prefix fraction (W-D1)
     env_factor_names: set = field(default_factory=set)  # factors that set env vars
 
 
@@ -2170,11 +2171,154 @@ _CORPUS = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Prompt battery and prefix reuse — docs/workload-shape-design.md.
+#
+# Category mix follows the reasoning in field-reports F6: real traffic is
+# dominated by cheap requests but conditioned at high percentiles by expensive
+# ones, so an even mix of shapes is not neutral either. Weights are theirs.
+#
+# NOTE ON SCOPE: only the prompt TEXT varies by category here, not the output
+# length. Their battery gives each category its own token target (32..384),
+# which we cannot do without breaking this tool's measurement contract — a
+# single tg number per config is only meaningful if every rep generated the same
+# amount. Varying output length per category is a real change to what tg means
+# and is left as a decision, not smuggled in. See the design doc's checklist.
+# ---------------------------------------------------------------------------
+PROMPT_BANKS = (
+    ("simple_qa", 0.40,
+     "What is the capital of Portugal? How many minutes are in a day? Name the "
+     "largest ocean. Who wrote the play about the prince of Denmark? What does "
+     "a barometer measure? When did the first powered flight take place? "),
+    ("reasoning", 0.20,
+     "Suppose a train leaves at noon travelling west while a second departs an "
+     "hour later travelling east; reason step by step about when the distance "
+     "between them exceeds four hundred kilometres, stating each assumption you "
+     "make about speed, rest stops, and the curvature you are ignoring. "),
+    ("code", 0.20,
+     "def merge_intervals(spans): spans.sort(key=lambda s: s[0]); out = [] ; "
+     "for start, end in spans: if out and start <= out[-1][1]: out[-1][1] = "
+     "max(out[-1][1], end) else: out.append([start, end]) ; return out  # fix "
+     "the off-by-one when spans touch but do not overlap, and add a test. "),
+    ("rag", 0.15,
+     "CONTEXT: The quarterly filing notes that supply-chain costs rose 12% "
+     "year over year, driven mainly by shipping rates and a one-off inventory "
+     "write-down in the second half. Management guidance was left unchanged. "
+     "QUESTION: what drove the increase, and did guidance change? "),
+    ("long_ctx", 0.05,
+     "The history of computing spans centuries, from mechanical calculators to "
+     "modern processors running billions of operations per second. In distributed "
+     "systems, consensus algorithms such as Raft and Paxos let unreliable machines "
+     "agree on a single value despite failures. Photosynthesis converts sunlight, "
+     "water, and carbon dioxide into glucose and oxygen. The novel opens in a quiet "
+     "coastal town where the protagonist, returning after many years, confronts an "
+     "old rival and a buried secret. "),
+)
+
+CHARS_PER_TOKEN = 4          # the ~4 chars/token approximation used throughout
+
+
+def _sentences() -> list:
+    """Every bank split into sentences — the pool prompts are composed from."""
+    out = []
+    for _, _, text in PROMPT_BANKS:
+        for part in text.replace("; ", ". ").split(". "):
+            part = part.strip()
+            if len(part) > 20:
+                out.append(part + ". ")
+    return out
+
+
+def _fill(n_chars: int, rnd) -> str:
+    """Varied prose of ~n_chars, composed from shuffled sentences.
+
+    NOT `text * n`: repeating a short passage to length makes the prompt
+    massively self-similar, and n-gram speculation feeds on exactly that. Built
+    that way, a battery of *distinct* prompts still drafted at 100% acceptance —
+    the requests differed from each other while each one was internally
+    repetitive, so the contamination F4 set out to remove survived in a new
+    place. Measured: acceptance stayed 1.00 at every reuse level until this was
+    fixed (docs/workload-shape-design.md).
+
+    Sentences are drawn in a shuffled order and the order is reshuffled each time
+    the pool is exhausted, so repetition only appears at a long period rather
+    than every few hundred characters."""
+    pool = _sentences()
+    out, n = [], 0
+    while n < n_chars:
+        order = list(range(len(pool)))
+        rnd.shuffle(order)
+        for i in order:
+            out.append(pool[i])
+            n += len(pool[i])
+            if n >= n_chars:
+                break
+    return "".join(out)[:max(0, n_chars)]
+
+
+def prompt_battery(n_tokens: int, count: int, reuse: float = 1.0,
+                   seed: int = 42) -> list:
+    """`count` prompts of ~n_tokens tokens, sharing the first `reuse` fraction.
+
+    `reuse` is the workload's SHAPE, not a tunable: an agent stack with a fixed
+    system prompt has ~90% shared prefix whether or not that is convenient, and
+    the right cache settings for it are the ones that win at its reuse level
+    (docs/workload-shape-design.md). 1.0 reproduces the historical behaviour —
+    every request byte-identical.
+
+    The shared part is shared *content*, not merely a shared length: llama.cpp
+    matches on tokens, so generating a fresh prefix per request would reuse
+    nothing while looking like it should (W-D3). Suffixes are drawn from the
+    category banks so the varying part is varied prose rather than a counter,
+    which matters because speculation feeds on how predictable text is."""
+    n_chars = max(1, n_tokens) * CHARS_PER_TOKEN
+    reuse = min(1.0, max(0.0, reuse))
+    n_shared = int(n_chars * reuse)
+    rnd = random.Random(seed)
+    # the shared part is generated once, from its own stream, so it is identical
+    # across requests no matter how many suffixes follow it
+    shared = _fill(n_shared, random.Random(seed))
+    out = []
+    for i in range(max(1, count)):
+        if n_shared >= n_chars:
+            out.append(shared[:n_chars])       # fully shared: identical requests
+            continue
+        # a per-request stream: suffixes differ from each other AND are varied
+        # prose internally, which is the part that took a measurement to get right
+        out.append(shared + _fill(n_chars - n_shared, random.Random(seed + 1 + i)))
+    return out
+
+
+def achieved_reuse(prompts: list) -> float:
+    """The prefix fraction the battery ACTUALLY shares, measured not assumed.
+
+    Requested reuse and delivered reuse can differ — short prompts round, and a
+    bank shorter than the suffix repeats. The Bayesian autotuner this idea came
+    from ships `duplication_report()` for the same reason: prefix-cache
+    contamination is worth quantifying rather than declaring
+    (docs/field-reports.md F6). Reported alongside the result so a number can be
+    read in the light of the traffic that produced it."""
+    if not prompts:
+        return 0.0
+    if len(prompts) == 1:
+        return 1.0
+    shortest = min(len(p) for p in prompts)
+    first = prompts[0]
+    i = 0
+    while i < shortest and all(p[i] == first[i] for p in prompts):
+        i += 1
+    mean_len = sum(len(p) for p in prompts) / len(prompts)
+    return round(i / mean_len, 4) if mean_len else 0.0
+
+
 def _realistic_prompt(n_tokens: int) -> str:
-    """A varied-text prompt of roughly n_tokens tokens (~4 chars/token)."""
-    approx_chars = max(1, n_tokens) * 4
-    reps = approx_chars // len(_CORPUS) + 1
-    return (_CORPUS * reps)[:approx_chars]
+    """A varied-text prompt of roughly n_tokens tokens (~4 chars/token).
+
+    Shares `_fill`'s composition rather than repeating a fixed corpus: the old
+    version tiled `_CORPUS` to length, which made every long prompt strongly
+    self-similar and inflated speculative acceptance regardless of what the
+    battery did across requests."""
+    return _fill(max(1, n_tokens) * CHARS_PER_TOKEN, random.Random(0))
 
 
 # Slack on the wall-clock bound (I5). Wall time covers HTTP round trip and any
@@ -2391,7 +2535,14 @@ class ServerSession:
         recorded as ERROR — indistinguishable from a model that would not load.
         A config that serves 7 of 8 requests quickly is a real and different
         thing, and the sweep should be able to see it (F7)."""
-        prompt = _realistic_prompt(prompt_len)
+        # One prompt per request rather than one prompt reused: at reuse 1.0 the
+        # battery reproduces the historical identical-prompt behaviour exactly,
+        # and below it the requests genuinely differ (W-D1/W-D3).
+        reuse = float(getattr(self.cfg, "prefix_reuse", 1.0))
+        n_req = (max(1, reps) + 1) if par == 1 else par
+        prompts = prompt_battery(prompt_len, n_req, reuse)
+        self.last_reuse = achieved_reuse(prompts)
+        prompt = prompts[0]
         n_err = 0
         if par == 1:
             # Single stream: prefill once (warm request → real pp + primes the KV
@@ -2404,10 +2555,11 @@ class ServerSession:
             except (urllib.error.URLError, OSError, json.JSONDecodeError):
                 pp, n_err = 0.0, n_err + 1
             tps, ceilings, timings = [], [], []
-            for _ in range(max(1, reps)):
+            for i in range(max(1, reps)):
                 w0 = time.time()
                 try:
-                    r = _completion(self.port, prompt, n_gen, timeout, cache=True)
+                    r = _completion(self.port, prompts[(i + 1) % len(prompts)],
+                                    n_gen, timeout, cache=True)
                 except (urllib.error.URLError, OSError, json.JSONDecodeError):
                     n_err += 1
                     continue
@@ -2432,18 +2584,19 @@ class ServerSession:
             return {"pp": pp, "tg": tg,
                     "problem": exceeds_wall_clock(tg, ceilings),
                     "draft": _draft_totals(timings),
-                    "err_rate": n_err / (max(1, reps) + 1)}
+                    "err_rate": n_err / (max(1, reps) + 1),
+                    "reuse": self.last_reuse}
         # Concurrency: realistic serving — every request prefills; aggregate over
         # the streams. Warmup once, then average per-round throughput over reps.
         # These rates are computed from our own wall clock already, so they
         # cannot exceed it by construction — no cross-check needed.
-        _measure_round(self.port, prompt, n_gen, par, timeout)  # warmup, discard
+        _measure_round(self.port, prompts, n_gen, par, timeout)  # warmup, discard
         pps, tps, timings = [], [], []
-        n_req = 0
+        n_sent = 0
         for _ in range(max(1, reps)):
-            res, failed, wall = _measure_round(self.port, prompt, n_gen, par, timeout)
+            res, failed, wall = _measure_round(self.port, prompts, n_gen, par, timeout)
             n_err += failed
-            n_req += par
+            n_sent += par
             timings.extend(r.get("timings", {}) for r in res)
             tg_tok = sum(r.get("timings", {}).get("predicted_n", 0) for r in res)
             pp_tok = sum(r.get("timings", {}).get("prompt_n", 0) for r in res)
@@ -2454,7 +2607,8 @@ class ServerSession:
             pps.append(pp_tok / wall if wall > 0 else 0.0)
         return {"pp": sum(pps) / len(pps), "tg": sum(tps) / len(tps),
                 "problem": None, "draft": _draft_totals(timings),
-                "err_rate": n_err / n_req if n_req else 0.0}
+                "err_rate": n_err / n_sent if n_sent else 0.0,
+                "reuse": self.last_reuse}
 
     def close(self):
         if self.proc and self.proc.poll() is None:
@@ -2536,6 +2690,8 @@ def measure_in_session(cfg: Config, f: dict, session, timeout: int) -> dict:
         status = "ERROR"
     res = {"status": status, "pp_tps": pp, "tg_tps": tg,
            "err_rate": round(err_rate, 4),
+           # what the battery ACTUALLY shared, not what was asked for (F6)
+           "reuse": m.get("reuse", ""),
            "secs": time.time() - t0, "vram_mib": sampler.peak if sampler else 0}
     if status == "OK":                     # speculative telemetry (F1) — a
         res.update(draft_cols(cfg, f, m.get("draft", {})))  # never sets status
@@ -4519,6 +4675,7 @@ def selftest() -> bool:
 
             sess = ServerSession.__new__(ServerSession)   # no server launched
             sess.port, sess.ok, sess.err = 1, True, ""
+            sess.cfg = SimpleNamespace(prefix_reuse=1.0)  # historical shape
             fake_cfg = SimpleNamespace(n_prompt=0, n_gen=128, parallel=1, reps=1,
                                        measure_vram=False, factors={},
                                        emit_mtp=False, ngram=False, hw={})
@@ -4606,6 +4763,40 @@ def selftest() -> bool:
             assert r_e["status"] == "ERROR", r_e
         finally:
             globals()["_completion"] = _real_completion
+
+        # --- prompt battery and prefix reuse (docs/workload-shape-design.md) ---
+        # reuse 1.0 must reproduce the historical behaviour EXACTLY: every
+        # request byte-identical. Anything else silently redefines every
+        # measurement this tool has ever produced.
+        same = prompt_battery(256, 5, reuse=1.0)
+        assert len(set(same)) == 1, "reuse 1.0 must give identical requests"
+        assert achieved_reuse(same) == 1.0
+        # reuse 0.0: nothing shared by construction
+        none_shared = prompt_battery(256, 6, reuse=0.0)
+        assert len(set(none_shared)) > 1, none_shared
+        assert achieved_reuse(none_shared) < 0.1, achieved_reuse(none_shared)
+        # partial reuse: the shared part is shared CONTENT, not a shared length
+        # (W-D3) -- llama.cpp matches on tokens, so a per-request "prefix" would
+        # reuse nothing while looking like it should
+        part = prompt_battery(400, 8, reuse=0.5)
+        assert len(set(part)) > 1, "suffixes must differ"
+        pre = part[0][:len(part[0]) // 2]
+        assert all(x.startswith(pre) for x in part), "prefix must be shared"
+        got = achieved_reuse(part)
+        assert 0.4 <= got <= 0.6, got
+        # achieved is MEASURED, not echoed back: it reads the prompts we built
+        assert achieved_reuse(["abcdef", "abcxyz"]) == round(3 / 6, 4)
+        assert achieved_reuse([]) == 0.0 and achieved_reuse(["only"]) == 1.0
+        # deterministic for a given seed, so two sweeps are comparable
+        assert prompt_battery(256, 4, 0.25) == prompt_battery(256, 4, 0.25)
+        # every prompt is about the requested size regardless of reuse
+        for _re in (0.0, 0.5, 1.0):
+            for _p in prompt_battery(300, 4, _re):
+                assert abs(len(_p) - 300 * CHARS_PER_TOKEN) <= CHARS_PER_TOKEN, len(_p)
+        # the category mix is drawn from the banks, and the weights sum to 1
+        assert abs(sum(w for _, w, _ in PROMPT_BANKS) - 1.0) < 1e-9
+        assert {n for n, _, _ in PROMPT_BANKS} == {
+            "simple_qa", "reasoning", "code", "rag", "long_ctx"}
 
         # The bench driver needs the same wiring as the server driver above.
         # It reaches validate_measurement by a different route, and llama-bench
@@ -4835,7 +5026,7 @@ def load_results_csv(path: Path, factors: dict) -> list[dict]:
 # header is a factor column (must match the writer's `cols` in main)
 RESULT_COLS = {"run_id", "pp_tps", "tg_tps", "eff_tps", "status", "secs",
                "temp_c", "vram_mib", "implausible", "draft_acc", "spec_off",
-               "tool_version", "llama_build", "backend", "err_rate"}
+               "tool_version", "llama_build", "backend", "err_rate", "reuse"}
 
 
 def merge_result_rows(cfg: Config, rows: list[dict],
@@ -5559,6 +5750,14 @@ def main():
                     help="disable the default 'wait and watch' settle that pauses "
                          "between runs until GPU temp returns near its idle "
                          "baseline (keeps measurements thermally comparable)")
+    ap.add_argument("--prefix-reuse", type=float, default=None, metavar="PCT",
+                    help="workload SHAPE: percent of each prompt that is a "
+                         "prefix shared across requests (0-100). Describes your "
+                         "traffic, it is not tuned. Default 100 = every request "
+                         "identical, which is the historical behaviour and "
+                         "INFLATES n-gram speculation (see CHANGELOG); an agent "
+                         "stack with a fixed system prompt is nearer 90, "
+                         "independent requests are 0")
     ap.add_argument("--parallel", type=int, default=None,
                     help="concurrent request streams for the server driver "
                          "(default: from profile)")
@@ -5694,6 +5893,9 @@ def main():
     if args.quick and args.full:
         ap.error("--quick and --full are mutually exclusive")
 
+    if args.prefix_reuse is not None and not 0.0 <= args.prefix_reuse <= 100.0:
+        ap.error("--prefix-reuse is a percentage: 0-100")
+
     # --ctx-size N: fix context at N (min == max), like llama.cpp -c
     if args.ctx_size is not None:
         args.ctx_floor = args.ctx_size
@@ -5747,6 +5949,12 @@ def main():
         n_gen=n_gen,
         max_depth=args.max_depth,
         emit_mtp=not args.no_mtp,
+        # 1.0 preserves the historical identical-prompt behaviour exactly, so
+        # this release adds the capability without silently re-defining what
+        # every measurement means. See CHANGELOG for why the default is the
+        # unrealistic one, and NEXT-SESSION for flipping it.
+        prefix_reuse=(1.0 if args.prefix_reuse is None
+                      else args.prefix_reuse / 100.0),
         ngram=args.ngram,
         ngram_type=args.ngram_type,
         ngram_keep=args.ngram_keep,
@@ -5933,6 +6141,11 @@ def main():
         print(f"ngram      : yes — {emit}")
     print(f"profile    : {cfg.profile}  (request {cfg.n_prompt} prompt + "
           f"{cfg.n_gen} gen tokens; driver={cfg.driver})")
+    if cfg.driver == "server":
+        shape = (f"{cfg.prefix_reuse * 100:.0f}% shared prefix across requests")
+        warn = ("  <-- identical requests; INFLATES n-gram speculation, see "
+                "CHANGELOG" if cfg.prefix_reuse >= 1.0 else "")
+        print(f"workload   : {shape}{warn}")
     print("objective  : " + ("eff (effective t/s: blends pp + tg)"
                              if cfg.score == "eff" else
                              "tg (generation t/s; pp reported, not scored)"))
@@ -6011,7 +6224,7 @@ def main():
             + ["pp_tps", "tg_tps", "eff_tps", "status", "secs", "temp_c"]
             + (["vram_mib"] if cfg.measure_vram else [])
             + (["draft_acc", "spec_off"] if spec_cols_wanted(cfg) else [])
-            + (["backend"] if cfg.driver == "bench" else ["err_rate"])
+            + (["backend"] if cfg.driver == "bench" else ["err_rate", "reuse"])
             + ["tool_version", "llama_build"])
 
     # Resume keys on run_id (unique per array row), not config values, because

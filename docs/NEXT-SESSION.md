@@ -54,7 +54,7 @@ Each has a checklist and a no-GPU test plan in its own doc.
 
 | what | doc | notes |
 |---|---|---|
-| **Workload shape / `--prefix-reuse`** | [`workload-shape-design.md`](workload-shape-design.md) | **Highest value.** Now a correctness fix, not a feature: it is the mechanism by which ngram gets measured honestly at all. Prerequisite: re-derive `TG_OVER_PP_LIMIT` under partial reuse *before* any cache factor lands, because a too-tight limit fails silently by deleting real configs |
+| **Workload shape — flip the default** | [`workload-shape-design.md`](workload-shape-design.md) | `--prefix-reuse` now exists and is measured, but **defaults to 100 (identical requests)** so this release did not silently redefine every measurement. Remaining: per-profile realistic defaults, and re-measure the ngram screen. Also still open: re-derive `TG_OVER_PP_LIMIT` before any `--cache-reuse` factor lands, since a too-tight limit deletes real configs silently |
 | **Concurrency / `kv_unified`** | [`concurrency-kv-design.md`](concurrency-kv-design.md) | Design done this session. Blocked on settling the per-regime `n_ctx` rule (K3) first — a slot's context differs between shared and split KV, and getting it wrong recreates the batch-floor defect somewhere new |
 | **Draft model / `-md`** | [`draft-model-design.md`](draft-model-design.md) | Unlocks ~12 `--spec-draft-*` knobs plus `draft-simple`/`draft-dflash`/`draft-dspark`. Prerequisite: `predict_fits` must account for two models resident |
 | **Multi-GPU / `-ts`,`-sm`,`-mg`** | [`multi-gpu-design.md`](multi-gpu-design.md) | Predates these sessions. Needs two non-identical GPUs to validate the part that matters |
@@ -107,6 +107,11 @@ Three concrete things to pull from it:
 
 - A completed-but-empty run can no longer be recommended (`measured_ok`), with a
   regression test confirmed to fail without the guard.
+- Partial request failures are measured (`err_rate`) instead of collapsing the
+  config to ERROR; the throughput penalty is intrinsic to the wall clock.
+- `--prefix-reuse` measured live: 100% reuse -> 100% draft acceptance / 889 t/s,
+  90% -> 31% / 379 t/s. The prompt generator was itself a contamination source
+  (tiled text kept acceptance at 1.00 even at 0% reuse) and is fixed.
 - llama.cpp rebuilt at `4d19b2876` (ROCm 7.2.1, gfx906) and confirmed on real
   inference: `backend=ROCm`, 444 t/s tg on gemma-3-270m vs 115 t/s CPU-only.
 - All 37 flags the registry emits are still accepted by that build; none removed.

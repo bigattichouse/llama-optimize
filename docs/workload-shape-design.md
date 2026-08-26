@@ -159,6 +159,51 @@ F1) had been recording for less than a day. The absent-`draft_n` signal — the 
 built to catch a *config* that silently did not speculate — is what made a
 *harness* that silently over-speculates visible in a single six-request run.
 
+## Landed, and what it measured
+
+`--prefix-reuse PCT` is implemented, along with the category-weighted battery and
+achieved-reuse reporting. Measured on gemma-3-270m-it-Q8_0 / ROCm with
+`--spec-type ngram-mod`, 256-token prompts, 3 reps:
+
+| requested reuse | achieved | drafted | accepted | tg t/s |
+|---|---|---|---|---|
+| 100% (historical) | 1.0000 | 159 | 159 (**100%**) | **889.5** |
+| 90% | 0.8994 | 42 | 13 (31%) | 378.9 |
+| 50% | 0.5000 | — none — | — | 369.5 |
+| 0% | 0.0000 | 12 | 12 | 387.6 |
+
+The identical-request default measures **2.3x** the throughput of any realistic
+reuse level, and its 100% acceptance falls to **31%** at a realistic 90%.
+
+### The generator was a second contamination source
+
+Worth recording because it was missed twice and only a measurement caught it.
+
+The first battery built each prompt by tiling a short passage to length. Requests
+then differed *from each other* while each one was heavily self-similar — and
+n-gram speculation feeds on repetition wherever it finds it, including inside a
+single context. Acceptance stayed pinned at **1.00 across every reuse level,
+including 0%**, which looked like "reuse does not matter" and actually meant "the
+prompts are still pathological".
+
+`_fill` now composes from a shuffled sentence pool instead of repeating, so
+repetition appears only at a long period. `_realistic_prompt` had the identical
+defect — its docstring claimed "varied prose so speculative-decoding acceptance is
+realistic" while it tiled `_CORPUS` — and now shares the same builder.
+
+**The general lesson: "the requests differ" is not the same as "the text is
+varied", and only the second one makes speculative measurement honest.** A
+prompt generator is part of the measurement apparatus, and this one was quietly
+manufacturing the effect it was used to measure.
+
+### The default is still the unrealistic one, deliberately
+
+`--prefix-reuse` defaults to 100 — today's behaviour, exactly. Shipping the
+capability and silently redefining every measurement in the same release are
+separable, and the second deserves its own decision with a GPU re-measurement of
+the ngram screen behind it. The preamble now says so on every server run, and
+[`../CHANGELOG.md`](../CHANGELOG.md) carries the advisory.
+
 ## Cost
 
 Cheap in factors, which is unusual here. One input, two gated factors, no new
@@ -186,18 +231,18 @@ dimension and should not be smuggled into the first one.
 
 ## Checklist
 
-- [ ] `--prefix-reuse PCT` input on `Config`, defaulted per profile (W-D2)
-- [ ] Report the reuse fraction actually **achieved**, not just requested — the
-      Bayesian autotuner's `duplication_report()` quantifies contamination rather
-      than assuming it away ([`field-reports.md`](field-reports.md) F6)
-- [ ] Consider a category-weighted battery rather than one prompt shape: their
-      mix is 40% short-QA / 20% reasoning / 20% code / 15% RAG / 5% long-context,
-      justified by real traffic being dominated by cheap requests but
-      *conditioned at high percentiles* by expensive ones (F6)
-- [ ] Prompt generator: one sweep-stable prefix + per-request fresh suffix,
-      sharing `_realistic_prompt`'s prose (W-D3)
-- [ ] `ServerSession.measure`: distinct suffix per rep and per concurrent slot,
-      cache on, with the pp/tg contract stated at the call site (W-I1)
+- [x] `--prefix-reuse PCT` input on `Config` (defaults to 100 = historical
+      behaviour; per-profile defaults are the follow-up, W-D2)
+- [x] Report the reuse fraction actually **achieved** — `achieved_reuse` measures
+      the prompts we built rather than echoing the request, and lands in the CSV
+      as `reuse` ([`field-reports.md`](field-reports.md) F6)
+- [x] Category-weighted battery (40% short-QA / 20% reasoning / 20% code /
+      15% RAG / 5% long-context). Prompt *text* only — per-category output
+      lengths would redefine what a single tg number means and are still open
+- [x] Prompt generator: one sweep-stable prefix + per-request fresh suffix —
+      and composed from shuffled sentences, because tiling a passage made every
+      prompt self-similar enough to keep acceptance at 100% (W-D3)
+- [x] `ServerSession.measure`: distinct suffix per rep and per concurrent slot
 - [ ] Re-derive `TG_OVER_PP_LIMIT` under partial reuse, or scope it to the shape
       it was written for (W-I2) — **before** any factor lands, since a wrong
       limit deletes configs silently
@@ -205,9 +250,8 @@ dimension and should not be smuggled into the first one.
 - [ ] `--cache-ram` and a rotating-conversation shape — separate, later
 - [x] Check whether n-gram state survives across requests — **it does**, and the
       distortion is 2.3-3.4x (table above)
-- [ ] Re-measure the ngram screen under distinct prompts once `--prefix-reuse`
-      lands, and say plainly in the report that earlier ngram numbers were upper
-      bounds
+- [ ] Flip the default to per-profile realistic reuse, and re-measure the ngram
+      screen — the remaining half of this work, and the part that needs a GPU
 - [ ] `--selftest`: generator produces a byte-identical prefix and distinct
       suffixes; the gate keeps cache factors out of the design at reuse 0; the
       revised validity limit accepts a plausible high-reuse row and still rejects

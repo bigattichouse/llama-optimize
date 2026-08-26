@@ -220,6 +220,19 @@ catches a CPU-only build; it was caught because `draft_acc` recorded acceptance
 and the number was implausibly perfect. That is the argument for recording
 diagnostics you do not yet know you need.
 
+**And it had a second layer.** Fixing the harness to send genuinely distinct
+requests did not fix the measurement: acceptance stayed at 1.00 at every reuse
+level, including 0%. The prompts differed *from each other* while each one was
+built by tiling a short passage to length, and n-gram speculation feeds on
+repetition wherever it occurs — including inside a single context. The generator
+was manufacturing the effect it was being used to measure, one level below where
+anyone was looking.
+
+So: **"the requests differ" is not the same as "the text is varied."** A prompt
+generator is part of the measurement apparatus and deserves the same suspicion as
+a timer. Both layers were only visible because acceptance was recorded and the
+number was too good.
+
 ## "OK" is not the same as "measured"
 
 A run can complete cleanly and still generate nothing. `implausible_reason`

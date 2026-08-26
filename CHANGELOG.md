@@ -73,6 +73,29 @@ earlier.
   note instead of the alarm.
 - `tool_version` and `llama_build` columns stamped on every results row, so a
   CSV can be traced to what produced it after the fact.
+- **`--prefix-reuse PCT`** — describes the *shape* of your traffic: how much of
+  each prompt is a prefix shared across requests. It is an input, not a factor:
+  an agent stack with a fixed system prompt has ~90% shared prefix whether or not
+  that is convenient, and the right settings for it are the ones that win at its
+  reuse level. Sweeping it would report "your workload should have more prefix
+  reuse", which is not advice.
+
+  **The default is 100 — every request identical, exactly today's behaviour.**
+  That is the unrealistic setting, and it is the default on purpose: shipping the
+  capability and silently redefining every measurement are separable decisions,
+  and the second needs a GPU re-measurement behind it. Server runs now print the
+  shape and flag the default. Measured on gemma-3-270m/ROCm with `ngram-mod`:
+  100% reuse gives 100% draft acceptance and 889 t/s, while a realistic 90% gives
+  31% acceptance and 379 t/s — the 2.3x inflation the ngram advisory describes,
+  now reproducible with a flag.
+- **Category-weighted prompt battery** — 40% short-QA, 20% reasoning, 20% code,
+  15% RAG, 5% long-context, following the reasoning that real traffic is
+  dominated by cheap requests but conditioned at high percentiles by expensive
+  ones. Prompt *text* only; per-category output lengths would redefine what a
+  single tg number means and were deliberately not smuggled in.
+- **`reuse` column** — the prefix fraction the battery *actually* shared,
+  measured from the generated prompts rather than echoed back from the request,
+  so a result can be read in light of the traffic that produced it.
 - Fourteen previously unreachable llama.cpp knobs registered and usable via
   `--factor`: `load_mode`, `no_op_offload`, `no_host`, `repack`, `swa_full`,
   `backend_sampling`, `prio`, `prio_batch`, `ctx_checkpoints`,
@@ -100,6 +123,14 @@ earlier.
 
 ### Fixed
 
+- **The prompt generator was inflating speculative acceptance on its own.**
+  Prompts were built by tiling a short passage to length, which made each one
+  heavily self-similar — and n-gram speculation feeds on repetition inside a
+  single context, not just across requests. With distinct requests but tiled
+  text, acceptance stayed pinned at 100% at *every* reuse level, which reads as
+  "reuse does not matter" and means "the prompts are still pathological".
+  `_fill` now composes from a shuffled sentence pool, and `_realistic_prompt` —
+  which had the same defect while its docstring claimed varied prose — shares it.
 - **One failed request no longer discards the whole measurement.** A concurrent
   round died on the first exception (`ThreadPoolExecutor.map` re-raises while
   iterating), so "7 of 8 requests served quickly" was recorded as `ERROR` —
