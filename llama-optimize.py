@@ -2024,6 +2024,36 @@ def validate_measurement(res: dict, parallel: int = 1) -> dict:
     return res
 
 
+def estimate_secs_per_run(cfg) -> float:
+    """Rough seconds per sweep run, scaled by the things that actually drive it.
+
+    Was a flat 90s, which reported the same ~187 minutes for a 270M model and a
+    27B one (docs/constants-audit.md C-F). Users decide whether to start a
+    multi-hour sweep from this number, so being wrong by an order of magnitude at
+    both ends is worse than being roughly right.
+
+    Model size dominates: every run reloads the weights (the server driver
+    amortises this across configs that share load params, the bench driver does
+    not). Reps and generated tokens scale the measured part on top. Deliberately
+    crude and labelled as a guess — the honest estimate is the one the sweep
+    prints from its own elapsed time once it is running."""
+    gib = 0.0
+    try:
+        gib = cfg.model.stat().st_size / (1024 ** 3)
+    except OSError:
+        pass
+    load = 6.0 + 2.5 * gib                      # weights off disk / into VRAM
+    if cfg.driver == "server":
+        load *= 0.5                             # sessions are reused across runs
+    # The decode-rate prior has to scale too, or the estimate just moves the
+    # hardcoded assumption somewhere less visible: a fixed "20 tok/s" is as
+    # wrong for a 270M model (hundreds) as for a 27B one (tens). Throughput
+    # roughly tracks 1/params at fixed bandwidth, which is the shape used here.
+    tps_prior = min(300.0, max(5.0, 300.0 / max(0.3, gib)))
+    measure = max(1, cfg.reps) * (cfg.n_gen / tps_prior) + 4.0
+    return max(8.0, load + measure)
+
+
 def fmt_dur(secs: float) -> str:
     secs = int(secs)
     if secs < 60:
@@ -2215,7 +2245,33 @@ PROMPT_BANKS = (
      "old rival and a buried secret. "),
 )
 
-CHARS_PER_TOKEN = 4          # the ~4 chars/token approximation used throughout
+# Bootstrap only. The real ratio is model- and language-specific — code and CJK
+# are nowhere near 4 — and it decides the actual n_depth of every server
+# measurement, so it is measured rather than assumed as soon as llama.cpp tells
+# us (docs/constants-audit.md C-B).
+CHARS_PER_TOKEN = 4
+
+
+def calibrate_chars_per_token(prompt: str, prompt_n) -> float | None:
+    """chars-per-token for THIS model, from a response llama.cpp already sent.
+
+    Every completion reports `prompt_n` — the tokens the prompt actually became.
+    Divided by the characters we sent, that is a measured ratio for this
+    tokenizer, replacing a constant that is only right for English prose.
+
+    Returns None when the sample cannot support a ratio: an absent or zero
+    `prompt_n`, or a value so far from any real tokenizer (outside 1..20
+    chars/token) that it is more likely a malformed response than a surprising
+    model. Rejecting a wrong ratio matters more than adopting a slightly better
+    one — it sizes every subsequent prompt."""
+    try:
+        n = int(prompt_n or 0)
+    except (TypeError, ValueError):
+        return None
+    if n <= 0 or not prompt:
+        return None
+    ratio = len(prompt) / n
+    return ratio if 1.0 <= ratio <= 20.0 else None
 
 
 def _sentences() -> list:
@@ -2257,7 +2313,7 @@ def _fill(n_chars: int, rnd) -> str:
 
 
 def prompt_battery(n_tokens: int, count: int, reuse: float = 1.0,
-                   seed: int = 42) -> list:
+                   seed: int = 42, chars_per_token: float | None = None) -> list:
     """`count` prompts of ~n_tokens tokens, sharing the first `reuse` fraction.
 
     `reuse` is the workload's SHAPE, not a tunable: an agent stack with a fixed
@@ -2271,7 +2327,7 @@ def prompt_battery(n_tokens: int, count: int, reuse: float = 1.0,
     nothing while looking like it should (W-D3). Suffixes are drawn from the
     category banks so the varying part is varied prose rather than a counter,
     which matters because speculation feeds on how predictable text is."""
-    n_chars = max(1, n_tokens) * CHARS_PER_TOKEN
+    n_chars = int(max(1, n_tokens) * (chars_per_token or CHARS_PER_TOKEN))
     reuse = min(1.0, max(0.0, reuse))
     n_shared = int(n_chars * reuse)
     rnd = random.Random(seed)
@@ -2540,7 +2596,11 @@ class ServerSession:
         # and below it the requests genuinely differ (W-D1/W-D3).
         reuse = float(getattr(self.cfg, "prefix_reuse", 1.0))
         n_req = (max(1, reps) + 1) if par == 1 else par
-        prompts = prompt_battery(prompt_len, n_req, reuse)
+        # cpt is learned from the first response this session sees and reused
+        # after, so a model whose tokenizer is nothing like 4 chars/token still
+        # gets prompts of the requested SIZE (docs/constants-audit.md C-B)
+        prompts = prompt_battery(prompt_len, n_req, reuse,
+                                 chars_per_token=getattr(self, "cpt", None))
         self.last_reuse = achieved_reuse(prompts)
         prompt = prompts[0]
         n_err = 0
@@ -2551,7 +2611,10 @@ class ServerSession:
             # cleaner decode number.
             try:
                 warm = _completion(self.port, prompt, n_gen, timeout, cache=True)
-                pp = warm.get("timings", {}).get("prompt_per_second", 0.0) or 0.0
+                wt = warm.get("timings", {})
+                pp = wt.get("prompt_per_second", 0.0) or 0.0
+                self.cpt = (calibrate_chars_per_token(prompt, wt.get("prompt_n"))
+                            or getattr(self, "cpt", None))
             except (urllib.error.URLError, OSError, json.JSONDecodeError):
                 pp, n_err = 0.0, n_err + 1
             tps, ceilings, timings = [], [], []
@@ -2590,7 +2653,11 @@ class ServerSession:
         # the streams. Warmup once, then average per-round throughput over reps.
         # These rates are computed from our own wall clock already, so they
         # cannot exceed it by construction — no cross-check needed.
-        _measure_round(self.port, prompts, n_gen, par, timeout)  # warmup, discard
+        warm_res, _, _ = _measure_round(self.port, prompts, n_gen, par, timeout)
+        if warm_res:                            # warmup discarded, ratio kept
+            self.cpt = (calibrate_chars_per_token(
+                prompts[0], warm_res[0].get("timings", {}).get("prompt_n"))
+                or getattr(self, "cpt", None))
         pps, tps, timings = [], [], []
         n_sent = 0
         for _ in range(max(1, reps)):
@@ -4795,6 +4862,49 @@ def selftest() -> bool:
                 assert abs(len(_p) - 300 * CHARS_PER_TOKEN) <= CHARS_PER_TOKEN, len(_p)
         # the category mix is drawn from the banks, and the weights sum to 1
         assert abs(sum(w for _, w, _ in PROMPT_BANKS) - 1.0) < 1e-9
+
+        # --- constants that were ours, now derived (docs/constants-audit.md) ---
+        # C-B: chars-per-token is measured from llama.cpp's own prompt_n, not
+        # assumed to be 4. Getting this wrong means the sweep tests a different
+        # n_depth than the column claims, on any model whose tokenizer is not
+        # English prose.
+        assert calibrate_chars_per_token("x" * 400, 100) == 4.0
+        assert calibrate_chars_per_token("x" * 250, 100) == 2.5   # code-ish
+        assert calibrate_chars_per_token("x" * 900, 100) == 9.0   # CJK-ish
+        # a ratio no real tokenizer produces is a malformed response, not a
+        # surprising model: rejecting it matters more than adopting it, because
+        # it would size every later prompt
+        assert calibrate_chars_per_token("x" * 100, 200) is None  # 0.5
+        assert calibrate_chars_per_token("x" * 5000, 100) is None  # 50
+        assert calibrate_chars_per_token("x" * 400, 0) is None
+        assert calibrate_chars_per_token("x" * 400, None) is None
+        assert calibrate_chars_per_token("", 10) is None
+        assert calibrate_chars_per_token("x" * 400, "bad") is None
+        # a measured ratio actually resizes the battery
+        wide = prompt_battery(100, 2, reuse=0.0, chars_per_token=9.0)
+        assert all(abs(len(x) - 900) <= 9 for x in wide), [len(x) for x in wide]
+        narrow = prompt_battery(100, 2, reuse=0.0, chars_per_token=2.0)
+        assert all(abs(len(x) - 200) <= 2 for x in narrow), [len(x) for x in narrow]
+        # and None falls back to the bootstrap constant
+        assert len(prompt_battery(100, 1, 0.0)[0]) == 100 * CHARS_PER_TOKEN
+
+        # C-F: the sweep estimate must scale with model size, not be flat
+        _big = Config(model=Path("/nonexistent-big.gguf"), llama_bench=Path("b"),
+                      array="auto", ctx_floor=8192, n_gen=256, reps=3)
+        assert estimate_secs_per_run(_big) > 8.0        # missing file: no crash
+        class _Sz:
+            def __init__(self, n): self.n = n
+            def stat(self): return SimpleNamespace(st_size=self.n)
+        small = Config(model=_Sz(300 * 1024**2), llama_bench=Path("b"),
+                       array="auto", ctx_floor=8192, n_gen=256, reps=3)
+        big = Config(model=_Sz(25 * 1024**3), llama_bench=Path("b"),
+                     array="auto", ctx_floor=8192, n_gen=256, reps=3)
+        assert estimate_secs_per_run(big) > 3 * estimate_secs_per_run(small), (
+            estimate_secs_per_run(big), estimate_secs_per_run(small))
+        # more reps and more generated tokens both cost time
+        more = Config(model=_Sz(300 * 1024**2), llama_bench=Path("b"),
+                      array="auto", ctx_floor=8192, n_gen=256, reps=5)
+        assert estimate_secs_per_run(more) > estimate_secs_per_run(small)
         assert {n for n, _, _ in PROMPT_BANKS} == {
             "simple_qa", "reasoning", "code", "rag", "long_ctx"}
 
@@ -6182,9 +6292,11 @@ def main():
             print("  " + " ".join(build_server_args(cfg, f0, 8080, n_ctx)))
         else:
             print("  " + " ".join(bench_command(cfg, f0)))
-        est = len(runs) * 90  # rough 90s/run guess
+        per = estimate_secs_per_run(cfg)
         print(f"\nAll {len(runs)} runs would execute sequentially "
-              f"(~{est // 60} min at a rough 90s/run).")
+              f"(~{fmt_dur(len(runs) * per)} at a rough {per:.0f}s/run, "
+              f"scaled from model size, reps and n_gen — a guess, not a "
+              f"measurement).")
         return
 
     needed = cfg.llama_server if cfg.driver == "server" else cfg.llama_bench

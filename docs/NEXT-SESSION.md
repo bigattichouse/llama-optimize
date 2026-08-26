@@ -59,6 +59,23 @@ Each has a checklist and a no-GPU test plan in its own doc.
 | **Draft model / `-md`** | [`draft-model-design.md`](draft-model-design.md) | Unlocks ~12 `--spec-draft-*` knobs plus `draft-simple`/`draft-dflash`/`draft-dspark`. Prerequisite: `predict_fits` must account for two models resident |
 | **Multi-GPU / `-ts`,`-sm`,`-mg`** | [`multi-gpu-design.md`](multi-gpu-design.md) | Predates these sessions. Needs two non-identical GPUs to validate the part that matters |
 
+## Hardware-poisoned constants
+
+[`constants-audit.md`](constants-audit.md) classifies every hardcoded value.
+Two were fixed (chars-per-token, the sweep time estimate). Four are recorded as
+findings because each changes what gets measured and needs live validation:
+
+- **C-A `FIXED_FA = 1`** — pinned because it "helps gfx906", i.e. from this
+  machine. Not a one-line fix: `-fa` is a precondition for quantized KV, so
+  letting it fall to `auto` on a backend that declines FA would silently
+  invalidate every `q8_0` row. The honest fix probes whether FA is active and
+  gates `kv_type` on the answer — and needs a non-ROCm box to validate.
+- **C-C `THERMAL_BAND_C` / `THERMAL_CAP_S`** — a settle policy tuned to one
+  card's thermal behaviour. `temp_c` is already recorded per row, so the raw
+  material for deriving it exists.
+- **C-D `FIXED_BATCH`**, **C-E `DEFAULT_UBATCH_LEVELS` / `DEFAULT_MAX_DEPTH`** —
+  literals where a derivation from VRAM or the model is available.
+
 ## Smaller open items
 
 - **`-sps`/`--slot-prompt-similarity`** — the server-side prefix-reuse routing
