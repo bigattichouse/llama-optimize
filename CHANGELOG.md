@@ -110,7 +110,10 @@ earlier.
   sweep whose rows all say `CPU` while `ngl` varies is the same fault, still
   visible in the results file long after the console output is gone — and
   visible to whoever is handed the CSV, who never saw the warning.
-- Documentation: [`docs/NEXT-SESSION.md`](docs/NEXT-SESSION.md) (working handoff
+- Documentation: [`docs/constants-audit.md`](docs/constants-audit.md) (every
+  hardcoded value classified as universal / derivable / ours — the
+  hardware-poisoning audit),
+  [`docs/NEXT-SESSION.md`](docs/NEXT-SESSION.md) (working handoff
   — what is in flight, blocked on what, and already verified),
   [`docs/field-reports.md`](docs/field-reports.md) (published third-party setups
   *and methods*, and what transfers — including a Bayesian/TPE autotuner whose own
@@ -123,6 +126,20 @@ earlier.
 
 ### Fixed
 
+- **Chars-per-token is measured, not assumed to be 4.** The constant decided the
+  real `n_depth` of every server measurement and the size of every battery
+  prompt, and tokenizer ratios vary widely by model and language — code and CJK
+  are nowhere near 4. It is now calibrated from `prompt_n`, which llama.cpp
+  already reports in every response; the constant survives only as the bootstrap
+  for the first request. A ratio outside 1–20 chars/token is rejected as a
+  malformed response rather than adopted, because a wrong ratio sizes every
+  prompt after it.
+- **The sweep time estimate no longer assumes 90s per run.** A 270M model and a
+  27B model both reported ~187 minutes, and users decide whether to start a
+  multi-hour sweep from that number. It now scales with model size, driver, reps
+  and `n_gen` — 20m / 1h18m / 3h21m for 270M / 8B / 27B — and says it is a guess.
+  The decode-rate prior inside it scales too, since a fixed "20 tok/s" would just
+  have moved the hardcoded assumption somewhere less visible.
 - **The prompt generator was inflating speculative acceptance on its own.**
   Prompts were built by tiling a short passage to length, which made each one
   heavily self-similar — and n-gram speculation feeds on repetition inside a
