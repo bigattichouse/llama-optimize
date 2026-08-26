@@ -767,6 +767,10 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for the background and tuning hypotheses,
 and [`docs/field-reports.md`](docs/field-reports.md) for tuned setups published by
 other people — what transfers to a llama.cpp command line and what does not.
 
+[`docs/flag-coverage.md`](docs/flag-coverage.md) audits every `llama-server` and
+`llama-bench` parameter against the registry — what is swept, what is fixed, what
+is deliberately excluded and why, and what is still missing.
+
 ## License
 
 `llama-optimize` is released under the [MIT License](LICENSE). The bundled

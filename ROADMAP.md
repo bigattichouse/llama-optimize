@@ -103,6 +103,25 @@ construction. Shape is an input describing the user's traffic, not a factor to
 optimize. Design and checklist:
 [`docs/workload-shape-design.md`](docs/workload-shape-design.md).
 
+## 10. Flag coverage — two live defects
+
+A full audit of `llama-server`/`llama-bench` `--help` against `FACTORS`
+([`docs/flag-coverage.md`](docs/flag-coverage.md)) turned up two things that are
+wrong today rather than merely missing:
+
+- `bench_command` emits `-mmp`, now deprecated in favour of `--load-mode`.
+  llama.cpp does remove deprecated args (three removals are visible in the same
+  help text), and when this one goes every bench run fails at argument parsing.
+- `--parallel` is always passed explicitly, and `kv_unified` defaults to true
+  *only* when slots are auto (`tools/server/server.cpp:151`). So every
+  concurrency sweep has measured `kv_unified = false`, and the regime a default
+  `llama-server` actually runs in has never been measured.
+
+Plus ~12 uncovered perf-relevant knobs aimed at the partial-offload case
+(`--load-mode`, `--repack`, `--op-offload`, `--no-host`, `-kvu`, `-sps`,
+`--swa-full`, batch-phase CPU affinity, `--prio`), and an `--audit-flags` mode so
+coverage stops rotting silently.
+
 ## Small cleanups
 
 - ~~`--merge-results` rows aren't deduplicated against the current pass~~ —
