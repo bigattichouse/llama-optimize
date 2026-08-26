@@ -23,7 +23,25 @@ earlier.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **`SIGNAL` status** — a run whose process was killed by a signal is no longer
+  filed as a generic `ERROR`. The two mean different things and only one is about
+  the config: a process that *ran and returned an error* was rejected by
+  llama.cpp, while a process killed by a signal crashed inside it.
+
+  Found while validating the OOM pruner: Qwen3.8 (Gated Delta Net) on gfx906
+  segfaults during context init above roughly 64k with **no allocation failure
+  logged**, so the OOM patterns do not match. It is genuinely not an OOM — the
+  same model cleanly reports `cudaMalloc failed: out of memory` at 200k, well
+  above where the segfaults start — so calling it one would have been wrong too.
+
+### Verified
+
+- **The OOM pruner is not over-conservative** (ROADMAP item 2's last open
+  bullet). On Qwen3.8-27B / 32 GB MI50 the decision boundary sits between 143,996
+  and 145,073 tokens of context, and the predicted-OOM side is real: 200k fails
+  allocating the KV cache. No viable configuration was wrongly skipped.
 
 ## [0.2.0] — 2026-08-26
 

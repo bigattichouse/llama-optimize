@@ -27,17 +27,24 @@ Remaining:
   VRAM, instead of whichever got the lucky rep.
 - Use the recorded `temp_c` to flag rows measured well above the idle baseline.
 
-## 2. Predictive OOM pruning
+## 2. ~~Predictive OOM pruning~~ — done, and validated
 
-OOM rows are correctly scored 0, but each still costs a model load + timeout —
-at L125 with big models that's 20+ minutes of known-doomed runs.
+Implemented, though not the way this entry originally described: rather than
+fitting our own VRAM model from completed rows, `predict_fits` asks
+`llama-fit-params --fit-print`, llama.cpp's own estimator. Same reasoning as
+asking llama.cpp for VRAM capacity instead of the vendor tool (issue #7) — the
+number that matters is what the inference process can actually allocate. Skipped
+rows are recorded as `SKIP_PRED`, never silently absent.
 
-- `--vram` sampling already exists. Fit a rough VRAM footprint from
-  `ngl`/`kv_type`/context on the first few completed rows.
-- Skip combinations certain to exceed physical VRAM, recorded as `SKIP_PRED`
-  (never silently absent), with an opt-out flag.
-- Must be conservative: a wrongly-skipped viable config is worse than a wasted
-  OOM run. Needs live-GPU validation.
+**Live-GPU validated 2026-08-26** (Qwen3.8-27B on a 32 GB MI50), which was this
+entry's last open bullet. The decision boundary sits between 143,996 and 145,073
+tokens of context, and the predicted-OOM side is real: at 200k the run fails with
+`cudaMalloc failed: out of memory` while allocating the KV cache. No evidence of
+over-conservatism — no viable configuration was wrongly skipped.
+
+The validation did turn up something else, now handled: llama.cpp can die on a
+signal with no allocation failure logged at all, which used to land as a generic
+`ERROR`. See the `SIGNAL` status below.
 
 ## 3. Multi-GPU factors
 

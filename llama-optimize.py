@@ -1928,6 +1928,31 @@ def server_command(cfg: Config, f: dict, ctx: int) -> str:
     return (env_prefix + " \\\n  " + cmd) if env_prefix else cmd
 
 
+def died_on_signal(returncode) -> int | None:
+    """The signal a child died on, or None if it exited normally.
+
+    Worth distinguishing from a non-zero exit, because the two mean different
+    things and only one of them is about the config. A process that *ran* and
+    returned an error was rejected by llama.cpp; a process killed by a signal
+    crashed inside it.
+
+    Observed on this project's own hardware: Qwen3.8 (Gated Delta Net) on gfx906
+    segfaults during context init above roughly 64k, with **no allocation failure
+    logged at all** — the OOM patterns do not match, so it would otherwise land
+    as an indistinguishable generic ERROR. It is not an OOM: the same model
+    cleanly reports "cudaMalloc failed: out of memory" at 200k, well above where
+    the segfaults start.
+
+    subprocess reports this as a negative returncode; shells report 128+N."""
+    try:
+        rc = int(returncode)
+    except (TypeError, ValueError):
+        return None
+    if rc < 0:
+        return -rc
+    return rc - 128 if 128 < rc < 160 else None
+
+
 _OOM_PAT = re.compile(
     r"out of memory|failed to allocate|ROCm error|hipErrorOutOfMemory|"
     r"cudaErrorMemoryAllocation|ggml_backend_.*failed",
@@ -2115,7 +2140,9 @@ def run_one(cfg: Config, f: dict, timeout: int):
                               env=run_env(cfg, f))
         combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
         if proc.returncode != 0 or _OOM_PAT.search(combined):
-            status = "OOM" if _OOM_PAT.search(combined) else "ERROR"
+            sig = died_on_signal(proc.returncode)
+            status = ("OOM" if _OOM_PAT.search(combined) else
+                      "SIGNAL" if sig else "ERROR")
         else:
             pp_, tg_ = parse_bench_json(proc.stdout)
             backend = parse_bench_backend(proc.stdout)
@@ -2647,8 +2674,11 @@ class ServerSession:
                 self.err = err or ""
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+            self.signal = died_on_signal(self.proc.returncode) if died else None
             if not self.err:
-                self.err = (f"server exited during load" if died else
+                self.err = (f"server died on signal {self.signal} during load"
+                            if self.signal else
+                            "server exited during load" if died else
                             f"server not healthy within {cfg.server_start_timeout}s")
 
     def measure(self, prompt_len, n_gen, par, reps, timeout):
@@ -2811,7 +2841,8 @@ def measure_in_session(cfg: Config, f: dict, session, timeout: int) -> dict:
     t0 = time.time()
     if session is None or not session.ok:
         err = session.err if session else ""
-        status = "OOM" if _OOM_PAT.search(err or "") else "ERROR"
+        status = ("OOM" if _OOM_PAT.search(err or "") else
+                  "SIGNAL" if getattr(session, "signal", None) else "ERROR")
         return {"status": status, "pp_tps": 0.0, "tg_tps": 0.0, "secs": 0.0,
                 "vram_mib": 0}
     prompt_len = cfg.n_prompt + int(f.get("n_depth", 0))
@@ -3663,6 +3694,26 @@ def selftest() -> bool:
         assert parse_bench_backend("not json") == ""
         assert parse_bench_backend("[]") == ""
         assert parse_bench_backend('[{"avg_ts": 1.0}]') == ""   # older build
+
+        # --- a crash is not an error (validated on real hardware) ---
+        # Qwen3.8 on gfx906 segfaults during context init above ~64k with NO
+        # allocation failure logged, so the OOM patterns do not match and it
+        # would land as a generic ERROR. It is genuinely not an OOM: the same
+        # model cleanly reports "cudaMalloc failed: out of memory" at 200k, well
+        # above where the segfaults begin.
+        assert died_on_signal(-11) == 11          # subprocess: negative
+        assert died_on_signal(139) == 11          # shell: 128 + N
+        assert died_on_signal(-9) == 9 and died_on_signal(137) == 9
+        assert died_on_signal(0) is None          # clean exit
+        assert died_on_signal(1) is None          # ran, returned an error
+        assert died_on_signal(127) is None        # command not found, not a signal
+        assert died_on_signal(160) is None        # out of signal range
+        assert died_on_signal(None) is None and died_on_signal("x") is None
+        # a real OOM message still wins over the signal classification: the
+        # process may well be killed after llama.cpp reports the allocation
+        # failure, and "OOM" is the more actionable of the two
+        assert _OOM_PAT.search("cudaMalloc failed: out of memory")
+        assert not _OOM_PAT.search("Segmentation fault")
         assert "backend" in RESULT_COLS          # bookkeeping, never a factor
 
         # OOM detection

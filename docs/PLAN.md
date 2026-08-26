@@ -65,14 +65,18 @@ Bump `__version__`, move `[Unreleased]` to `[0.2.0]`, tag. The ⚠️ **Affects
 existing results** section is the reason to ship rather than sit on it: users who
 have already run ngram sweeps need to know their numbers were upper bounds.
 
-### 4. The OOM pruner — *no longer blocked*
+### 4. ~~The OOM pruner~~ — **already done, now validated**
 
-ROADMAP item 2 was stalled on *what to sum*. F6 supplied it: weights + KV +
-state + graph overhead + activations + margin, against a usable pool and a hard
-VRAM limit, first-order additive on purpose because conservative is the point
-([`field-reports.md`](field-reports.md) F6). The llama.cpp translation drops
-Mamba and CUDA graphs and gains the partial-offload split. Independent of
-everything above — good work to interleave.
+This step was written on a stale reading of ROADMAP item 2. The pruner does not
+need a memory model of ours and never did: `predict_fits` asks
+`llama-fit-params`, llama.cpp's own estimator — the better design by this
+project's own rule about asking llama.cpp rather than modelling it. F6's
+six-term model is therefore *not* wanted here; it stays on file as a fallback
+shape if a future backend has no equivalent tool.
+
+What was genuinely open was item 2's last bullet, live-GPU validation, and that
+is now done: the boundary is real and the pruner is not over-conservative. It
+also surfaced the `SIGNAL` status. Details in [`../ROADMAP.md`](../ROADMAP.md).
 
 ### 5. C2 / `kv_unified` — *designed, blocked on one decision*
 
