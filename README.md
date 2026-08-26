@@ -375,6 +375,39 @@ so it survives a crash — see below).
 
 ## Recommended workflow (staged / iterative refinement)
 
+**Step 0 — check the setup before spending hours.** A full sweep on a 27B model is
+a couple of hours; almost every way it can be wasted is visible in the first
+minute.
+
+```bash
+# no --run: plan only, uses NO GPU. Prints the factor matrix, the run count,
+# a time estimate, and the exact command run 1 would execute.
+python3 llama-optimize.py model.gguf --llama-cpp /path/to/llama.cpp/build/bin
+```
+
+Three things to read in that output before committing:
+
+1. **`VRAM : ... (llama.cpp: ROCm0)`** — the source in parentheses matters. If it
+   says `rocm-smi` or `nvidia-smi` instead, llama.cpp cannot see your GPU and
+   you'll get a loud warning: every run would execute on the CPU and report
+   plausible-looking numbers. (Measured at 3.9x wrong on the same model.)
+2. **The run count and estimate** (e.g. `125 runs ... ~187 min`). If that's more
+   time than you want, `--quick` cuts reps, and `--screen` finds which knobs even
+   matter first.
+3. **The sample command** — it's the real thing. If it looks wrong for your
+   setup, it would have been wrong 125 times.
+
+Then start small and widen:
+
+```bash
+python3 llama-optimize.py model.gguf --run --quick   # 1 rep, fastest useful pass
+```
+
+Once it's running, the results CSV carries `backend` (bench driver), which should
+say `ROCm`/`CUDA`, not `CPU` — plus `tool_version` and `llama_build`, so the file
+can be traced back to what produced it. See [`CHANGELOG.md`](CHANGELOG.md) for
+whether a given version's results are affected by a known measurement issue.
+
 **Many knobs? Screen first (the funnel).** With a dozen-plus `--factor`s, run a
 **Morris pre-screen** to find which knobs even matter before spending a full sweep:
 ```bash
