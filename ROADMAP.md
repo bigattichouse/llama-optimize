@@ -144,6 +144,23 @@ sweeps are legitimate and get a one-line note instead. See
 Also landed: the `backend` column, from `llama-bench -o json`, so the same fault
 is visible after a sweep and to whoever receives the CSV.
 
+## 12. Remaining knobs — registered, not yet swept
+
+Fourteen llama.cpp knobs are now reachable via `--factor` but stay out of the
+default design on purpose ([`docs/remaining-factors-design.md`](docs/remaining-factors-design.md),
+R1). Two open questions would promote some of them: whether SWA is detectable
+from GGUF metadata (`swa_full`), and whether `load_mode` should auto-sweep when
+the model does not fit in VRAM — which is exactly where paging decides
+throughput.
+
+## 13. Concurrency and the unified KV cache
+
+`--parallel` and `kv_unified` are coupled by llama.cpp and cannot ride an
+orthogonal array as free columns. Worse than the audit said: single-stream
+sweeps silently run 4 auto slots with unified KV, concurrency sweeps never see
+unified at all, and `parallel = auto` is not expressible. Design:
+[`docs/concurrency-kv-design.md`](docs/concurrency-kv-design.md).
+
 ## Small cleanups
 
 - ~~`--merge-results` rows aren't deduplicated against the current pass~~ —

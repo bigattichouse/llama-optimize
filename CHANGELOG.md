@@ -73,6 +73,15 @@ earlier.
   note instead of the alarm.
 - `tool_version` and `llama_build` columns stamped on every results row, so a
   CSV can be traced to what produced it after the fact.
+- Fourteen previously unreachable llama.cpp knobs registered and usable via
+  `--factor`: `load_mode`, `no_op_offload`, `no_host`, `repack`, `swa_full`,
+  `backend_sampling`, `prio`, `prio_batch`, `ctx_checkpoints`,
+  `checkpoint_min_step`, and the batch-phase CPU affinity set (`cpu_mask_batch`,
+  `cpu_range_batch`, `cpu_strict_batch`, `poll_batch`). Deliberately **not**
+  auto-swept — a registry entry costs nothing and makes the knob askable, while
+  entry into the default design would spend rows on columns that do nothing on
+  most machines. See
+  [`docs/remaining-factors-design.md`](docs/remaining-factors-design.md).
 - `backend` column on bench-driver rows, recording what llama.cpp says actually
   ran ("ROCm", "CPU", ...). The after-the-fact companion to the GPU warning: a
   sweep whose rows all say `CPU` while `ngl` varies is the same fault, still
@@ -101,10 +110,12 @@ earlier.
 
 ### Known issues
 
-- Roughly a dozen perf-relevant llama.cpp flags are still unreachable, several
-  aimed squarely at the partial-offload case: `--repack`, `--op-offload`,
-  `--no-host`, `-kvu`, `-sps`, `--swa-full`, `--prio`, and the batch-phase CPU
-  affinity twins. Audited in [`docs/flag-coverage.md`](docs/flag-coverage.md).
+- `-kvu`/`--kv-unified` and `-sps`/`--slot-prompt-similarity` are still
+  unreachable. Both are blocked on design rather than effort: `kv_unified` is
+  constrained by `--parallel`
+  ([`docs/concurrency-kv-design.md`](docs/concurrency-kv-design.md)) and `-sps`
+  cannot move until requests differ
+  ([`docs/workload-shape-design.md`](docs/workload-shape-design.md)).
 
 ## [0.1.0] — 2026-08-24
 

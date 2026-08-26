@@ -168,15 +168,17 @@ about is how inert columns get created.
       falling back to the per-driver legacy spellings on older builds
 - [ ] `load_mode` as a *factor* (mmap / mlock / mmap+mlock / dio), now that
       emitting it is settled — the partial-offload case is where it should pay
-- [ ] **C2** — `kv_unified` factor, and decide whether `--parallel` auto is
-      reachable at all (a `parallel=auto` level pins slots to 4 — it is a
-      constrained pair, not two free columns)
-- [ ] `--repack`, `--op-offload`, `--no-host` — three booleans, both drivers,
-      cheap to add and aimed squarely at the partial-offload case
+- [x] **C2** — designed: [`concurrency-kv-design.md`](concurrency-kv-design.md).
+      `--parallel` and `kv_unified` are a constrained pair, and the audit
+      understated it — single-stream sweeps run 4 auto slots with unified KV,
+      concurrency sweeps never see unified at all
+- [x] `--repack`, `--op-offload`, `--no-host`, `--swa-full`, `--backend-sampling`,
+      `--prio`/`--prio-batch`, the batch-phase CPU affinity twins, and
+      `-ctxcp`/`-cms` — all registered and reachable via `--factor`, none
+      auto-swept ([`remaining-factors-design.md`](remaining-factors-design.md), R1)
+- [x] `--load-mode` as a factor, with the fixed-emission interlock
 - [ ] `-sps` folded into [`workload-shape-design.md`](workload-shape-design.md)
-- [ ] `--swa-full` as a conditional factor, gated on the model being SWA
-- [ ] batch-phase CPU affinity twins, mirroring the existing `-tb` decision
-- [ ] `--prio` / `--prio-batch`
+- [ ] Auto-sweep `swa_full` if SWA turns out to be detectable from GGUF metadata
 - [ ] Decide the RoPE/YaRN tail: complete the family or state the scope
 - [ ] `--audit-flags` mode + exclusion allow-list in code, with `--selftest`
       coverage over captured `--help` text (no binary, no GPU)

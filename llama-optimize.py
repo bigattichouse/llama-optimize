@@ -1311,6 +1311,8 @@ def ngram_child_levels(variant: str) -> dict:
 #                  "float" real value, refined by keeping top levels
 #                  "cat"   categorical, refined by keeping top levels
 #                  "bool"  0/1; bench takes the value, server emits a bare flag
+#   off_flag     : bool only — the server spelling for "disabled", when llama.cpp
+#                  defaults the flag ON so omitting it would NOT disable it
 #   server_only  : only meaningful with the server driver
 #   request      : request-time (n_depth) — not a server launch arg
 #   translate    : map named level -> real value ("" ⇒ omit the flag)
@@ -1404,6 +1406,47 @@ FACTORS = {
                             "server_only": True, "active_when": ("ngram", {"ngram-mod"}),
                             "derived_from": ("ngram_mod_n_min", "offset"),
                             "relation": "at_least", "abs_name": "ngram_mod_n_max"},
+    # --- model loading / buffer placement (docs/remaining-factors-design.md) ---
+    # Registered but NOT auto-swept (R1): reachable via --factor, kept out of the
+    # default design because nothing detectable says whether they matter here.
+    # long spelling on both drivers so the swept flag and the fixed one
+    # (load_mode_args) are literally the same string — R4 is then checkable
+    "load_mode":    {"bench": ("--load-mode",), "server": ("--load-mode",),
+                     "kind": "cat"},
+    # Named for the NEGATIVE spelling because llama.cpp is (R2): bench has
+    # `-nopo <0|1>` and server `--no-op-offload`, so one level means one thing on
+    # both drivers and nothing has to be inverted.
+    "no_op_offload": {"bench": ("-nopo",), "server": ("--no-op-offload",),
+                      "kind": "bool", "off_flag": "--op-offload"},
+    "no_host":      {"bench": ("--no-host",), "server": ("--no-host",), "kind": "bool"},
+    # default ON upstream, so 0 must emit --no-repack rather than nothing (R3)
+    "repack":       {"bench": None, "server": ("--repack",), "kind": "bool",
+                     "off_flag": "--no-repack", "server_only": True},
+    # --- attention / cache shape (server only) ---
+    "swa_full":     {"bench": None, "server": ("--swa-full",), "kind": "bool",
+                     "server_only": True},
+    "ctx_checkpoints": {"bench": None, "server": ("-ctxcp",), "kind": "num",
+                        "server_only": True},
+    "checkpoint_min_step": {"bench": None, "server": ("-cms",), "kind": "num",
+                            "server_only": True},
+    # --- sampling placement (server only) ---
+    "backend_sampling": {"bench": None, "server": ("--backend-sampling",),
+                         "kind": "bool", "server_only": True},
+    # --- process priority ---
+    "prio":         {"bench": ("--prio",), "server": ("--prio",), "kind": "num"},
+    "prio_batch":   {"bench": None, "server": ("--prio-batch",), "kind": "num",
+                     "server_only": True},
+    # --- batch-phase CPU affinity: the twins of the knobs above. We already
+    # sweep threads_batch, so we already believe the batch phase is worth its own
+    # tuning; these complete that surface.
+    "cpu_mask_batch":   {"bench": None, "server": ("-Cb",), "kind": "cat",
+                         "server_only": True},
+    "cpu_range_batch":  {"bench": None, "server": ("-Crb",), "kind": "cat",
+                         "server_only": True},
+    "cpu_strict_batch": {"bench": None, "server": ("--cpu-strict-batch",),
+                         "kind": "cat", "server_only": True},
+    "poll_batch":       {"bench": None, "server": ("--poll-batch",), "kind": "cat",
+                         "server_only": True},
     # --- concurrency (server only) ---
     "parallel":     {"bench": None, "server": ("--parallel",), "kind": "num", "server_only": True},
     # --- context extension / capability (server only) ---
@@ -1723,6 +1766,11 @@ def factor_flags(cfg: Config, f: dict, driver: str) -> list[list[str]]:
             if driver == "server":
                 if str(val) in ("1", "on", "true", "True"):
                     groups.append([flags[0]])      # server: bare flag when enabled
+                elif spec.get("off_flag"):
+                    # llama.cpp defaults this ON, so "disabled" has to be SAID.
+                    # Emitting nothing would leave it enabled while the column
+                    # claims otherwise (docs/remaining-factors-design.md, R3).
+                    groups.append([spec["off_flag"]])
             else:
                 groups.append([flags[0], str(val)])  # bench: -flag 0|1
         else:
@@ -1756,7 +1804,9 @@ def bench_command(cfg: Config, f: dict) -> list[str]:
     cmd = [
         str(cfg.llama_bench),
         "-m", str(cfg.model),
-        *load_mode_args(cfg.llama_bench, "bench"),
+        # fixed unless swept: emitting both would give llama.cpp the flag twice
+        # and it takes the last one (docs/remaining-factors-design.md, R4)
+        *(load_mode_args(cfg.llama_bench, "bench") if "load_mode" not in f else []),
         "-p", str(cfg.n_prompt),
         "-n", str(cfg.n_gen),
         "-r", str(cfg.reps),
@@ -1831,7 +1881,7 @@ def server_command(cfg: Config, f: dict, ctx: int) -> str:
     parts = [f"-m {cfg.model.name}", f"-c {ctx}"]
     # one part per flag+value: `parts` is rendered one-per-line in the emitted
     # command, and a bare "--load-mode" over "mmap" reads like two flags
-    _lm = load_mode_args(cfg.llama_server, "server")
+    _lm = load_mode_args(cfg.llama_server, "server") if "load_mode" not in f else []
     if _lm:
         parts.append(" ".join(_lm))
     if "fa" not in f:
@@ -2065,7 +2115,8 @@ def build_server_args(cfg: Config, f: dict, port: int, n_ctx: int) -> list[str]:
     # unknown arguments outright. Spelled `--fit off`; there is no `--no-fit`.
     if supports_flag(cfg.llama_server, "--fit"):
         args += ["--fit", "off"]
-    args += load_mode_args(cfg.llama_server, "server")
+    if "load_mode" not in f:                       # fixed unless swept (R4)
+        args += load_mode_args(cfg.llama_server, "server")
     if "fa" not in f:                              # flash-attn fixed unless swept
         args += ["-fa", str(FIXED_FA)]
     if "batch_ratio" not in f:
@@ -3521,6 +3572,56 @@ def selftest() -> bool:
             # "on" is the ABSENCE of a flag. Emitting -mmp there would be fatal.
             assert load_mode_args(Path("old"), "server", True) == []
             assert load_mode_args(Path("old"), "server", False) == ["--no-mmap"]
+            # R4: swept and fixed emission must not both fire, or llama.cpp
+            # takes the last flag and the row measures something else
+            cfg_lm = Config(model=Path("m"), llama_bench=Path("lm"),
+                            llama_server=Path("lm"), array="auto", ctx_floor=8192,
+                            hw={"phys": 8, "logical": 16, "n_layers": 32,
+                                "n_ctx_train": 32768, "n_experts": 0, "n_nextn": 0})
+            c_swept = bench_command(cfg_lm, {"load_mode": "mlock", "ubatch": "512"})
+            assert c_swept.count("--load-mode") == 1, c_swept
+            assert c_swept[c_swept.index("--load-mode") + 1] == "mlock", c_swept
+            c_fixed = bench_command(cfg_lm, {"ubatch": "512"})
+            assert c_fixed.count("--load-mode") == 1, c_fixed
+            assert c_fixed[c_fixed.index("--load-mode") + 1] == "mmap", c_fixed
+            s_swept = build_server_args(cfg_lm, {"load_mode": "dio", "ubatch": "512"},
+                                        8080, 4096)
+            assert s_swept.count("--load-mode") == 1, s_swept
+            assert s_swept[s_swept.index("--load-mode") + 1] == "dio", s_swept
+
+            # F3: llama.cpp defaults --op-offload and --repack ON, so a disabled
+            # level must SAY so. Emitting nothing would leave the feature on
+            # while the column records 0 -- a row measuring the opposite of its
+            # own label, which is the issue-#8 shape in a new place.
+            off = _flat(factor_flags(cfg_lm, {"no_op_offload": "0"}, "server"))
+            assert off == ["--op-offload"], off
+            on = _flat(factor_flags(cfg_lm, {"no_op_offload": "1"}, "server"))
+            assert on == ["--no-op-offload"], on
+            rp0 = _flat(factor_flags(cfg_lm, {"repack": "0"}, "server"))
+            assert rp0 == ["--no-repack"], rp0
+            rp1 = _flat(factor_flags(cfg_lm, {"repack": "1"}, "server"))
+            assert rp1 == ["--repack"], rp1
+            # a default-OFF boolean keeps the old behaviour: absent means absent
+            assert _flat(factor_flags(cfg_lm, {"no_host": "0"}, "server")) == []
+            assert _flat(factor_flags(cfg_lm, {"no_host": "1"}, "server")) == ["--no-host"]
+
+            # F2: one level, one meaning, on both drivers. The bench spelling is
+            # negative (-nopo <0|1>) and the server spelling is a positive/negative
+            # pair; naming the factor for the negative is what keeps them aligned.
+            b_on = _flat(factor_flags(cfg_lm, {"no_op_offload": "1"}, "bench"))
+            assert b_on == ["-nopo", "1"], b_on
+            b_off = _flat(factor_flags(cfg_lm, {"no_op_offload": "0"}, "bench"))
+            assert b_off == ["-nopo", "0"], b_off
+
+            # F1: every registered knob is reachable by name -- a registry entry
+            # --factor would reject is the bug this batch exists to fix.
+            for _n in ("load_mode", "no_op_offload", "no_host", "repack",
+                       "swa_full", "backend_sampling", "prio", "prio_batch",
+                       "ctx_checkpoints", "checkpoint_min_step", "cpu_mask_batch",
+                       "cpu_range_batch", "cpu_strict_batch", "poll_batch"):
+                assert _n in FACTORS, _n
+                assert FACTORS[_n].get("server"), _n     # all reach the server
+            assert not validate_factor_registry(), validate_factor_registry()
             for drv in ("bench", "server"):
                 for binary in (Path("lm"), Path("old")):
                     for on in (True, False):
