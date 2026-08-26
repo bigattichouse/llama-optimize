@@ -2519,9 +2519,25 @@ def score_of(r: dict) -> float:
     return float(r.get("eff_tps", r.get("tg_tps", 0.0)))
 
 
+def measured_ok(rows: list[dict]) -> list[dict]:
+    """Rows that both succeeded AND produced a number worth acting on.
+
+    `status == "OK"` alone is not enough, and the gap is reachable: a run that
+    completes but generates nothing keeps status OK, because
+    `implausible_reason` deliberately passes on `tg <= 0` ("not a measurement;
+    other paths own it"). This is that other path.
+
+    It matters wherever a row is SELECTED rather than counted. `longest` keys on
+    depth first, so a zero-throughput row at the deepest depth wins outright and
+    gets recommended as the max-context config — a command that loads and then
+    produces nothing. Same lineage as issue #3: "OK" only ever meant the process
+    exited cleanly."""
+    return [r for r in rows if r.get("status") == "OK" and score_of(r) > 0]
+
+
 def pareto_frontier(rows: list[dict]) -> list[dict]:
     """Non-dominated set maximizing (context depth, objective score) among OK."""
-    ok = [r for r in rows if r["status"] == "OK" and score_of(r) > 0]
+    ok = measured_ok(rows)
     frontier = []
     for r in ok:
         depth, s = int(r["n_depth"]), score_of(r)
@@ -2597,7 +2613,7 @@ def pick_recommendations(cfg: Config, rows: list[dict]):
     the best score *measured at* depth >= the floor (speed while actually deep
     in context); LONGEST is the deepest OK row.
     """
-    ok = [r for r in rows if r["status"] == "OK"]
+    ok = measured_ok(rows)      # never recommend a config that produced nothing
     if not ok:
         return None, None, None
 
@@ -3142,7 +3158,7 @@ def run_probe_stage(cfg: Config, all_rows: list[dict], timeout: int,
     None. The probe searches BEYOND the swept depth grid (up to the model's
     native context / --max-context), so its ceiling is an extrapolation the
     sweep never benchmarked — the report labels it as such."""
-    ok = [r for r in all_rows if r["status"] == "OK"]
+    ok = measured_ok(all_rows)  # a zero-throughput row is a bad probe seed too
     if not ok:
         return None
     # Probe the config that reaches FURTHEST (max measured depth, then
@@ -4375,6 +4391,26 @@ def selftest() -> bool:
         assert score_of({**bad, "eff_tps": 0.0}) == 0.0
         # and it is excluded everywhere status == "OK" gates
         assert pareto_frontier([bad]) == []
+
+        # A run can COMPLETE and still generate nothing: implausible_reason
+        # deliberately passes on tg <= 0, so status stays OK with a zero score.
+        # That row must never be SELECTED — `longest` keys on depth first, so
+        # without the guard the deepest zero row is recommended as the
+        # max-context config: a command that loads and then produces nothing.
+        cfg_pick = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
+                          ctx_floor=8192)
+        _real = {"status": "OK", "n_depth": "8192", "pp_tps": 400.0,
+                 "tg_tps": 25.0, "eff_tps": 25.0, "ngl": "32"}
+        _empty = {"status": "OK", "n_depth": "65536", "pp_tps": 400.0,
+                  "tg_tps": 0.0, "eff_tps": 0.0, "ngl": "32"}
+        assert implausible_reason(400.0, 0.0) is None      # the reachable gap
+        assert measured_ok([_real, _empty]) == [_real]
+        _f, _b, _l = pick_recommendations(cfg_pick, [_real, _empty])
+        assert _l is _real, _l          # deepest ZERO row must not win LONGEST
+        assert _f is _real and _b is _real
+        # and with nothing measurable at all, recommend nothing rather than a zero
+        assert pick_recommendations(cfg_pick, [_empty]) == (None, None, None)
+        assert pareto_frontier([_real, _empty]) == [_real]
         good = validate_measurement({"status": "OK", "pp_tps": 444.1,
                                      "tg_tps": 25.0, "secs": 5.0})
         assert good["status"] == "OK" and good["tg_tps"] == 25.0

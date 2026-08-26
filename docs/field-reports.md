@@ -281,10 +281,40 @@ once per-request timings are recorded, which F1 now does. Energy is a genuinely
 new axis and an interesting one on an MI50, where the thermal ceiling is already
 the dominant noise source.
 
-**A designed prompt battery.** They have a whole document on it
-(`06-diseno-bateria-prompts.md`). We send one identical prompt for every rep,
-which F4 established is not a neutral choice but an active distortion. Worth
-reading before building `--prefix-reuse`.
+**A designed prompt battery.** `06-diseno-bateria-prompts.md` is worth reading in
+full before building `--prefix-reuse`. 100 prompts, fixed seed, five categories
+mixed by how real traffic is distributed rather than evenly: simple QA 40%
+(~32 output tokens, stresses TTFT), complex reasoning 20% (~384, stresses sustained
+decode), code 20% (~256), RAG/long-input-short-output 15% (~64, stresses prefill),
+long context 5% (~24k input, stresses the KV cache). The justification is that
+"real LLM traffic tends to be dominated by simple requests" while being
+"conditioned at high percentiles by costly requests" — which is an argument our
+three size-only `PROFILES` cannot currently express.
+
+**They hit our F4 problem and instrumented it rather than avoiding it.** With
+prefix caching on, repeated prompts inflate throughput — the same contamination
+F4 measured at 2.3-3.4x for ngram. Their battery is generated once and reused
+across trials, and when a category needs more prompts than its bank holds they
+resample *with replacement*, so duplicates are possible; `duplication_report()`
+exists to quantify how much duplication a given battery will produce. That is a
+better answer than either ignoring it or assuming it away: **measure the
+contamination and report it alongside the result.** Worth copying — our
+`--prefix-reuse` should report the reuse fraction it actually achieved, not just
+the one that was asked for.
+
+**Their objective guards one of ours did not.** They "explicitly discard
+configurations with zero measurements to prevent spurious Pareto dominance".
+Checking ours: `pareto_frontier` already required `score_of(r) > 0`, but
+`pick_recommendations` filtered on `status == "OK"` alone — and since `longest`
+keys on depth before score, a completed-but-empty run at the deepest depth won
+the max-context recommendation outright. Fixed, with a regression test that fails
+without the guard. See [`measurement-validity.md`](measurement-validity.md).
+
+Their objective function is also worth recording as a contrast:
+`score = throughput − 0.01·p95_latency_ms − 1.0·error_rate·1000`, so a 10% error
+rate costs 100 points and an unstable configuration cannot win on speed. Ours
+scores failures as 0 and excludes them, which is a blunter version of the same
+intent — theirs degrades gracefully where ours is a cliff.
 
 ## F5 — Legacy/mixed-vendor builds (recorded, out of scope)
 

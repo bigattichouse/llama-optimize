@@ -187,6 +187,13 @@ dimension and should not be smuggled into the first one.
 ## Checklist
 
 - [ ] `--prefix-reuse PCT` input on `Config`, defaulted per profile (W-D2)
+- [ ] Report the reuse fraction actually **achieved**, not just requested — the
+      Bayesian autotuner's `duplication_report()` quantifies contamination rather
+      than assuming it away ([`field-reports.md`](field-reports.md) F6)
+- [ ] Consider a category-weighted battery rather than one prompt shape: their
+      mix is 40% short-QA / 20% reasoning / 20% code / 15% RAG / 5% long-context,
+      justified by real traffic being dominated by cheap requests but
+      *conditioned at high percentiles* by expensive ones (F6)
 - [ ] Prompt generator: one sweep-stable prefix + per-request fresh suffix,
       sharing `_realistic_prompt`'s prose (W-D3)
 - [ ] `ServerSession.measure`: distinct suffix per rep and per concurrent slot,

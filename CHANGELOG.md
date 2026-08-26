@@ -100,6 +100,16 @@ earlier.
 
 ### Fixed
 
+- **A completed-but-empty run could be recommended as the max-context config.**
+  A run that finishes without generating anything keeps `status == "OK"` with a
+  zero score — `implausible_reason` deliberately passes on `tg <= 0`, since
+  nothing impossible happened. `pick_recommendations` filtered on status alone
+  and computes `longest` as `max(ok, key=(depth, score))`, depth first, so such a
+  row at the deepest depth won outright and was handed over as a paste-ready
+  command that loads and then produces nothing. `pareto_frontier` was already
+  guarded; recommendations and the max-context probe seed now share the same
+  `measured_ok` filter. Counting paths still use plain status, because a run that
+  completed did complete.
 - **Stop emitting the deprecated `-mmp` / `--no-mmap`.** Model loading is now
   pinned with `--load-mode`, probed via `supports_flag` so builds predating it
   keep the old spelling. This was a latent whole-sweep failure: llama.cpp does

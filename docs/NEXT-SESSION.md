@@ -81,6 +81,12 @@ Each has a checklist and a no-GPU test plan in its own doc.
 
 ## From the Bayesian autotuner (F6)
 
+Their prompt-battery and metrics docs have now been read in full; F6 records the
+detail. Two things landed already — the zero-measurement selection fix (below),
+and the note that `--prefix-reuse` should **report the reuse fraction it actually
+achieved**, not just the one requested, the way their `duplication_report()`
+quantifies contamination instead of assuming it away.
+
 [`field-reports.md`](field-reports.md) F6 reviews
 [SergioMorillas/vllm-bayesian-autotuner](https://github.com/SergioMorillas/vllm-bayesian-autotuner).
 Three concrete things to pull from it:
@@ -99,6 +105,8 @@ Three concrete things to pull from it:
 
 ## Verified this session, so you do not need to re-check
 
+- A completed-but-empty run can no longer be recommended (`measured_ok`), with a
+  regression test confirmed to fail without the guard.
 - llama.cpp rebuilt at `4d19b2876` (ROCm 7.2.1, gfx906) and confirmed on real
   inference: `backend=ROCm`, 444 t/s tg on gemma-3-270m vs 115 t/s CPU-only.
 - All 37 flags the registry emits are still accepted by that build; none removed.

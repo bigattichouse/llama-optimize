@@ -220,6 +220,32 @@ catches a CPU-only build; it was caught because `draft_acc` recorded acceptance
 and the number was implausibly perfect. That is the argument for recording
 diagnostics you do not yet know you need.
 
+## "OK" is not the same as "measured"
+
+A run can complete cleanly and still generate nothing. `implausible_reason`
+deliberately passes on `tg <= 0` — "not a measurement; other paths own it" — so
+such a row keeps `status == "OK"` with a zero score. That is correct: rejecting it
+as *implausible* would be the wrong verdict, since nothing impossible happened.
+
+The gap is what happens downstream. `status == "OK"` is a fine filter where rows
+are **counted**, and the wrong one where a row is **selected**. `pick_recommendations`
+computes `longest` as `max(ok, key=(depth, score))` — depth first, score only as a
+tie-break — so a zero-throughput row at the deepest depth wins outright and is
+handed to the user as the max-context recommendation: a command that loads and
+then produces nothing.
+
+`measured_ok` is the shared filter for selection paths: OK **and** a score worth
+acting on. `pareto_frontier` already applied it inline; `pick_recommendations` and
+the max-context probe seed did not, and now do. Counting paths (the "N/M configs
+succeeded" line) deliberately still use plain `status`, because a run that
+completed did complete.
+
+Found by reading another tool's methodology docs rather than by hitting it: a
+Bayesian vLLM autotuner documents discarding zero-measurement configurations "to
+prevent spurious Pareto dominance" ([`field-reports.md`](field-reports.md) F6).
+Our Pareto was already guarded; our *recommendations* were not, which is the more
+user-visible of the two.
+
 ## What this does not do
 
 It does not explain *why* generation returned early on the reporter's
