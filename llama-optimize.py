@@ -1461,10 +1461,87 @@ FACTORS = {
                          "server_only": True},
     # --- concurrency (server only) ---
     "parallel":     {"bench": None, "server": ("--parallel",), "kind": "num", "server_only": True},
+    # Emitted by build_server_args rather than factor_flags: a level maps to
+    # zero, two or three flags, which a flag tuple cannot express.
+    "concurrency":  {"bench": None, "server": None, "kind": "cat", "server_only": True,
+                     "emitted_by_caller": True},
     # --- context extension / capability (server only) ---
     "rope_scaling": {"bench": None, "server": ("--rope-scaling",), "kind": "cat", "server_only": True},
     "yarn_factor":  {"bench": None, "server": ("--yarn-ext-factor",), "kind": "float", "server_only": True},
 }
+
+
+# ---------------------------------------------------------------------------
+# Concurrency and the unified KV cache — docs/concurrency-kv-design.md.
+#
+# llama.cpp couples these two, so they cannot ride an orthogonal array as free
+# columns. llama-server defaults slots to auto (common/arg.cpp), and auto means
+# 4 slots AND kv_unified=true (tools/server/server.cpp); ANY explicit --parallel
+# disables unified KV, including --parallel 1, because the branch tests < 0.
+#
+# So one categorical over the combinations that actually exist (K1), rather than
+# a `parallel` number plus a `kv_unified` boolean that could express states
+# llama.cpp cannot be put into.
+# ---------------------------------------------------------------------------
+def concurrency_spec(level: str) -> tuple:
+    """(slots, unified) for a `concurrency` level.
+
+    Levels: "auto" (emit nothing — llama.cpp picks 4 slots and unified KV),
+    "N" (--parallel N, split KV), "Nu" (--parallel N --kv-unified)."""
+    lv = str(level).strip().lower()
+    if lv in ("auto", ""):
+        return 4, True                  # what llama.cpp itself chooses
+    unified = lv.endswith("u")
+    try:
+        slots = int(lv[:-1] if unified else lv)
+    except ValueError:
+        return 1, False
+    return max(1, slots), unified
+
+
+def slots_for(cfg, f: dict) -> int:
+    """Slots this row actually runs with, whichever knob set them.
+
+    `concurrency` wins where present because it is the one that can also say
+    `auto`; otherwise the older `parallel` factor, then the config default."""
+    if "concurrency" in f:
+        return concurrency_spec(f["concurrency"])[0]
+    return int(f.get("parallel", getattr(cfg, "parallel", 1)))
+
+
+def kv_unified_for(cfg, f: dict) -> bool:
+    """Whether this row runs with a unified KV cache — derivable from the flags,
+    so it can be RECORDED rather than guessed at read time (KV2).
+
+    True only when llama.cpp chooses it (slots left auto) or we ask for it
+    explicitly; any bare --parallel leaves it off, including --parallel 1."""
+    if "concurrency" in f:
+        return concurrency_spec(f["concurrency"])[1]
+    if "parallel" in f:
+        return False                    # explicit --parallel always disables it
+    return int(getattr(cfg, "parallel", 1)) <= 1   # nothing emitted -> auto
+
+
+def concurrency_flags(level: str) -> list:
+    """Server flags for a `concurrency` level. `auto` emits nothing — that is
+    the whole point of it, and the state we could not previously reach (KV3)."""
+    lv = str(level).strip().lower()
+    if lv in ("auto", ""):
+        return []
+    slots, unified = concurrency_spec(level)
+    return ["--parallel", str(slots)] + (["--kv-unified"] if unified else [])
+
+
+def ctx_slots_multiplier(level: str) -> int:
+    """How many times the per-slot context to request for this level (K3).
+
+    llama.cpp gives a slot the FULL n_ctx under unified KV and `n_ctx / slots`
+    when the cache is split (src/llama-context.cpp): so a split regime must ask
+    for slots x the per-slot context, and a unified one must not. Getting this
+    backwards would silently give every row a different real context than its
+    ctx_floor claims — the batch-floor defect in a new place (KV4)."""
+    slots, unified = concurrency_spec(level)
+    return 1 if unified else slots
 
 
 # ---------------------------------------------------------------------------
@@ -1902,7 +1979,10 @@ def server_command(cfg: Config, f: dict, ctx: int) -> str:
         parts.append(f"-b {max(FIXED_BATCH, ub)}")
     parts += [" ".join(shlex.quote(t) for t in g)
               for g in factor_flags(cfg, f, "server")]
-    if "parallel" not in f and cfg.parallel > 1:
+    if "concurrency" in f:
+        parts += [" ".join(concurrency_flags(f["concurrency"]))] if \
+            concurrency_flags(f["concurrency"]) else []
+    elif "parallel" not in f and cfg.parallel > 1:
         parts.append(f"--parallel {cfg.parallel}")
     # Multi-token prediction: if the model ships a NextN/MTP head, enable
     # draft-mtp speculative decoding for extra generation throughput. With the
@@ -2191,7 +2271,9 @@ def build_server_args(cfg: Config, f: dict, port: int, n_ctx: int) -> list[str]:
     if "batch_ratio" not in f:
         args += ["-b", str(max(FIXED_BATCH, ub))]
     args += _flat(factor_flags(cfg, f, "server"))
-    if "parallel" not in f and cfg.parallel > 1:   # concurrency (fixed) if not swept
+    if "concurrency" in f:                        # swept: level decides the flags
+        args += concurrency_flags(f["concurrency"])
+    elif "parallel" not in f and cfg.parallel > 1:  # concurrency (fixed) if not swept
         args += ["--parallel", str(cfg.parallel)]
     if cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0:
         if "mtp" not in f:                         # MTP fixed on unless swept
@@ -2846,7 +2928,7 @@ def measure_in_session(cfg: Config, f: dict, session, timeout: int) -> dict:
         return {"status": status, "pp_tps": 0.0, "tg_tps": 0.0, "secs": 0.0,
                 "vram_mib": 0}
     prompt_len = cfg.n_prompt + int(f.get("n_depth", 0))
-    par = int(f.get("parallel", cfg.parallel))
+    par = slots_for(cfg, f)
     sampler = VRAMSampler().__enter__() if cfg.measure_vram else None
     status, m = "OK", {}
     try:
@@ -2866,6 +2948,9 @@ def measure_in_session(cfg: Config, f: dict, session, timeout: int) -> dict:
            "err_rate": round(err_rate, 4),
            # what the battery ACTUALLY shared, not what was asked for (F6)
            "reuse": m.get("reuse", ""),
+           # derivable from the emitted flags, so recorded rather than left to
+           # be re-derived by whoever reads the CSV later (KV2)
+           "kv_unified": 1 if kv_unified_for(cfg, f) else 0,
            "secs": time.time() - t0, "vram_mib": sampler.peak if sampler else 0}
     if status == "OK":                     # speculative telemetry (F1) — a
         res.update(draft_cols(cfg, f, m.get("draft", {})))  # never sets status
@@ -2880,11 +2965,12 @@ def measure_in_session(cfg: Config, f: dict, session, timeout: int) -> dict:
 def server_run_one(cfg: Config, f: dict, timeout: int):
     """Standalone server measurement for one config (own session). Used by the
     context probe; the sweep groups configs to reuse sessions instead."""
-    par = int(f.get("parallel", cfg.parallel))
+    par = slots_for(cfg, f)
     prompt_len = cfg.n_prompt + int(f.get("n_depth", 0))
-    n_ctx = prompt_len + cfg.n_gen + 256
-    if par > 1:
-        n_ctx *= par
+    # K3: a slot gets the full n_ctx under unified KV and n_ctx/slots when split,
+    # so only the split regime asks for slots x the per-slot context.
+    n_ctx = (prompt_len + cfg.n_gen + 256) * ctx_slots_multiplier(
+        f.get("concurrency", str(par) if par > 1 else "1"))
     session = ServerSession(cfg, f, n_ctx, timeout)
     try:
         return measure_in_session(cfg, f, session, timeout)
@@ -5039,6 +5125,52 @@ def selftest() -> bool:
         assert PROFILES["single"]["prefix_reuse"] == 0.0
         assert PROFILES["multi"]["prefix_reuse"] == 0.0
         assert PROFILES["agents"]["prefix_reuse"] == 0.9
+
+        # --- concurrency / kv_unified (docs/concurrency-kv-design.md) ---
+        # llama.cpp couples these: auto means 4 slots AND unified KV, and ANY
+        # explicit --parallel disables unified -- including --parallel 1, because
+        # the branch tests < 0. One categorical over the states that exist.
+        assert concurrency_spec("auto") == (4, True)
+        assert concurrency_spec("8") == (8, False)
+        assert concurrency_spec("8u") == (8, True)
+        assert concurrency_spec("1") == (1, False)      # NOT unified
+        assert concurrency_spec("nonsense") == (1, False)
+        # KV3: auto must be reachable, and it is the level that emits nothing
+        assert concurrency_flags("auto") == []
+        assert concurrency_flags("8") == ["--parallel", "8"]
+        assert concurrency_flags("8u") == ["--parallel", "8", "--kv-unified"]
+        # K3: ask for slots x per-slot context ONLY when the cache is split.
+        # A slot gets the full n_ctx under unified KV and n_ctx/slots when split
+        # (src/llama-context.cpp), so inverting this silently gives every row a
+        # different real context than its ctx_floor claims.
+        assert ctx_slots_multiplier("auto") == 1        # unified: no division
+        assert ctx_slots_multiplier("8") == 8           # split: divided by 8
+        assert ctx_slots_multiplier("8u") == 1
+        assert ctx_slots_multiplier("1") == 1
+        # KV1: no thresholds -- the level decides, not a `> 1` test
+        cfg_cc = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
+                        ctx_floor=8192, driver="server", parallel=1,
+                        hw={"phys": 8, "logical": 16, "n_layers": 32,
+                            "n_ctx_train": 32768, "n_experts": 0, "n_nextn": 0})
+        for lvl, want_np in (("auto", False), ("1", True), ("4", True), ("4u", True)):
+            a = build_server_args(cfg_cc, {"concurrency": lvl, "ubatch": "512"},
+                                  8080, 4096)
+            assert ("--parallel" in a) is want_np, (lvl, a)
+            assert ("--kv-unified" in a) is concurrency_spec(lvl)[1] or lvl == "auto", (lvl, a)
+        # KV2: the recorded regime matches the flags for every level
+        for lvl in ("auto", "1", "4", "4u", "8u"):
+            a = build_server_args(cfg_cc, {"concurrency": lvl, "ubatch": "512"},
+                                  8080, 4096)
+            emitted_unified = "--kv-unified" in a or "--parallel" not in a
+            assert kv_unified_for(cfg_cc, {"concurrency": lvl}) == emitted_unified, lvl
+        # the older `parallel` factor keeps working, and always splits the cache
+        assert kv_unified_for(cfg_cc, {"parallel": "4"}) is False
+        assert kv_unified_for(cfg_cc, {"parallel": "1"}) is False
+        assert slots_for(cfg_cc, {"parallel": "6"}) == 6
+        assert slots_for(cfg_cc, {"concurrency": "6u"}) == 6
+        assert slots_for(cfg_cc, {}) == 1
+        # nothing emitted at all -> llama.cpp picks auto -> unified
+        assert kv_unified_for(cfg_cc, {}) is True
         for _n, _p in PROFILES.items():
             assert 0.0 <= _p["prefix_reuse"] <= 1.0, _n
 
@@ -5291,7 +5423,7 @@ def load_results_csv(path: Path, factors: dict) -> list[dict]:
 RESULT_COLS = {"run_id", "pp_tps", "tg_tps", "eff_tps", "status", "secs",
                "temp_c", "vram_mib", "implausible", "draft_acc", "spec_off",
                "tool_version", "llama_build", "backend", "err_rate", "reuse",
-               "draft_cov"}
+               "draft_cov", "kv_unified"}
 
 
 def merge_result_rows(cfg: Config, rows: list[dict],
@@ -6491,7 +6623,8 @@ def main():
             + (["vram_mib"] if cfg.measure_vram else [])
             + (["draft_acc", "draft_cov", "spec_off"]
                if spec_cols_wanted(cfg) else [])
-            + (["backend"] if cfg.driver == "bench" else ["err_rate", "reuse"])
+            + (["backend"] if cfg.driver == "bench"
+               else ["err_rate", "reuse", "kv_unified"])
             + ["tool_version", "llama_build"])
 
     # Resume keys on run_id (unique per array row), not config values, because
@@ -6598,9 +6731,9 @@ def main():
                 launch = pending[0]["factors"]
                 par = int(launch.get("parallel", cfg.parallel))
                 max_depth = max(int(r["factors"].get("n_depth", 0)) for r in pending)
-                n_ctx = cfg.n_prompt + max_depth + cfg.n_gen + 256
-                if par > 1:
-                    n_ctx *= par
+                n_ctx = (cfg.n_prompt + max_depth + cfg.n_gen + 256) * \
+                    ctx_slots_multiplier(launch.get(
+                        "concurrency", str(par) if par > 1 else "1"))
                 lp = (f"server launch: ngl={launch['ngl']} kv={launch['kv_type']} "
                       f"ub={launch['ubatch']} ctx={n_ctx}")
                 lk = load_key_str(cfg, launch)

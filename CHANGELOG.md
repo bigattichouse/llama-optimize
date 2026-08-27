@@ -25,6 +25,20 @@ earlier.
 
 ### Added
 
+- **`concurrency` factor, and `kv_unified` recorded per row.** llama.cpp couples
+  slot count and the unified KV cache, so they cannot ride an orthogonal array as
+  two free columns: auto means 4 slots *and* unified, and any explicit
+  `--parallel` disables unified — including `--parallel 1`. The factor is one
+  categorical over the states that exist: `auto` (emit nothing), `N`
+  (`--parallel N`, split cache), `Nu` (`--parallel N --kv-unified`).
+
+  `auto` is the point of it. It is llama.cpp's own default and was previously
+  unreachable, because the tool always passed `--parallel` explicitly whenever
+  concurrency was non-trivial. Every level was verified against a real server's
+  log, including that `-c 2048` gives each of 4 split slots `n_ctx_slot = 512`
+  while a unified 4-slot server gives each the full 2048 — the context rule the
+  design was blocked on. The older `parallel` factor still works and always
+  splits the cache.
 - **`SIGNAL` status** — a run whose process was killed by a signal is no longer
   filed as a generic `ERROR`. The two mean different things and only one is about
   the config: a process that *ran and returned an error* was rejected by

@@ -102,6 +102,36 @@ N private caches do not cost the same, and `predict_fits` currently reasons abou
 neither. The pruner must take the regime as an input, and must stay conservative:
 a wrongly-skipped viable config is worse than a wasted OOM run.
 
+## Implemented, and verified against llama.cpp's own log
+
+`concurrency` is a categorical over the states llama.cpp can actually be put
+into. Every level was checked by launching a real server and reading what it
+reported, rather than by reasoning from the source:
+
+| level | flags emitted | llama.cpp reports | K3 multiplier |
+|---|---|---|---|
+| `auto` | *(none)* | `n_slots = 4, kv_unified = 'true'` | 1 |
+| `1` | `--parallel 1` | `n_slots = 1, kv_unified = 'false'` | 1 |
+| `4` | `--parallel 4` | `n_slots = 4, n_ctx_slot = 512, kv_unified = 'false'` | 4 |
+| `4u` | `--parallel 4 --kv-unified` | `n_slots = 4, n_ctx_slot = 2048, kv_unified = 'true'` | 1 |
+
+Two things this confirms that were previously read out of the source:
+
+**`--parallel 1` really does disable unified KV.** Not a quirk of the branch as
+written — llama.cpp logs `kv_unified = 'false'` for it, while emitting nothing at
+all gives `'true'`. Asking for the number that matches the default still changes
+the regime.
+
+**K3 is settled empirically.** At `-c 2048` the split regime gives each slot
+`n_ctx_slot = 512` — exactly 2048/4 — and the unified regime gives 2048, the
+whole thing. So `n_ctx = per_slot x (slots if split else 1)`, which is what
+`ctx_slots_multiplier` implements.
+
+A pleasant discovery while settling it: the existing `if par > 1: n_ctx *= par`
+was already correct in all three reachable cases, because the multiplication
+happened to coincide with exactly the split regime. The rule is now explicit
+rather than a coincidence, which is what makes the `auto` level safe to add.
+
 ## Invariants
 
 - **KV1 — a row's emitted flags determine its regime, with no thresholds.**

@@ -78,12 +78,14 @@ What was genuinely open was item 2's last bullet, live-GPU validation, and that
 is now done: the boundary is real and the pruner is not over-conservative. It
 also surfaced the `SIGNAL` status. Details in [`../ROADMAP.md`](../ROADMAP.md).
 
-### 5. C2 / `kv_unified` — *designed, blocked on one decision*
+### 5. ~~C2 / `kv_unified`~~ — **done**
 
-[`concurrency-kv-design.md`](concurrency-kv-design.md). Blocked on settling the
-per-regime `n_ctx` rule (K3): a slot's context differs between shared and split
-KV, and guessing recreates the batch-floor defect somewhere new. That decision is
-the work; the factor is easy after it.
+K3 settled empirically rather than by argument: at `-c 2048`, four split slots
+get `n_ctx_slot = 512` each and four unified slots get 2048 each, so
+`n_ctx = per_slot x (slots if split else 1)`. The `concurrency` factor implements
+that, `auto` is reachable for the first time, and `kv_unified` is recorded per
+row. All four levels verified against llama.cpp's own log —
+[`concurrency-kv-design.md`](concurrency-kv-design.md).
 
 ### 6. Draft model / `-md` — *designed, one prerequisite*
 
