@@ -458,7 +458,7 @@ def vram_used_mib() -> int | None:
 # ---------------------------------------------------------------------------
 # Factors that can only do something when llama.cpp can see a GPU. On a CPU-only
 # build every level of these is the same run.
-GPU_ONLY_FACTORS = ("ngl", "ncmoe", "nkvo", "ot")
+GPU_ONLY_FACTORS = ("ngl", "ncmoe", "ncffn", "nkvo", "ot")
 
 
 def gpu_visibility(vram, vram_src: str, can_ask: bool) -> str:
@@ -644,10 +644,13 @@ def gpu_temp_c() -> float | None:
 # before running a config — skip configs that can't fit, saving a model load
 # + timeout per doomed row (ROADMAP item 2).
 # ---------------------------------------------------------------------------
-def _fit_params_flags(f: dict, driver: str) -> list[str]:
+def _fit_params_flags(cfg: "Config", f: dict, driver: str) -> list[str]:
     """Build llama-fit-params args from the VRAM-relevant factors in a run row.
     Only the factors that affect memory footprint are forwarded; the rest of the
-    config (threads, poll, batch, spec knobs) is irrelevant to the estimate."""
+    config (threads, poll, batch, spec knobs) is irrelevant to the estimate.
+    A flag the fit-params binary predates (ncffn on pre b10645 builds) is
+    dropped rather than forwarded — forwarding it would fail the estimate and
+    disable pruning for every row carrying that factor."""
     flags = []
     # GPU layers
     if "ngl" in f:
@@ -669,6 +672,9 @@ def _fit_params_flags(f: dict, driver: str) -> list[str]:
     # MoE expert offload
     if "ncmoe" in f:
         flags += ["-ncmoe", f["ncmoe"]]
+    # Dense FFN offload (recent flag, llama.cpp #26622 — gate on the binary)
+    if "ncffn" in f and supports_flag(cfg.fit_params, "-ncffn"):
+        flags += ["-ncffn", f["ncffn"]]
     return flags
 
 
@@ -692,7 +698,7 @@ _fit_cache: dict[tuple, bool | None] = {}
 
 def _fit_cache_key(cfg: "Config", f: dict, driver: str) -> tuple:
     """Identity of a fit estimate: the model plus the exact args we'd pass."""
-    return (str(cfg.model), tuple(_fit_params_flags(f, driver)))
+    return (str(cfg.model), tuple(_fit_params_flags(cfg, f, driver)))
 
 
 def parse_fit_print(stdout: str) -> int:
@@ -734,7 +740,7 @@ def predict_fits(cfg: "Config", f: dict, driver: str) -> bool | None:
     try:
         args = [str(cfg.fit_params), "-m", str(cfg.model),
                 "--fit-print", "on"]
-        args += _fit_params_flags(f, driver)
+        args += _fit_params_flags(cfg, f, driver)
         proc = subprocess.run(args, capture_output=True, text=True, timeout=30)
         if proc.returncode != 0:
             # Indeterminate is a real answer and worth remembering: a binary
@@ -1005,8 +1011,8 @@ def depth_levels(n_ctx_train: int | None, override_max: int | None = None,
     return five_levels_span(floor, top)
 
 
-def ncmoe_levels(n_layers: int | None) -> list[int]:
-    """Levels for -ncmoe (how many layers keep their MoE experts on CPU)."""
+def cpu_offload_levels(n_layers: int | None) -> list[int]:
+    """Levels for a first-N-layers-on-CPU knob (-ncmoe, -ncffn): 0..n_layers."""
     return five_levels_span(0, n_layers if n_layers else 64)
 
 
@@ -1103,9 +1109,17 @@ def build_factors(cfg: Config):
     # beats dropping whole layers (attn_cpu is left out — attention on CPU
     # kills decode; exps_cpu is inert without experts).
     if cfg.hw.get("n_experts", 0) > 0:
-        factors["ncmoe"] = [str(x) for x in ncmoe_levels(n_layers)]
+        factors["ncmoe"] = [str(x) for x in cpu_offload_levels(n_layers)]
     else:
-        factors["ot"] = ["none", "ffn_up_cpu", "ffn_cpu"]
+        # Dense models: -ncffn (first N layers' FFN on CPU, llama.cpp b10645)
+        # is the convenient finer-grained form of the -ot lever and replaces it
+        # where the build has it — per-layer instead of all-or-nothing.
+        # Previous builds keep -ot.
+        drv_bin = cfg.llama_bench if cfg.driver == "bench" else cfg.llama_server
+        if supports_flag(drv_bin, "-ncffn"):
+            factors["ncffn"] = [str(x) for x in cpu_offload_levels(n_layers)]
+        else:
+            factors["ot"] = ["none", "ffn_up_cpu", "ffn_cpu"]
     # A model with an MTP/NextN head on the server driver: sweep the whole
     # speculative-decoding surface — on/off, draft lengths, and acceptance
     # thresholds — so the report MEASURES what MTP buys instead of assuming it.
@@ -1344,6 +1358,7 @@ FACTORS = {
     # --- offload / placement ---
     "ngl":          {"bench": ("-ngl",), "server": ("-ngl",), "kind": "num"},
     "ncmoe":        {"bench": ("-ncmoe",), "server": ("-ncmoe",), "kind": "num"},
+    "ncffn":        {"bench": ("-ncffn",), "server": ("-ncffn",), "kind": "num"},
     "ot":           {"bench": ("-ot",), "server": ("-ot",), "kind": "cat",
                      "translate": OT_PATTERNS},
     "nkvo":         {"bench": ("-nkvo",), "server": ("-nkvo",), "kind": "bool"},
@@ -4422,16 +4437,34 @@ def selftest() -> bool:
         finally:
             _help_cache.clear()
             _help_cache.update(_saved_help)
-        # default factor set: nkvo/poll/batch always; ot for dense / ncmoe for
-        # MoE; threads_batch + the MTP surface only on the server driver;
-        # numa only on a multi-node box
-        fs = build_factors(cfg_m)
-        assert all(k in fs for k in ("nkvo", "poll", "batch_ratio", "threads_batch",
-                                     "mtp", "spec_n_max", "spec_n_min_frac",
-                                     "spec_p_min", "spec_p_split"))
-        assert "batch" not in fs and "spec_n_min" not in fs   # renamed, now derived
-        assert "ot" in fs and "ncmoe" not in fs            # dense
-        assert "numa" not in fs                            # single NUMA node
+        # default factor set: nkvo/poll/batch always; ncffn (or ot on older
+        # builds) for dense / ncmoe for MoE; threads_batch + the MTP surface
+        # only on the server driver; numa only on a multi-node box
+        _saved_help = dict(_help_cache)
+        try:
+            _help_cache[str(cfg_m.llama_server)] = "-m, --model FNAME\n"   # older build
+            fs = build_factors(cfg_m)
+            assert all(k in fs for k in ("nkvo", "poll", "batch_ratio", "threads_batch",
+                                         "mtp", "spec_n_max", "spec_n_min_frac",
+                                         "spec_p_min", "spec_p_split"))
+            assert "batch" not in fs and "spec_n_min" not in fs   # renamed, now derived
+            assert "ot" in fs and "ncmoe" not in fs            # dense, older build
+            assert "numa" not in fs                            # single NUMA node
+        finally:
+            _help_cache.clear()
+            _help_cache.update(_saved_help)
+        # -ncffn (dense FFN offload, llama.cpp b10645) replaces -ot where the
+        # build advertises it; the flag rides both drivers
+        _saved_help = dict(_help_cache)
+        try:
+            _help_cache[str(cfg_m.llama_server)] = ("-ncffn, --n-cpu-ffn N  "
+                                                    "keep dense FFN on CPU\n")
+            fs2 = build_factors(cfg_m)
+            assert "ncffn" in fs2 and "ot" not in fs2, fs2
+            assert factor_flags(cfg_m, {"ncffn": "16"}, "server") == [["-ncffn", "16"]]
+        finally:
+            _help_cache.clear()
+            _help_cache.update(_saved_help)
         cfg_m.hw["numa_nodes"] = 2
         assert "numa" in build_factors(cfg_m)
         cfg_m.hw["numa_nodes"] = 1
@@ -5325,33 +5358,41 @@ def selftest() -> bool:
 
     # --- OOM pruning: fit-params flag generation ---
     try:
+        class _FC:                        # minimal Config stand-in
+            model = Path("m.gguf")
+            fit_params = Path("fp")
         f = {"ngl": "32", "n_depth": "32768", "kv_type": "q4_0", "nkvo": "0"}
-        bench_flags = _fit_params_flags(f, "bench")
+        bench_flags = _fit_params_flags(_FC, f, "bench")
         assert "-ngl" in bench_flags and "32" in bench_flags
         assert "-c" in bench_flags and "32768" in bench_flags
         assert "-ctk" in bench_flags and "q4_0" in bench_flags
         assert "--no-kv-offload" in bench_flags  # nkvo=0 → --no-kv-offload
 
-        server_flags = _fit_params_flags(f, "server")
+        server_flags = _fit_params_flags(_FC, f, "server")
         assert "--no-kv-offload" in server_flags  # same for both drivers
 
         # nkvo=1 (default) → no offload flag
         f2 = {"ngl": "32", "n_depth": "8192", "kv_type": "f16", "nkvo": "1"}
-        assert "--no-kv-offload" not in _fit_params_flags(f2, "bench")
-        assert "-nkvo" not in _fit_params_flags(f2, "bench")
+        assert "--no-kv-offload" not in _fit_params_flags(_FC, f2, "bench")
+        assert "-nkvo" not in _fit_params_flags(_FC, f2, "bench")
 
         # ot factor — pattern must be passed literally (no shell quoting)
         f3 = {"ngl": "32", "n_depth": "8192", "ot": "ffn_cpu"}
-        s3 = _fit_params_flags(f3, "bench")
+        s3 = _fit_params_flags(_FC, f3, "bench")
         assert "-ot" in s3
         assert s3[s3.index("-ot") + 1] == OT_PATTERNS["ffn_cpu"]
         # "none" ot → no -ot flag emitted
-        assert "-ot" not in _fit_params_flags({"ngl": "32", "n_depth": "8192", "ot": "none"}, "bench")
+        assert "-ot" not in _fit_params_flags(_FC, {"ngl": "32", "n_depth": "8192", "ot": "none"}, "bench")
 
         # ncmoe
         f4 = {"ngl": "32", "n_depth": "8192", "ncmoe": "16"}
-        s4 = _fit_params_flags(f4, "bench")
+        s4 = _fit_params_flags(_FC, f4, "bench")
         assert "-ncmoe" in s4 and "16" in s4
+
+        # ncffn is dropped when the fit-params binary predates the flag
+        # (forwarding it would fail the estimate and disable OOM pruning)
+        f5 = {"ngl": "32", "n_depth": "8192", "ncffn": "16"}
+        assert "-ncffn" not in _fit_params_flags(_FC, f5, "bench")
 
         # --- OOM pruning: the fit cache must not merge distinct footprints ---
         # A cached verdict is applied to a row that is then never run, so a
@@ -5360,8 +5401,6 @@ def selftest() -> bool:
         # must therefore reach the key. Asserted as a property (perturb one
         # factor at a time) rather than by listing names, so a VRAM-relevant
         # factor added later is covered without anyone remembering to.
-        class _FC:                        # minimal Config stand-in
-            model = Path("m.gguf")
         base = {"ngl": "32", "n_depth": "8192", "kv_type": "f16",
                 "nkvo": "1", "ncmoe": "0", "ot": "none"}
         # each perturbation changes the estimated footprint, so each must

@@ -150,6 +150,7 @@ Swept by default (auto-scaled to your hardware and model):
 | Logical batch | `-b`             | `1x, 4x, 16x` the `-ub` of the same row | prompt chunking (swept as a *multiple* of `-ub`, so `b≥ub` holds by construction — see [constrained factors](docs/CONSTRAINED-FACTORS.md)) |
 | Tensor placement | `-ot`         | `none, ffn_up_cpu, ffn_cpu`            | **dense models**: FFN tensors on CPU at full `-ngl` often beats dropping whole layers |
 | MoE expert offload | `-ncmoe`   | `0 .. n_layers` (5 levels)             | **MoE models** (replaces `-ot`): how many layers keep experts on CPU |
+| Dense FFN offload | `-ncffn`     | `0 .. n_layers` (5 levels)             | **dense models** (replaces `-ot`): how many of the first layers keep their dense FFN weights on CPU |
 | NUMA policy   | `--numa`         | `distribute, isolate`                  | **multi-NUMA-node boxes only** (inert on one node) |
 | Prefill threads | `-tb`          | same levels as `-t`                    | **server driver**: decode vs prefill thread split |
 | ngram variant  | `--spec-type <variant>` | `none, ng-simple, ng-mod, ng-map-k, ng-map-k4v` | **server driver, --ngram**: which pattern-matching variant — *screened* first (see [ngram staging](#ngram-staged-search)) |
@@ -639,6 +640,7 @@ registry in `llama-optimize.py`.
 | `kv_type` | `-ctk -ctv` | both | cat | swept | KV cache precision (buys context) |
 | `ubatch` | `-ub` | both | num | swept | physical micro-batch |
 | `ncmoe` | `-ncmoe` | both | num | swept¹ | MoE expert layers kept on CPU |
+| `ncffn` | `-ncffn` | both | num | swept¹ | dense FFN layers kept on CPU |
 | `batch_ratio` | `-b` | both | num | swept | logical batch, as a **multiple of `ubatch`** (`-b` = `batch_ratio × ubatch`)⁵ |
 | `nkvo` | `-nkvo` | both | bool | swept | keep KV in RAM vs VRAM |
 | `poll` | `--poll` | both | num | swept | CPU polling level |
@@ -663,8 +665,8 @@ registry in `llama-optimize.py`.
 | `spec_p_split` | `--spec-draft-p-split` | server | float | swept³ | MTP split probability |
 | `rope_scaling` | `--rope-scaling` | server | cat | opt-in | RoPE scaling: none/linear/yarn |
 | `yarn_factor` | `--yarn-ext-factor` | server | float | opt-in | YaRN extrapolation (context **beyond** native) |
-¹ `ncmoe` swept for MoE models, `ot` for dense ones (the same placement lever, per
-architecture).  ² fixed on unless swept (precondition for KV-quant; pair with
+¹ `ncmoe` swept for MoE models; `ncffn` for dense ones on builds with the flag
+(`ot` on pre b10645 builds) — the same placement lever, per architecture.  ² fixed on unless swept (precondition for KV-quant; pair with
 `--min-kv f16`).  ³ swept when the model ships an MTP/NextN head — such models also
 auto-switch to the server driver so the effect is measured (`--no-mtp` disables).
 ⁴ with `--ngram` (server driver auto-switches), the *variant* is screened first;

@@ -49,7 +49,7 @@ These are properties of llama.cpp or of arithmetic, not of any machine.
 |---|---|
 | `thread_levels` | physical / logical core count |
 | `ngl_levels` | the model's layer count |
-| `ncmoe_levels` | the model's layer count |
+| `cpu_offload_levels` | the model's layer count |
 | `depth_levels` | the model's native context |
 | `ts_levels` (planned) | per-device capacity from `--list-devices` ([`multi-gpu-design.md`](multi-gpu-design.md)) |
 

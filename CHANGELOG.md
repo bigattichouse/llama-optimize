@@ -39,6 +39,12 @@ earlier.
   while a unified 4-slot server gives each the full 2048 — the context rule the
   design was blocked on. The older `parallel` factor still works and always
   splits the cache.
+- **`ncffn` factor** (`-ncffn`, llama.cpp tag b10645): for dense models, how
+  many of the first N layers keep their dense FFN weights on CPU — the
+  finer-grained form of the `-ot` lever (per layer, instead of all-or-nothing).
+  On builds that have the flag it replaces `ot` in the default dense-model
+  design (5 levels, `0 .. n_layers`); previous builds keep `-ot`. The OOM
+  pruner forwards it to `llama-fit-params` only when that binary has the flag.
 - **`SIGNAL` status** — a run whose process was killed by a signal is no longer
   filed as a generic `ERROR`. The two mean different things and only one is about
   the config: a process that *ran and returned an error* was rejected by

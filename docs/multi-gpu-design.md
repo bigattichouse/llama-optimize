@@ -108,7 +108,7 @@ Two things are genuinely new and are where the work is:
 level; `-ts` takes proportions per device (`3,1`). It enters the registry as a
 categorical whose levels are pre-rendered strings, with the level *set* generated
 from detected hardware rather than fixed — the same way `ngl_levels` and
-`ncmoe_levels` derive from the model and box.
+`cpu_offload_levels` derive from the model and box.
 
 Proposed generation for N devices with detected capacities `c_i`:
 
