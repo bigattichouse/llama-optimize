@@ -177,6 +177,9 @@ about is how inert columns get created.
       `-ctxcp`/`-cms` — all registered and reachable via `--factor`, none
       auto-swept ([`remaining-factors-design.md`](remaining-factors-design.md), R1)
 - [x] `--load-mode` as a factor, with the fixed-emission interlock
+- [x] `-ncffn` (dense FFN offload, llama.cpp tag b10645) registered and
+      auto-swept for dense models on builds with the flag — replaces `-ot`;
+      builds pre b10645 keep `-ot`
 - [ ] `-sps` folded into [`workload-shape-design.md`](workload-shape-design.md)
 - [ ] Auto-sweep `swa_full` if SWA turns out to be detectable from GGUF metadata
 - [ ] Decide the RoPE/YaRN tail: complete the family or state the scope
