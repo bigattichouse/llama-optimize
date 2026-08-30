@@ -150,7 +150,7 @@ Swept by default (auto-scaled to your hardware and model):
 | Logical batch | `-b`             | `1x, 4x, 16x` the `-ub` of the same row | prompt chunking (swept as a *multiple* of `-ub`, so `b≥ub` holds by construction — see [constrained factors](docs/CONSTRAINED-FACTORS.md)) |
 | Tensor placement | `-ot`         | `none, ffn_up_cpu, ffn_cpu`            | **dense models**: FFN tensors on CPU at full `-ngl` often beats dropping whole layers |
 | MoE expert offload | `-ncmoe`   | `0 .. n_layers` (5 levels)             | **MoE models** (replaces `-ot`): how many layers keep experts on CPU |
-| Dense FFN offload | `-ncffn`     | `0 .. n_layers` (5 levels)             | **dense models** (replaces `-ot`): how many of the first layers keep their dense FFN weights on CPU |
+| Dense FFN offload | `-ncffn`     | `0 .. n_layers` (5 levels)             | **dense models** on builds with the flag (replaces `-ot` in the default design): how many of the first layers keep their dense FFN weights on CPU |
 | NUMA policy   | `--numa`         | `distribute, isolate`                  | **multi-NUMA-node boxes only** (inert on one node) |
 | Prefill threads | `-tb`          | same levels as `-t`                    | **server driver**: decode vs prefill thread split |
 | ngram variant  | `--spec-type <variant>` | `none, ng-simple, ng-mod, ng-map-k, ng-map-k4v` | **server driver, --ngram**: which pattern-matching variant — *screened* first (see [ngram staging](#ngram-staged-search)) |
@@ -666,7 +666,11 @@ registry in `llama-optimize.py`.
 | `rope_scaling` | `--rope-scaling` | server | cat | opt-in | RoPE scaling: none/linear/yarn |
 | `yarn_factor` | `--yarn-ext-factor` | server | float | opt-in | YaRN extrapolation (context **beyond** native) |
 ¹ `ncmoe` swept for MoE models; `ncffn` for dense ones on builds with the flag
-(`ot` on pre b10645 builds) — the same placement lever, per architecture.  ² fixed on unless swept (precondition for KV-quant; pair with
+(`ot` on pre b10645 builds) — the same placement lever, per architecture.
+`ncffn` replaces `ot` in the *default* design only: it grades *how many layers*
+offload, while `ot=ffn_up_cpu` picks *which tensor* (up-projection alone, all
+layers). To sweep that lighter regime, ask for it: `--factor
+ot=none,ffn_up_cpu,ffn_cpu`.  ² fixed on unless swept (precondition for KV-quant; pair with
 `--min-kv f16`).  ³ swept when the model ships an MTP/NextN head — such models also
 auto-switch to the server driver so the effect is measured (`--no-mtp` disables).
 ⁴ with `--ngram` (server driver auto-switches), the *variant* is screened first;

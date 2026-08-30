@@ -644,13 +644,42 @@ def gpu_temp_c() -> float | None:
 # before running a config — skip configs that can't fit, saving a model load
 # + timeout per doomed row (ROADMAP item 2).
 # ---------------------------------------------------------------------------
+# Footprint factors whose llama-fit-params flag is recent enough that a build
+# in the wild may predate it. Gating lives here rather than at each emission
+# site so the next new placement flag is one dict entry, not another branch.
+#
+# The estimator and the driver are separate binaries and are gated separately,
+# so the mismatch is reachable in practice: --llama-cpp can point at a fresh
+# build while an older llama-fit-params is found on $PATH or left from a
+# previous checkout.
+FIT_GATED_FLAGS = {"ncmoe": "-ncmoe", "ncffn": "-ncffn"}
+
+
+def fit_blind_factors(cfg: "Config", f: dict) -> list[str]:
+    """Footprint-relevant factors in this row that llama-fit-params cannot see.
+
+    Dropping such a flag and estimating anyway is the tempting move and the
+    wrong one. These flags all exist to MOVE WEIGHTS OFF THE GPU, so an
+    estimator blind to one reports the un-offloaded footprint — the largest
+    configuration in the row. On the machine that needed the offload in the
+    first place that overshoots VRAM, every level of the factor is predicted
+    OOM, and the whole factor is silently pruned out of the sweep. A wrong
+    estimate deletes rows; a missing estimate merely runs them (P3)."""
+    return sorted(n for n, flag in FIT_GATED_FLAGS.items()
+                  if n in f and not supports_flag(cfg.fit_params, flag))
+
+
 def _fit_params_flags(cfg: "Config", f: dict, driver: str) -> list[str]:
     """Build llama-fit-params args from the VRAM-relevant factors in a run row.
     Only the factors that affect memory footprint are forwarded; the rest of the
     config (threads, poll, batch, spec knobs) is irrelevant to the estimate.
-    A flag the fit-params binary predates (ncffn on pre b10645 builds) is
-    dropped rather than forwarded — forwarding it would fail the estimate and
-    disable pruning for every row carrying that factor."""
+
+    Every footprint factor present is emitted unconditionally, including ones
+    the estimator may be too old to accept. Whether the binary can be asked at
+    all is `fit_blind_factors`' business, decided once in `predict_fits`;
+    keeping it out of here leaves this a pure "what would we pass" function, so
+    the cache key it feeds still separates rows that differ only in a gated
+    factor."""
     flags = []
     # GPU layers
     if "ngl" in f:
@@ -672,14 +701,18 @@ def _fit_params_flags(cfg: "Config", f: dict, driver: str) -> list[str]:
     # MoE expert offload
     if "ncmoe" in f:
         flags += ["-ncmoe", f["ncmoe"]]
-    # Dense FFN offload (recent flag, llama.cpp #26622 — gate on the binary)
-    if "ncffn" in f and supports_flag(cfg.fit_params, "-ncffn"):
+    # Dense FFN offload (llama.cpp #26622, tag b10645)
+    if "ncffn" in f:
         flags += ["-ncffn", f["ncffn"]]
     return flags
 
 
 # Track whether we've already warned about a disabled prune (once per sweep).
 _oom_prune_warned = False
+# Same, for the narrower "estimator is too old for this factor" case: reported
+# once per distinct factor set so a partially-pruned sweep is legible rather
+# than silent, without one line per row.
+_fit_blind_warned: set = set()
 
 # Cache for predict_fits: memoizing collapses the ~125 subprocess calls of an
 # L125 sweep to the handful of distinct footprints it actually contains.
@@ -733,6 +766,19 @@ def predict_fits(cfg: "Config", f: dict, driver: str) -> bool | None:
     global _oom_prune_warned, _fit_cache
     total_vram = cfg.hw.get("vram")
     if total_vram is None or not cfg.fit_params.exists():
+        return None
+    # The estimator cannot see one of this row's placement factors, so it cannot
+    # answer the question being asked. Say so and run the row (P3) rather than
+    # act on a footprint that ignores the offload the row is about.
+    blind = fit_blind_factors(cfg, f)
+    if blind:
+        names = ", ".join(blind)
+        if names not in _fit_blind_warned:
+            _fit_blind_warned.add(names)
+            print(f"OOM prune: llama-fit-params ({cfg.fit_params.name}) predates "
+                  f"{', '.join(FIT_GATED_FLAGS[n] for n in blind)} — pruning is "
+                  f"OFF for rows that set {names}; they will all run. Update "
+                  "llama.cpp to restore it.", file=sys.stderr)
         return None
     key = _fit_cache_key(cfg, f, driver)
     if key in _fit_cache:
@@ -5389,10 +5435,71 @@ def selftest() -> bool:
         s4 = _fit_params_flags(_FC, f4, "bench")
         assert "-ncmoe" in s4 and "16" in s4
 
-        # ncffn is dropped when the fit-params binary predates the flag
-        # (forwarding it would fail the estimate and disable OOM pruning)
+        # ncffn: emitted unconditionally, like every other footprint factor.
+        # Whether the estimator can be ASKED is fit_blind_factors' job — keeping
+        # the gate out of the flag builder is what lets the cache key below
+        # separate rows that differ only in a gated factor.
         f5 = {"ngl": "32", "n_depth": "8192", "ncffn": "16"}
-        assert "-ncffn" not in _fit_params_flags(_FC, f5, "bench")
+        s5 = _fit_params_flags(_FC, f5, "bench")
+        assert "-ncffn" in s5 and "16" in s5
+
+        # --- OOM pruning: the estimator's own capability gate ---
+        # These assertions must drive supports_flag from the help text, not from
+        # a missing binary: _FC.fit_params does not exist, so supports_flag is
+        # False for EVERY flag and a gate asserted that way would pass even if
+        # it were inverted.
+        _saved_help = dict(_help_cache)
+        try:
+            # a fit-params that advertises both flags is blind to neither
+            _help_cache[str(_FC.fit_params)] = ("-ncmoe, --n-cpu-moe N\n"
+                                                "-ncffn, --n-cpu-ffn N\n")
+            assert fit_blind_factors(_FC, f5) == []
+            assert fit_blind_factors(_FC, {"ncmoe": "8", "ncffn": "16"}) == []
+            # an older one sees neither, and reports exactly what it is missing
+            _help_cache[str(_FC.fit_params)] = "-m, --model FNAME\n"
+            assert fit_blind_factors(_FC, f5) == ["ncffn"]
+            assert fit_blind_factors(_FC, {"ncmoe": "8", "ncffn": "16"}) == \
+                ["ncffn", "ncmoe"]
+            # a row that sets neither is estimable on any build — the gate must
+            # not disable pruning for the whole sweep just because it exists
+            assert fit_blind_factors(_FC, {"ngl": "32", "n_depth": "8192"}) == []
+            # ...and a blind row yields None (run it), never a bool. A wrong
+            # False here is the silent-prune bug: -ncffn moves weights OFF the
+            # GPU, so an estimator that cannot see it reports the un-offloaded
+            # footprint and rejects every level of the factor.
+            # fit_params must point at a file that EXISTS, or predict_fits bails
+            # at its earlier exists() check and this passes without reaching the
+            # gate. This script is a convenient stand-in; its help is stubbed
+            # above, so nothing is executed.
+            _real = Path(__file__).resolve()
+            _help_cache[str(_real)] = "-m, --model FNAME\n"      # predates both
+            _blind_cfg = Config(model=Path("m.gguf"), llama_bench=Path("lb"),
+                                array="L25", ctx_floor=8192,
+                                fit_params=_real, hw={"vram": 8192})
+            assert _blind_cfg.fit_params.exists()   # else the assert is vacuous
+            assert fit_blind_factors(_blind_cfg, f5) == ["ncffn"]
+            _saved_blind = set(_fit_blind_warned)
+            _fit_blind_warned.clear()
+            _err = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(_err):
+                    assert predict_fits(_blind_cfg, f5, "bench") is None
+                    # once per factor set, not once per row
+                    assert predict_fits(_blind_cfg, f5, "bench") is None
+            finally:
+                _fit_blind_warned.clear()
+                _fit_blind_warned.update(_saved_blind)
+            # a silently-disabled prune is the thing to avoid: say which flag,
+            # and that the rows still run
+            assert _err.getvalue().count("OOM prune") == 1, _err.getvalue()
+            assert "-ncffn" in _err.getvalue() and "will all run" in _err.getvalue()
+            # the same row on a build that HAS the flag is estimable again:
+            # the gate opens rather than disabling pruning permanently
+            _help_cache[str(_real)] = "-ncmoe, --n-cpu-moe N\n-ncffn, --n-cpu-ffn N\n"
+            assert fit_blind_factors(_blind_cfg, f5) == []
+        finally:
+            _help_cache.clear()
+            _help_cache.update(_saved_help)
 
         # --- OOM pruning: the fit cache must not merge distinct footprints ---
         # A cached verdict is applied to a row that is then never run, so a
@@ -5402,12 +5509,16 @@ def selftest() -> bool:
         # factor at a time) rather than by listing names, so a VRAM-relevant
         # factor added later is covered without anyone remembering to.
         base = {"ngl": "32", "n_depth": "8192", "kv_type": "f16",
-                "nkvo": "1", "ncmoe": "0", "ot": "none"}
+                "nkvo": "1", "ncmoe": "0", "ot": "none", "ncffn": "0"}
         # each perturbation changes the estimated footprint, so each must
-        # change the key (ncmoe/ot were the two the original key dropped)
+        # change the key (ncmoe/ot were the two the original key dropped).
+        # ncffn is here for a second reason: gating its emission on the
+        # estimator's help text collapsed every level to one key, so all five
+        # inherited a single verdict computed for ncffn=0.
         for knob, other in (("ngl", "16"), ("n_depth", "32768"),
                             ("kv_type", "q4_0"), ("nkvo", "0"),
-                            ("ncmoe", "40"), ("ot", "ffn_cpu")):
+                            ("ncmoe", "40"), ("ot", "ffn_cpu"),
+                            ("ncffn", "32")):
             alt = {**base, knob: other}
             assert _fit_cache_key(_FC, base, "bench") != _fit_cache_key(_FC, alt, "bench"), \
                 f"fit cache key ignores {knob}: configs differing only in " \
@@ -5417,6 +5528,7 @@ def selftest() -> bool:
         # different model, identical flags → different key
         class _FC2:
             model = Path("other.gguf")
+            fit_params = Path("fp")
         assert _fit_cache_key(_FC, base, "bench") != _fit_cache_key(_FC2, base, "bench")
     except AssertionError as e:
         print(f"selftest FAILED: {e}")

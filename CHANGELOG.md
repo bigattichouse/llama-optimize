@@ -43,8 +43,21 @@ earlier.
   many of the first N layers keep their dense FFN weights on CPU — the
   finer-grained form of the `-ot` lever (per layer, instead of all-or-nothing).
   On builds that have the flag it replaces `ot` in the default dense-model
-  design (5 levels, `0 .. n_layers`); previous builds keep `-ot`. The OOM
-  pruner forwards it to `llama-fit-params` only when that binary has the flag.
+  design (5 levels, `0 .. n_layers`); previous builds keep `-ot`. `-ot` stays
+  reachable via `--factor ot=...` — `ncffn` varies *how many layers* offload
+  while `ot=ffn_up_cpu` varies *which tensor*, so the two are different axes and
+  the finer one does not subsume the lighter one.
+- **OOM pruning is skipped, not guessed, when the estimator is too old.** The
+  driver and `llama-fit-params` are separate binaries with separate flag
+  support, so a row can set a placement factor the estimator cannot parse. Such
+  a flag must not simply be dropped from the estimate: `-ncmoe`/`-ncffn` exist
+  to move weights *off* the GPU, so an estimator blind to one reports the
+  un-offloaded footprint — the largest configuration in the row. On the machine
+  that needed the offload, that overshoots VRAM and every level of the factor is
+  predicted OOM, deleting the whole factor from the sweep without a word. Rows
+  carrying a factor the estimator cannot see now skip pruning and run, with one
+  notice naming the flag. Same lineage as issue #5: a config that would have run,
+  discarded on the strength of a number that was never about it.
 - **`SIGNAL` status** — a run whose process was killed by a signal is no longer
   filed as a generic `ERROR`. The two mean different things and only one is about
   the config: a process that *ran and returned an error* was rejected by
