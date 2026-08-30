@@ -47,6 +47,34 @@ earlier.
   reachable via `--factor ot=...` — `ncffn` varies *how many layers* offload
   while `ot=ffn_up_cpu` varies *which tensor*, so the two are different axes and
   the finer one does not subsume the lighter one.
+- **`--timeout` is a per-config deadline on both drivers.** It used to mean two
+  different things. On llama-bench it bounded the whole process, which is what it
+  reads like. On the server driver it was handed to each HTTP request, so one
+  config could legitimately spend `(1 warm + reps) x timeout` — at the defaults,
+  **80 minutes for a "20 minute" timeout**. It was not a bound on anything a user
+  could name. It now covers warm-up and every rep together, and the per-request
+  value is whatever is left of it.
+- **`--min-tgs` / `--min-pps` — stop paying for configs you would not ship.** A
+  config generating at 0.5 t/s takes ~8.5 minutes per rep at `--n-gen 256`, and
+  the only previous guard was the blunt `--timeout`. A throughput floor tightens
+  the deadline instead of adding a second mechanism: a config that would MEET the
+  floor finishes `reps x n_gen` tokens within `tokens / floor` seconds, so
+  exceeding that budget is itself the finding.
+
+  That arithmetic is why it works on llama-bench too, where nothing can be
+  observed mid-run. On the server driver `--min-pps` is answerable the moment the
+  warm-up returns, so a config failing it skips its decode reps entirely — the
+  "once pp is done, skip the slow ones" case.
+
+  Worst-case sweep time on an L125, `--n-gen 256`, `--reps 3`: **41.7h at the
+  default `--timeout 1200`, 17.8h at `--min-tgs 2`, 3.5h at `--min-tgs 10`.**
+
+  Rows are marked `SLOW`, a status distinct from both `TIMEOUT` (it did not hang,
+  we stopped waiting on purpose) and `IMPLAUSIBLE` (those numbers cannot be true;
+  these are true and unwanted). A `SLOW` row **keeps its measured numbers** and is
+  excluded from the picks like any non-OK status. `--tgs-timeout` (default 60s)
+  floors the derived budget so a small `--n-gen` cannot produce one that measures
+  model load instead of throughput.
 - **Free-VRAM preflight.** `detect_vram_mib` reports TOTAL VRAM, which is the
   right basis for "can this model ever fit on this card" and the wrong one for
   "can it fit right now". The OOM pruner compares against total, so on a card

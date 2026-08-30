@@ -424,6 +424,31 @@ Four things to read in that output before committing:
 4. **The sample command** — it's the real thing. If it looks wrong for your
    setup, it would have been wrong 125 times.
 
+**Cap what you are willing to wait for.** Most of a long sweep is spent on
+configs that were never going to win: at `--n-gen 256`, a config running at
+0.5 t/s takes ~8.5 minutes *per rep*. If you know the slowest result you would
+actually deploy, say so and the sweep stops paying for anything below it:
+
+```bash
+python3 llama-optimize.py model.gguf --run --min-tgs 10   # abandon <10 t/s configs
+```
+
+This shortens the per-config budget by arithmetic rather than watching the run,
+so it works on both drivers — a config that *would* meet the floor finishes
+`reps x n_gen` tokens within `tokens / floor` seconds, and exceeding that is
+itself the answer. On an L125 with `--reps 3`, worst case:
+
+| floor | budget/config | worst-case sweep |
+|---|---|---|
+| none (`--timeout 1200`) | 1200s | 41.7h |
+| `--min-tgs 2` | 512s | 17.8h |
+| `--min-tgs 10` | 102s | 3.5h |
+
+Those rows are recorded as `SLOW` with their real numbers, not discarded — they
+are excluded from the picks, but you can still see what they did. `--min-pps`
+does the same for prefill, and on the server driver it is decided as soon as
+warm-up returns, so a failing config never pays for its decode reps at all.
+
 Then start small and widen:
 
 ```bash
@@ -681,29 +706,47 @@ registry in `llama-optimize.py`.
 | `spec_p_split` | `--spec-draft-p-split` | server | float | swept³ | MTP split probability |
 | `rope_scaling` | `--rope-scaling` | server | cat | opt-in | RoPE scaling: none/linear/yarn |
 | `yarn_factor` | `--yarn-ext-factor` | server | float | opt-in | YaRN extrapolation (context **beyond** native) |
-¹ `ncmoe` swept for MoE models, `ffn_place` for dense ones — the same placement
-lever, per architecture. `ffn_place` is a single column spanning both dense
-mechanisms, because they are different axes rather than rival spellings:
-`ffn_up_cpu` varies *which tensor* (up-projection alone, every layer) and
-`first_N` varies *how many layers* (whole FFN, first N). They cannot be two
-columns — `-ncffn` appends to the same override list `-ot` writes to, so
-`ffn_cpu` would swallow every `first_N` level and those rows would measure
-nothing. Levels are rendered from the layer count, and a build without
-`-ncffn` simply gets the three `-ot` levels under the same factor name.  ² fixed on unless swept (precondition for KV-quant; pair with
-`--min-kv f16`).  ³ swept when the model ships an MTP/NextN head — such models also
-auto-switch to the server driver so the effect is measured (`--no-mtp` disables).
-⁴ with `--ngram` (server driver auto-switches), the *variant* is screened first;
-each variant's tuning knobs are then swept only in that variant's tuning stage —
-they never share one array with the gate (see [ngram staging](#ngram-staged-search)).
-ngram needs no draft model — it pattern-matches from the token history.  Note
-`spec_n_max` (`--spec-draft-n-max`) is a draft-model/MTP knob and has **no effect
-on ngram**, so it is not an ngram factor.  ⁵ **derived factor**: swept *relative*
-to a sibling rather than as an absolute, so the pair's implied ordering (`-b ≥
--ub`, `n_min ≤ n_max`) holds in every row by construction — no clamping, no
-inverted rows. The results CSV records both the relative level and the absolute
-value it materialized to. See
-[constrained factors](docs/CONSTRAINED-FACTORS.md); these three were renamed from
-`batch` / `spec_n_min` / `ngram_mod_n_max`, and the old names give a
+
+### Notes on the table
+
+**¹ Placement is one column per architecture.** `ncmoe` is swept for MoE models
+and `ffn_place` for dense ones — the same lever, named for what it moves.
+
+`ffn_place` spans two llama.cpp flags because they are different axes, not rival
+spellings of one knob: `ffn_up_cpu` varies *which tensor* (the up-projection
+alone, across every layer), while `first_N` varies *how many layers* (the whole
+FFN, for the first N). At equal VRAM freed they shape PCIe traffic differently,
+so which one wins is a measurement rather than a deduction.
+
+They cannot be two separate columns. `-ncffn` appends to the same tensor-override
+list that `-ot` writes to, so `ffn_cpu` — which covers all layers — would swallow
+every `first_N` level, and those rows would record a level that changed nothing.
+Levels are rendered from the model's layer count; a build without `-ncffn` simply
+gets the three `-ot` levels under the same factor name, so results stay
+comparable across a llama.cpp upgrade.
+
+**² Flash attention is fixed on unless swept.** It is a precondition for
+quantized KV, so sweeping it blindly would just fail every `fa=0` × KV-quant row.
+To sweep it anyway, pair it with a floor: `--factor fa=0,1 --min-kv f16`.
+
+**³ The MTP surface is swept when the model ships an MTP/NextN head.** Such
+models also auto-switch to the server driver, so the effect is measured rather
+than assumed. `--no-mtp` disables it.
+
+**⁴ ngram knobs are staged, not flat.** With `--ngram` (the server driver
+auto-switches), the *variant* is screened first; each variant's tuning knobs are
+then swept only in that variant's own tuning stage, never sharing one array with
+the gate — see [ngram staging](#ngram-staged-search). ngram needs no draft model,
+as it pattern-matches from the token history. Note that `spec_n_max`
+(`--spec-draft-n-max`) is a draft-model/MTP knob with **no effect on ngram**, so
+it is not an ngram factor.
+
+**⁵ Derived factors are swept relative to a sibling**, not as absolutes, so the
+pair's implied ordering (`-b ≥ -ub`, `n_min ≤ n_max`) holds in every row by
+construction — no clamping and no inverted rows. The results CSV records both the
+relative level and the absolute value it materialized to. See
+[constrained factors](docs/CONSTRAINED-FACTORS.md). These three were renamed from
+`batch` / `spec_n_min` / `ngram_mod_n_max`; the old names give a
 pointer-to-the-new-one error rather than being silently reinterpreted.
 
 **`-ot` named patterns** (translate to real tensor regexes): `none`, `ffn_cpu`,

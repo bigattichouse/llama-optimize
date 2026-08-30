@@ -1164,6 +1164,11 @@ class Config:
     hw: dict = field(default_factory=dict)
     prefix_reuse: float = 1.0   # workload SHAPE: shared-prefix fraction (W-D1)
     env_factor_names: set = field(default_factory=set)  # factors that set env vars
+    # Throughput floors: a config below them is a real measurement the user has
+    # said they do not want, so waiting for it to finish buys nothing (T1).
+    min_tgs: float = 0.0        # abandon a config generating slower than this
+    min_pps: float = 0.0        # ...or prefilling slower than this
+    slow_grace: int = 60        # never judge a config on less than this many seconds
 
 
 def effective_tps(n_prompt: int, n_gen: int, pp: float, tg: float) -> float:
@@ -2406,6 +2411,71 @@ def fmt_dur(secs: float) -> str:
     return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
 
 
+# ---------------------------------------------------------------------------
+# Time budget for one config (T1).
+#
+# `--timeout` meant different things per driver. On bench it bounds the whole
+# llama-bench process, which is what it reads like. On the server driver it was
+# handed to each HTTP request, so one config could legitimately spend
+# (1 warm + reps) x timeout — at the default that is 80 minutes for a "20 minute"
+# timeout. It was never a bound on anything a user could name.
+#
+# It is now a DEADLINE for the whole config on both drivers: launch, warm-up and
+# every rep together. The per-request value is whatever is left of it.
+#
+# A throughput floor tightens that deadline rather than adding a second
+# mechanism. If a config must reach `--min-tgs` to be of interest, then a config
+# that IS of interest finishes `reps x n_gen` tokens within `tokens / min_tgs`
+# seconds; anything slower has already answered the question and does not need
+# to finish. This is why the floor buys time on both drivers, including
+# llama-bench, where nothing can be observed mid-run: the bound is arithmetic,
+# not instrumentation.
+# ---------------------------------------------------------------------------
+def slow_budget_secs(cfg, timeout: int) -> int:
+    """Seconds to allow one config, given the throughput floor (0 ⇒ --timeout).
+
+    `slow_grace` is a floor on the floor: with a small `n_gen` the derived bound
+    can be a couple of seconds, and judging a config on that measures model load
+    and scheduler noise rather than its throughput."""
+    min_tgs = float(getattr(cfg, "min_tgs", 0.0) or 0.0)
+    if min_tgs <= 0:
+        return int(timeout)
+    reps = max(1, getattr(cfg, "reps", 1))
+    # +1 covers the warm/prefill request the server driver sends before its reps;
+    # on bench it is slack, and slack is the safe direction here (P3).
+    tokens = getattr(cfg, "n_gen", 0) * (reps + 1)
+    derived = tokens / min_tgs
+    return int(max(getattr(cfg, "slow_grace", 60), min(float(timeout), derived)))
+
+
+def too_slow_reason(cfg, pp: float, tg: float) -> str | None:
+    """Why this measurement is below the floors the user set, or None.
+
+    Separate from `implausible_reason`: that one rejects numbers that cannot be
+    true, this one rejects numbers that are true and unwanted. Keeping them
+    apart matters because the CSV should not call a slow machine a broken one."""
+    min_pps = float(getattr(cfg, "min_pps", 0.0) or 0.0)
+    min_tgs = float(getattr(cfg, "min_tgs", 0.0) or 0.0)
+    if min_pps > 0 and 0 < pp < min_pps:
+        return f"pp={pp:.1f} t/s is below --min-pps {min_pps:.1f}"
+    if min_tgs > 0 and 0 < tg < min_tgs:
+        return f"tg={tg:.1f} t/s is below --min-tgs {min_tgs:.1f}"
+    return None
+
+
+def _left(timeout: int, deadline: float | None) -> int:
+    """Per-request timeout: whatever is left of the config's deadline, capped by
+    --timeout. At least 1s — a zero would mean "no timeout" to urlopen, which is
+    the opposite of what an exhausted budget means."""
+    if deadline is None:
+        return int(timeout)
+    return max(1, int(min(float(timeout), deadline - time.time())))
+
+
+def _expired(deadline: float | None) -> bool:
+    return deadline is not None and time.time() >= deadline
+
+
 def with_ticker(prefix: str, timeout: int, fn):
     """Run fn() showing a live elapsed ticker on a TTY; plain start line if the
     output is redirected (keeps logs one-line-in/one-line-out)."""
@@ -2442,8 +2512,12 @@ def run_one(cfg: Config, f: dict, timeout: int):
     status, pp, tg = "OK", 0.0, 0.0
     sampler = VRAMSampler().__enter__() if cfg.measure_vram else None
     backend = ""
+    # llama-bench is one opaque process: nothing can be watched mid-run, so a
+    # throughput floor has to act as a shorter deadline. A config that would
+    # MEET the floor finishes inside it, so hitting it is itself the finding.
+    budget = slow_budget_secs(cfg, timeout)
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=budget,
                               env=run_env(cfg, f))
         combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
         if proc.returncode != 0 or _OOM_PAT.search(combined):
@@ -2458,13 +2532,22 @@ def run_one(cfg: Config, f: dict, timeout: int):
             else:
                 pp, tg = pp_ or 0.0, tg_
     except subprocess.TimeoutExpired:
-        status = "TIMEOUT"
+        # Distinguish "we stopped waiting because it is too slow to want" from
+        # "it hung": only the first is a deliberate answer to a question asked.
+        status = "SLOW" if budget < timeout else "TIMEOUT"
     finally:
         if sampler:
             sampler.__exit__()
-    return validate_measurement(
-        {"status": status, "pp_tps": pp, "tg_tps": tg, "backend": backend,
-         "secs": time.time() - t0, "vram_mib": sampler.peak if sampler else 0})
+    res = {"status": status, "pp_tps": pp, "tg_tps": tg, "backend": backend,
+           "secs": time.time() - t0, "vram_mib": sampler.peak if sampler else 0}
+    if status == "SLOW":
+        res["too_slow"] = (f"did not finish within {budget}s, the budget implied "
+                           f"by --min-tgs {cfg.min_tgs:.1f}")
+    elif status == "OK":
+        why = too_slow_reason(cfg, pp, tg)   # finished, but under a floor
+        if why:
+            res.update(status="SLOW", too_slow=why)
+    return validate_measurement(res)
 
 
 # ---------------------------------------------------------------------------
@@ -2990,7 +3073,7 @@ class ServerSession:
                             "server exited during load" if died else
                             f"server not healthy within {cfg.server_start_timeout}s")
 
-    def measure(self, prompt_len, n_gen, par, reps, timeout):
+    def measure(self, prompt_len, n_gen, par, reps, timeout, deadline=None):
         """Measure one config. Returns a dict:
 
             pp, tg      throughput (prefill / decode)
@@ -3025,7 +3108,8 @@ class ServerSession:
             # (tg) without re-prefilling — much faster at high context, and a
             # cleaner decode number.
             try:
-                warm = _completion(self.port, prompt, n_gen, timeout, cache=True)
+                warm = _completion(self.port, prompt, n_gen,
+                                   _left(timeout, deadline), cache=True)
                 wt = warm.get("timings", {})
                 pp = wt.get("prompt_per_second", 0.0) or 0.0
                 self.cpt = (calibrate_chars_per_token(prompt, wt.get("prompt_n"))
@@ -3033,11 +3117,21 @@ class ServerSession:
             except (urllib.error.URLError, OSError, json.JSONDecodeError):
                 pp, n_err = 0.0, n_err + 1
             tps, ceilings, timings = [], [], []
+            # A prefill floor is answerable the moment the warm request returns,
+            # before any decode rep is paid for — the cheapest possible exit.
+            _min_pps = float(getattr(self.cfg, "min_pps", 0.0) or 0.0)
+            if _min_pps > 0 and 0 < pp < _min_pps:
+                return {"pp": pp, "tg": 0.0, "problem": None, "draft": {},
+                        "err_rate": 0.0, "reuse": self.last_reuse,
+                        "too_slow": (f"pp={pp:.1f} t/s is below --min-pps "
+                                     f"{_min_pps:.1f}; decode not measured")}
             for i in range(max(1, reps)):
+                if _expired(deadline):     # budget gone; report what we have
+                    break
                 w0 = time.time()
                 try:
                     r = _completion(self.port, prompts[(i + 1) % len(prompts)],
-                                    n_gen, timeout, cache=True)
+                                    n_gen, _left(timeout, deadline), cache=True)
                 except (urllib.error.URLError, OSError, json.JSONDecodeError):
                     n_err += 1
                     continue
@@ -3068,7 +3162,8 @@ class ServerSession:
         # the streams. Warmup once, then average per-round throughput over reps.
         # These rates are computed from our own wall clock already, so they
         # cannot exceed it by construction — no cross-check needed.
-        warm_res, _, _ = _measure_round(self.port, prompts, n_gen, par, timeout)
+        warm_res, _, _ = _measure_round(self.port, prompts, n_gen, par,
+                                        _left(timeout, deadline))
         if warm_res:                            # warmup discarded, ratio kept
             self.cpt = (calibrate_chars_per_token(
                 prompts[0], warm_res[0].get("timings", {}).get("prompt_n"))
@@ -3076,7 +3171,10 @@ class ServerSession:
         pps, tps, timings = [], [], []
         n_sent = 0
         for _ in range(max(1, reps)):
-            res, failed, wall = _measure_round(self.port, prompts, n_gen, par, timeout)
+            if _expired(deadline):
+                break
+            res, failed, wall = _measure_round(self.port, prompts, n_gen, par,
+                                               _left(timeout, deadline))
             n_err += failed
             n_sent += par
             timings.extend(r.get("timings", {}) for r in res)
@@ -3159,7 +3257,11 @@ def measure_in_session(cfg: Config, f: dict, session, timeout: int) -> dict:
     sampler = VRAMSampler().__enter__() if cfg.measure_vram else None
     status, m = "OK", {}
     try:
-        m = session.measure(prompt_len, cfg.n_gen, par, cfg.reps, timeout)
+        # One deadline for the whole config — launch is already behind us, so
+        # this covers the warm request and every rep together (T1).
+        budget = slow_budget_secs(cfg, timeout)
+        m = session.measure(prompt_len, cfg.n_gen, par, cfg.reps, timeout,
+                            deadline=time.time() + budget)
     except (urllib.error.URLError, OSError, json.JSONDecodeError):
         status = "ERROR"
     finally:
@@ -3184,6 +3286,13 @@ def measure_in_session(cfg: Config, f: dict, session, timeout: int) -> dict:
     if status == "OK" and m.get("problem"):   # the wall-clock cross-check (I5)
         res.update(status="IMPLAUSIBLE", implausible=m["problem"],
                    pp_tps=0.0, tg_tps=0.0)
+    # Below a floor the user set. A real measurement they have said they do not
+    # want, so it keeps its numbers and is merely not OK — unlike IMPLAUSIBLE,
+    # which zeroes them because they cannot be true (T1).
+    slow = m.get("too_slow") or (too_slow_reason(cfg, pp, tg)
+                                 if status == "OK" else None)
+    if status == "OK" and slow:
+        res.update(status="SLOW", too_slow=slow)
     # parallel scales the ceiling: the server driver reports throughput
     # aggregated across concurrent streams (I2).
     return validate_measurement(res, parallel=par)
@@ -5118,6 +5227,50 @@ def selftest() -> bool:
         assert vram_headroom([]) == (0, 0)
         assert headroom_warning([{"id": "ROCm0", "total_mib": 0,
                                   "free_mib": 0}]) is None
+        # --- time budget for one config (T1) ---
+        _c = SimpleNamespace(min_tgs=0.0, min_pps=0.0, slow_grace=60,
+                             reps=3, n_gen=256)
+        # no floor: --timeout is the budget, unchanged
+        assert slow_budget_secs(_c, 1200) == 1200
+        # a floor shortens it by arithmetic: 4 x 256 tokens at 2 t/s = 512s.
+        # This is the whole point — a config that would MEET the floor finishes
+        # inside it, so the deadline IS the test, and it works on llama-bench
+        # where nothing can be observed mid-run.
+        _c.min_tgs = 2.0
+        assert slow_budget_secs(_c, 1200) == 512
+        # never longer than --timeout: the floor tightens, never loosens
+        _c.min_tgs = 0.1
+        assert slow_budget_secs(_c, 1200) == 1200
+        # ...and never shorter than the grace period, or a small n_gen would
+        # derive a budget that measures model load rather than throughput
+        _c.min_tgs, _c.n_gen = 1000.0, 8
+        assert slow_budget_secs(_c, 1200) == 60
+        _c.slow_grace = 10
+        assert slow_budget_secs(_c, 1200) == 10
+
+        # floors reject the unwanted, not the impossible — the numbers survive
+        _f = SimpleNamespace(min_tgs=5.0, min_pps=100.0)
+        assert too_slow_reason(_f, 500.0, 25.0) is None       # meets both
+        assert "below --min-tgs" in too_slow_reason(_f, 500.0, 2.0)
+        assert "below --min-pps" in too_slow_reason(_f, 50.0, 25.0)
+        # a zero is "not measured", not "infinitely slow" — that is other
+        # paths' business (measured_ok), and calling it SLOW would be a lie
+        assert too_slow_reason(_f, 0.0, 25.0) is None
+        assert too_slow_reason(_f, 500.0, 0.0) is None
+        # no floors set: never fires
+        assert too_slow_reason(SimpleNamespace(), 0.1, 0.1) is None
+
+        # per-request timeout is what is LEFT of the config deadline, capped by
+        # --timeout. This is the actual #11-adjacent defect: without a deadline
+        # the server driver gave each of (1 warm + reps) requests the full
+        # timeout, so a "20 minute" cap allowed 80 minutes.
+        _now = time.time()
+        assert _left(1200, None) == 1200                    # no deadline: as before
+        assert _left(1200, _now + 300) <= 300
+        assert _left(100, _now + 3000) == 100               # cap still applies
+        assert _left(1200, _now - 5) == 1                   # exhausted, never 0
+        assert _expired(_now - 1) and not _expired(_now + 60)
+        assert not _expired(None)
         assert gpu_visibility(32752, "llama.cpp: ROCm0", True) == "gpu"
         # the vendor tool sees a card llama.cpp does not: no GPU backend
         assert gpu_visibility(32752, "rocm-smi", True) == "blind"
@@ -5789,7 +5942,7 @@ def load_results_csv(path: Path, factors: dict) -> list[dict]:
 RESULT_COLS = {"run_id", "pp_tps", "tg_tps", "eff_tps", "status", "secs",
                "temp_c", "vram_mib", "implausible", "draft_acc", "spec_off",
                "tool_version", "llama_build", "backend", "err_rate", "reuse",
-               "draft_cov", "kv_unified"}
+               "draft_cov", "kv_unified", "too_slow"}
 
 
 def merge_result_rows(cfg: Config, rows: list[dict],
@@ -6580,7 +6733,27 @@ def main():
                          "(decode-heavy). Sets n_gen to a reasoning length (~2048); "
                          "default (no flag) is non-thinking / short answers")
     ap.add_argument("--timeout", type=int, default=1200,
-                    help="per-run timeout in seconds")
+                    help="wall-clock budget for ONE config (default 1200), "
+                         "covering warm-up and every rep together. Previously "
+                         "the server driver applied this per HTTP REQUEST, so a "
+                         "config could take (1+reps)x this; it is now a deadline "
+                         "on both drivers")
+    ap.add_argument("--min-tgs", type=float, default=0.0, metavar="TPS",
+                    help="abandon a config generating slower than TPS. A config "
+                         "that would MEET the floor finishes within "
+                         "tokens/TPS seconds, so this shortens the per-config "
+                         "budget instead of waiting out the full --timeout — the "
+                         "reason it saves time on llama-bench too, where nothing "
+                         "can be watched mid-run. Rows are marked SLOW, keep "
+                         "their numbers, and are excluded from the picks")
+    ap.add_argument("--min-pps", type=float, default=0.0, metavar="TPS",
+                    help="as --min-tgs, for prefill. On the server driver this "
+                         "is answerable the moment the warm-up returns, so a "
+                         "config failing it skips its decode reps entirely")
+    ap.add_argument("--tgs-timeout", type=int, default=60, metavar="SECS",
+                    help="never judge a config on less than this many seconds "
+                         "(default 60), so a small --n-gen cannot derive a "
+                         "budget that measures model load instead of throughput")
     ap.add_argument("--use-case", choices=list(USE_CASES), default=None,
                     metavar="{app,single,agents,multi-user}",
                     help="high-level runbook that bundles driver+profile+concurrency: "
@@ -6724,6 +6897,9 @@ def main():
         driver=driver,
         parallel=parallel,
         score=args.score,
+        min_tgs=max(0.0, args.min_tgs),
+        min_pps=max(0.0, args.min_pps),
+        slow_grace=max(1, args.tgs_timeout),
         measure_vram=args.vram,
         oom_prune=not args.no_oom_prune,
         fit_headroom_mib=args.fit_headroom,
@@ -7000,6 +7176,8 @@ def main():
                if spec_cols_wanted(cfg) else [])
             + (["backend"] if cfg.driver == "bench"
                else ["err_rate", "reuse", "kv_unified"])
+            # only when floors are in play, so ordinary sweeps keep their shape
+            + (["too_slow"] if (cfg.min_tgs > 0 or cfg.min_pps > 0) else [])
             + ["tool_version", "llama_build"])
 
     # Resume keys on run_id (unique per array row), not config values, because
