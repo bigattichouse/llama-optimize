@@ -135,6 +135,24 @@ Sensible first cut, cheapest first:
 
 ## Open questions
 
+0. **Does `-md` with an already-embedded NextN head differ from omitting it?**
+   The sharpest question from issue #12, and unanswerable without hardware. A
+   model can carry its MTP head *and* be given a separate head file: verified on
+   `Qwen3.8-27B-UD-IQ4_XS`, which reports `nextn_predict_layers = 1` and contains
+   all four `blk.64.nextn.*` tensors, while Unsloth also publishes a standalone
+   18-tensor `MTP/mtp-Qwen3.8-27B-Q4_0.gguf`. `has_dft()` is just "was a `-md`
+   path given", so the two take different branches of
+   `common_speculative_init_result`:
+
+   - **route 1** — embedded head, no `-md`: drafts from the already-loaded target
+   - **route 2** — `-md`: loads a second model, at its own independent quant
+     (a user in issue #12 pairs a `Q4_0` head with an `IQ4_XS` target)
+
+   Different VRAM footprints, plausibly different acceptance and throughput.
+   Both are now expressible, so this is a measurement someone can simply run:
+   the same sweep with and without `--draft-model`, on a model whose head is
+   embedded. Needs a GPU and an MTP-capable model; asked on issue #12.
+
 1. Should `--draft-model` accept `auto`, resolving a conventional sibling of the
    target GGUF? Convenient, but it would make a sweep's factor set depend on a
    filesystem guess — probably not worth the surprise.

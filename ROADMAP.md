@@ -8,6 +8,29 @@ working handoff (current state, already verified) and
 [`docs/PLAN.md`](docs/PLAN.md) is the execution order and its dependencies. This
 file stays the idea backlog.
 
+## 0. Sweep cost — done
+
+Field feedback said a sweep "will test everything under the sun and take days".
+It was right, and the advice attached to it (limit contexts, threads, cache
+types) did nothing when applied one knob at a time — `choose_array` sizes the
+design on the *widest* factor, so narrowing one column left the array where it
+was. Nothing in the output distinguished "no effect" from "ignored".
+
+Landed: `--levels N` narrows every auto-generated factor together (L125/125 runs
+→ L27/27 → L16/16); `--min-tgs`/`--min-pps` abandon configs below a floor by
+tightening the per-config deadline rather than watching the run, so they work on
+llama-bench too; `--timeout` became a per-config deadline instead of a
+per-*request* one on the server driver (it previously allowed `(1+reps)×` its
+value); and a bare invocation on a terminal now interviews the user and derives
+the flags, because the dials were the part nobody found.
+
+Worst case on an L125 at `--n-gen 256 --reps 3`: **41.7h → 3.5h** with
+`--min-tgs 10`. Reasoning and measurements:
+[`docs/sweep-cost-design.md`](docs/sweep-cost-design.md).
+
+Remaining: nothing reports, after a sweep, how much time the floors actually
+saved — that number would be the honest way to tune the advice.
+
 ## 1. Noise-aware picks — partially done
 
 Landed: `--verify-picks` (default on, 2 extra reps; `--full`=3) re-measures the
@@ -100,11 +123,20 @@ measurement is real, it just isn't measuring what its factor column claims. Both
 columns appear only where a draft is possible at all. Background:
 [`docs/field-reports.md`](docs/field-reports.md), F1.
 
-## 8. Draft-model tuning
+## 8. Draft-model tuning — first increment done
 
-We accept no `-md`, so for anyone who owns a draft model the entire draft-side
-surface — `-ngld`, `-ctkd`/`-ctvd`, `-ncmoed`, the `draft-simple`/`draft-dflash`
-spec types — is unaskable. Design and checklist:
+`--draft-model` is accepted (`1c69ad5`), and with one the draft-side *placement*
+factors `-ngld` and `-ctkd`/`-ctvd` are swept; without one they are omitted
+entirely, since llama.cpp ignores them and an inert column would read as "draft
+placement doesn't matter".
+
+It also made the second route to MTP expressible: `has_dft()` decides whether
+llama.cpp drafts from the target's own NextN head or loads a separate head file,
+and both are real configurations at different VRAM costs (issue #12).
+
+Remaining: the staged screen (spec type first, then tune the winner's
+placement), `-ncmoed` and the long tail, and the `draft-simple` / `draft-eagle3`
+/ `draft-dflash` spec types. Design and checklist:
 [`docs/draft-model-design.md`](docs/draft-model-design.md).
 
 ## 9. Workload shape — now a correctness fix, not a feature

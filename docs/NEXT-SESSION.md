@@ -1,169 +1,127 @@
-# Handoff — open work as of 2026-08-26
+# Handoff — open work as of 2026-08-30
 
-Working state at the end of the 2026-08-25/26 sessions. For what order to do the
+Working state at the end of the 2026-08-30 session. For what order to do the
 remaining work in and why, see [`PLAN.md`](PLAN.md). Unlike the other files in
 `docs/`, this one is **transient**: it records what is in flight and what to pick
 up next, and should be pruned as items land. Durable reasoning belongs in the
 design docs it points at.
 
-Everything below is committed and pushed to `main` (through `c6881b7`), the
+Everything below is committed and pushed to `main` (through `1c69ad5`), the
 working tree is clean, and `--selftest` passes.
+
+**No live sweep was run this session.** The GPU on the dev box is in use by
+another project — 174 MiB free of 32752 at last check — so every change is
+verified by `--selftest`, in-process exercise with a stubbed `_help_cache`, and
+CPU-only runs with the device hidden. Anything below marked "needs GPU" is
+genuinely unverified on hardware, not merely untested by convention.
+
+## What landed
+
+**PR #10 / issue #9 — `-ncffn` dense FFN offload.** Merged in `e87f13a` with
+Fathi Boudra's commit cherry-picked intact, plus a fix: the pruner gate dropped
+`-ncffn` from the estimate when `llama-fit-params` predated the flag, which made
+every level share one cache key and one verdict computed for the *un-offloaded*
+config — silently deleting the whole factor on exactly the machines it exists
+for. Superseded the same day by `ffn_place` (below).
+
+**`ffn_place` (`2ed5873`)** — one dense placement column spanning `-ot` and
+`-ncffn`, because they are different axes (*which tensor* vs *how many layers*)
+and cannot be two OA columns: `-ncffn` appends to the same override vector `-ot`
+writes to, so `ffn_cpu` swallows every `first_N` level. Added a build-time
+invariant that an `emit` factor's levels must emit *distinct* arguments — it
+immediately caught a level spelled `up_cpu` that missed the `OT_PATTERNS` key,
+emitted nothing, and silently duplicated `none`.
+
+**Free-VRAM preflight (`d422125`)** — the pruner compares against *total* VRAM;
+`list_devices` already parsed free per device and nothing read it. On a shared
+card that approves configs which abort in the allocator. Warns, never prunes.
+
+**Sweep cost (`71367e7`, `e2f50c9`, `5810272`, `eea04db`)** — `--timeout` became
+a per-config deadline (it was per-*request* on the server driver, allowing
+`(1+reps)×`), `--min-tgs`/`--min-pps` abandon slow configs by arithmetic, and
+`--levels` narrows every auto-generated factor together. A bare invocation on a
+TTY now interviews the user. See [`sweep-cost-design.md`](sweep-cost-design.md).
+
+**Draft model (`1c69ad5`)** — `--draft-model` input, `-ngld` and `-ctkd`/`-ctvd`
+as factors present only with it. First increment of F2.
 
 ## Do these first
 
-### 1. ~~Confirm CI is actually green~~ — done
+### 1. Issue #11 — `--profile agents` false `IMPLAUSIBLE` (blocked on reporter)
 
-Several runs had failed with *"The job was not acquired by Runner of type hosted
-even after multiple attempts"* — empty step list, conclusion `cancelled`. That was
-GitHub runner starvation, not a test failure. Confirmed: the four most recent runs
-all pass in ~20s. Worth remembering the signature, since it looks alarming and
-means nothing.
+**Parked at the maintainer's request; do not spend time until data arrives.**
+Asked for the results CSV, the exact command and the model's native context.
 
-### 2. Cut 0.2.0
+Ruled out already, so do not redo them: prefix reuse (`--profile agents` selects
+the *bench* driver, where it never applies — the original hypothesis was wrong)
+and bench output parsing (pp rows carry `n_gen=0`, tg rows `n_prompt=0`,
+unaffected by `-d`).
 
-Everything in [`CHANGELOG.md`](../CHANGELOG.md) `[Unreleased]` is done and
-verified. To release: change `__version__` in `llama-optimize.py` from
-`0.2.0-dev`, move the `[Unreleased]` heading to `[0.2.0]` with a date, and tag.
-`v0.1.0` is already tagged at `bbb206a` as the pre-provenance baseline.
+One real finding fell out: the guard's own comment claims "the honest ratio runs
+10-100x in prefill's favour", but measured on CPU (gemma-3-270m, `-p 8192
+-n 256`) it is 11.7x at depth 0, **7.5x at 8192** and 7.3x at 32768. It flattens
+rather than inverting, so the check never trips — but the margin on the
+deep-context profile is thinner than the constant was reasoned from. Worth
+revisiting `TG_OVER_PP_LIMIT` regardless of what the reporter says.
 
-The changelog's **⚠️ Affects existing results** section is the point of the
-release: ngram numbers are upper bounds, and concurrency sweeps never measured
-`kv_unified`. Both need to reach users who have already run sweeps.
+### 2. The estimate/answer rule now has three instances — consider generalising
 
-### 3. ~~Measure whether MTP acceptance is inflated~~ — done: it is not
+Three separate defects this session had one shape: **an estimate that answers a
+different question than the one asked is worse than no estimate.**
 
-**Answered 2026-08-26.** Acceptance moves 0.78 → 0.70 across the whole reuse
-range and reproduces to ±0.02, versus n-gram's 1.00 → 0.31. MTP sweep results
-stand. The reverse-order control also showed the accompanying throughput trend
-was thermal drift, not reuse — see
-[`workload-shape-design.md`](workload-shape-design.md). Original reasoning kept
-below.
+1. `-ncffn` dropped from the fit argv → estimated the un-offloaded footprint
+2. total VRAM vs free → approved configs with no room to run
+3. `-md` unparseable by `llama-fit-params` → would estimate one model of two
 
-We proved n-gram speculation is inflated by the identical-prompt harness
-([`workload-shape-design.md`](workload-shape-design.md)): 100% acceptance and
-2.3–3.4x throughput on a repeated prompt, no drafting at all on distinct ones.
-MTP drafts from the model's own NextN head rather than from cross-request n-gram
-state, so it is *probably* unaffected — but "probably" is exactly what was said
-about ngram before measuring.
+Each is handled, and `fit_blind_flags` is the shared mechanism for (1) and (3).
+Whether (2) belongs in it too — a "the card is too full to price this" blind
+condition rather than a warning — is an open design question, not a bug.
 
-Method (the ngram test, rerun with MTP): load a NextN model with
-`--spec-type draft-mtp`, send the same prompt three times, then three distinct
-prompts, and compare `draft_n` / `draft_n_accepted` in the response `timings`.
-`draft_acc` already records this. If MTP is flat across both, MTP results stand
-and only ngram needs the caveat.
+### 3. Multi-GPU (issue #5) — the reporter's own numbers moved this
 
-## Designed, not built
+`--list-devices` on their box: 6672 MiB free of 24117 on the 3090, 9837 of 11909
+on the 3060. **16.5 GB free against 36 GB total**, which likely explains their
+"35B kept getting offloaded" report better than the single-device VRAM bug did.
+Asked them to re-run and report the new `VRAM free` header line, since it changes
+what a multi-GPU split should be aiming at. `-sm`/`-ts` remain unimplemented;
+[`multi-gpu-design.md`](multi-gpu-design.md) is still the plan of record, and the
+device-order trap still needs their hardware.
 
-Each has a checklist and a no-GPU test plan in its own doc.
+## Then
 
-| what | doc | notes |
-|---|---|---|
-| **Workload shape — flip the default** | [`workload-shape-design.md`](workload-shape-design.md) | `--prefix-reuse` now exists and is measured, but **defaults to 100 (identical requests)** so this release did not silently redefine every measurement. Remaining: per-profile realistic defaults, and re-measure the ngram screen. Also still open: re-derive `TG_OVER_PP_LIMIT` before any `--cache-reuse` factor lands, since a too-tight limit deletes real configs silently |
-| **Concurrency / `kv_unified`** | [`concurrency-kv-design.md`](concurrency-kv-design.md) | Design done this session. Blocked on settling the per-regime `n_ctx` rule (K3) first — a slot's context differs between shared and split KV, and getting it wrong recreates the batch-floor defect somewhere new |
-| **Draft model / `-md`** | [`draft-model-design.md`](draft-model-design.md) | Unlocks ~12 `--spec-draft-*` knobs plus `draft-simple`/`draft-dflash`/`draft-dspark`. Prerequisite: `predict_fits` must account for two models resident |
-| **Multi-GPU / `-ts`,`-sm`,`-mg`** | [`multi-gpu-design.md`](multi-gpu-design.md) | Predates these sessions. Needs two non-identical GPUs to validate the part that matters |
+- **Draft-model staging (F2 continued).** The staged screen from
+  [`draft-model-design.md`](draft-model-design.md) — screen `--spec-type`, then
+  tune the winner's placement — is not built; draft factors currently ride the
+  flat array. Also `-ncmoed` and the `draft-simple`/`draft-eagle3`/`draft-dflash`
+  spec types.
+- **Route 1 vs route 2 for MTP (needs GPU, ideally not ours).** Whether passing
+  `-md` with an already-embedded NextN head measurably differs from omitting it.
+  Now expressible; asked on issue #12 for anyone with the setup.
+- **`--mmproj` (issue #12).** Probably a measurement-*validity* question rather
+  than only coverage: a resident projector occupies VRAM whether or not image
+  traffic arrives, shifting the boundary the pruner and context probe reason
+  about. Currently filed under absent workloads in
+  [`flag-coverage.md`](flag-coverage.md); may belong under validity.
+- **Report time saved by the floors.** Nothing says, after a sweep, how much
+  `--min-tgs` actually bought. That number is the honest way to tune the advice.
+- **Issue #3** — fix shipped and retroactive; the upstream cause is still
+  unconfirmed. Leading hypothesis is now the tight-fit/total-VRAM interaction
+  (`ngl=20 -ncmoe 40` on an 8 GB card). Offered to close as "cause not confirmed"
+  if the reporter no longer has the CSV.
 
-## Hardware-poisoned constants
+## Traps worth remembering
 
-[`constants-audit.md`](constants-audit.md) classifies every hardcoded value.
-Two were fixed (chars-per-token, the sweep time estimate). Four are recorded as
-findings because each changes what gets measured and needs live validation:
-
-- **C-A `FIXED_FA = 1`** — pinned because it "helps gfx906", i.e. from this
-  machine. Not a one-line fix: `-fa` is a precondition for quantized KV, so
-  letting it fall to `auto` on a backend that declines FA would silently
-  invalidate every `q8_0` row. The honest fix probes whether FA is active and
-  gates `kv_type` on the answer — and needs a non-ROCm box to validate.
-- **C-C `THERMAL_BAND_C` / `THERMAL_CAP_S`** — a settle policy tuned to one
-  card's thermal behaviour. `temp_c` is already recorded per row, so the raw
-  material for deriving it exists.
-- **C-D `FIXED_BATCH`**, **C-E `DEFAULT_UBATCH_LEVELS` / `DEFAULT_MAX_DEPTH`** —
-  literals where a derivation from VRAM or the model is available.
-
-## Watch: "n-gram tables" in Qwen3.8-Flash-Next — a name collision, and maybe a factor
-
-[Qwen3.8-Flash-Next](https://github.com/QwenLM/Qwen3.8-Flash-Next) ships **N-gram
-Embeddings**: 51B parameters of learned embeddings indexed by local context,
-alongside a 125B main model. **This is not our `ngram` factor.** Ours is
-`--spec-type ngram-*`, a runtime *self-speculation* strategy that drafts from
-n-grams already in the context. Theirs is a model *architecture* feature shipped
-inside the weights. Same word, unrelated mechanisms — worth writing down because
-the collision is confusing and someone will conflate them.
-
-Why it may matter later: the model card notes the embedding table "can be
-offloaded to host memory and overlapped with model computation through
-asynchronous prefetching". A 51B-parameter table whose placement is a choice is
-exactly our problem domain — the same question `-ot`, `-ncmoe`, `--no-host` and
-`--op-offload` already answer for other tensors.
-
-Nothing to do yet: `grep` finds no n-gram-embedding support in llama.cpp at
-`4d19b2876`. Revisit when llama.cpp gains it, and check whether the placement is
-flag-controlled — if it is, it is a factor.
-
-## Smaller open items
-
-- **`-sps`/`--slot-prompt-similarity`** — the server-side prefix-reuse routing
-  knob. Unmeasurable until `--prefix-reuse` exists; folded into the workload-shape
-  design.
-- **Auto-sweep decisions** for the newly registered knobs
-  ([`remaining-factors-design.md`](remaining-factors-design.md)): can SWA be
-  detected from GGUF metadata (would gate `swa_full` the way `n_nextn` gates
-  `mtp`)? Should `load_mode` auto-sweep when the model does not fit in VRAM —
-  which is detectable, and exactly where paging decides throughput?
-- **RoPE/YaRN tail** — we sweep `rope_scaling` and `yarn_factor` and stop.
-  Complete the family or state the scope; an incomplete family reads as a
-  deliberate decision and is not one.
-- **`--audit-flags`** — parse `--help`, diff against `FACTORS` plus an in-code
-  exclusion allow-list, report anything in neither. Measured drift across one
-  routine pull: 2 flags added, 0 removed, 4 of 12 cited line numbers moved. See
-  [`flag-coverage.md`](flag-coverage.md).
-- **Re-measure the ngram screen** under distinct prompts once `--prefix-reuse`
-  lands, and say plainly in the report that earlier numbers were upper bounds.
-
-## From the Bayesian autotuner (F6)
-
-Their prompt-battery and metrics docs have now been read in full; F6 records the
-detail. Two things landed already — the zero-measurement selection fix (below),
-and the note that `--prefix-reuse` should **report the reuse fraction it actually
-achieved**, not just the one requested, the way their `duplication_report()`
-quantifies contamination instead of assuming it away.
-
-[`field-reports.md`](field-reports.md) F6 reviews
-[SergioMorillas/vllm-bayesian-autotuner](https://github.com/SergioMorillas/vllm-bayesian-autotuner).
-Three concrete things to pull from it:
-
-1. **Their six-term memory model is our OOM pruner, already specified.** ROADMAP
-   item 2 has been blocked on what to sum; they sum weights + KV + Mamba state +
-   CUDA-graph overhead + activations + margin against two inequalities. The
-   llama.cpp translation drops Mamba and CUDA graphs and gains the
-   partial-offload split.
-2. **Objectives we do not measure**: TTFT (ours is derived, not measured — ROADMAP
-   5), TPOT and goodput (cheap now that per-request timings are recorded), and
-   **tokens/joule**, which is a genuinely new axis and interesting on a card whose
-   thermal ceiling is already the dominant noise source.
-3. **Their prompt-battery design doc** is worth reading before building
-   `--prefix-reuse`.
-
-## Verified this session, so you do not need to re-check
-
-- A completed-but-empty run can no longer be recommended (`measured_ok`), with a
-  regression test confirmed to fail without the guard.
-- Partial request failures are measured (`err_rate`) instead of collapsing the
-  config to ERROR; the throughput penalty is intrinsic to the wall clock.
-- `--prefix-reuse` measured live: 100% reuse -> 100% draft acceptance / 889 t/s,
-  90% -> 31% / 379 t/s. The prompt generator was itself a contamination source
-  (tiled text kept acceptance at 1.00 even at 0% reuse) and is fixed.
-- llama.cpp rebuilt at `4d19b2876` (ROCm 7.2.1, gfx906) and confirmed on real
-  inference: `backend=ROCm`, 444 t/s tg on gemma-3-270m vs 115 t/s CPU-only.
-- All 37 flags the registry emits are still accepted by that build; none removed.
-- Every newly registered knob's spelling is accepted by `llama-server`.
-- The emitted command carries exactly one `--load-mode`, and default-on booleans
-  emit their off-spelling.
-- `tool_version` / `llama_build` / `backend` land in real results CSVs.
-- The GPU-visibility warning fires on a blinded GPU and stays silent otherwise.
-
-## A note on the machine
-
-The GPU is shared and frequently busy — ask before running anything that loads a
-model. `--selftest` needs no GPU, and plan-only runs (omit `--run`) need no GPU
-either, which covers most verification.
+- **`-ngl 0` does not avoid the GPU.** llama.cpp op-offloads matmul to the GPU
+  backend with no layers resident, so CPU-only rows still allocate VRAM and abort
+  with the rest. To run on the CPU while the card is busy, hide the device:
+  `HIP_VISIBLE_DEVICES=` / `CUDA_VISIBLE_DEVICES=`.
+- **The CPU test model** is
+  `/home/bigattichouse/workspace/gguf/gemma-3-270m-it-Q8_0.gguf`. The
+  `../model/gemma-3-270M-it` directory is HF safetensors with no GGUF.
+- **`llama-fit-params` and the driver are separate binaries with separate flag
+  support**, and they *do* diverge inside one build tree — on this box
+  fit-params has `-ncffn` while llama-bench does not.
+- **Metadata declares an architecture, not a file's contents.** Both
+  `Qwen3.8-27B-UD-IQ4_XS` and the standalone `mtp-*.gguf` report
+  `nextn_predict_layers = 1`; only the tensor list distinguishes them. Checking
+  a truncated tensor listing is how issue #12's first diagnosis went wrong.

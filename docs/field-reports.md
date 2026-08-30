@@ -337,10 +337,18 @@ that card will hit *before* they can run a sweep at all.
       nothing, covered in `--selftest` against a synthetic response payload
       (no GPU). Note the gate is often *not* a factor — `build_server_args`
       emits MTP fixed-on — so the check reads the config, not just the row
-- [ ] **F2** — a `--draft-model` input, then the draft-side mirror as conditional
-      factors gated on it ([`draft-model-design.md`](draft-model-design.md)).
-      `-ngld` alone was the wrong unit of work: inert without `-md`, and one of a
-      dozen twins once `-md` exists
+- [~] **F2** — `--draft-model` input landed (`1c69ad5`), with `-ngld` and
+      `-ctkd`/`-ctvd` as factors present only when a draft model is given
+      ([`draft-model-design.md`](draft-model-design.md)). `-ngld` alone was the
+      wrong unit of work: inert without `-md`, and one of a dozen twins once
+      `-md` exists. Confirmed in the wild by a user config (issue #12) that sets
+      `--spec-draft-ngl all` and tunes draft KV separately from the target's —
+      the llama.cpp-native version of the vLLM evidence this report was built on.
+      **Remaining:** the staged screen (spec type first, then the winner's
+      placement), `-ncmoed` and the long tail, and the `draft-simple` /
+      `draft-eagle3` / `draft-dflash` spec types. Note D3 was *revised* rather
+      than implemented — `llama-fit-params` rejects `-md`, so the pruner stands
+      down on draft rows instead of estimating one model out of two
 - [ ] **F3** — fold the `1,4`-on-1:2 datapoint into `ts_levels()` span selection
       when [`multi-gpu-design.md`](multi-gpu-design.md) is implemented; keep the
       single-device configuration reachable

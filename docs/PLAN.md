@@ -14,8 +14,11 @@ Four separate pieces of work all wait on the same question:
 ```
   measure MTP acceptance  ─┬─►  flip --prefix-reuse default  ─►  re-measure ngram screen
       DONE: unaffected     │            DONE                          (needs GPU)
-                           └─►  MTP advisory: NOT needed  ─────►  cut 0.2.0  <-- next
+                           └─►  MTP advisory: NOT needed  ─────►  cut 0.2.0  DONE
 ```
+
+That chain is finished. The sequencing question since then has been a different
+one — see *After 0.2.0* below.
 
 n-gram speculation turned out inflated 2.3x by the identical-prompt harness
 ([`workload-shape-design.md`](workload-shape-design.md)). MTP drafts from the
@@ -59,11 +62,11 @@ the prompt generator and one defect in `draft_acc` itself — see
 [`workload-shape-design.md`](workload-shape-design.md). Corrected figures: ngram
 inflation is ~1.46x, not the 2.3x earlier drafts claimed.
 
-### 3. Cut 0.2.0 — *mechanical*
+### 3. ~~Cut 0.2.0~~ — **done** (2026-08-26)
 
-Bump `__version__`, move `[Unreleased]` to `[0.2.0]`, tag. The ⚠️ **Affects
-existing results** section is the reason to ship rather than sit on it: users who
-have already run ngram sweeps need to know their numbers were upper bounds.
+Shipped with the ⚠️ **Affects existing results** section, which was the reason to
+ship rather than sit on it: users who had already run ngram sweeps needed to know
+their numbers were upper bounds.
 
 ### 4. ~~The OOM pruner~~ — **already done, now validated**
 
@@ -116,3 +119,27 @@ That the GPU is shared and frequently busy, so anything needing it is scheduled
 opportunistically rather than depended on. Everything in steps 2–6 is
 reachable with `--selftest` and plan-only runs; only steps 1 and 7 genuinely
 require hardware.
+
+## After 0.2.0 — what actually shapes the order now
+
+The 2026-08-30 session cleared the sweep-cost work and the first draft-model
+increment, so the dependency that shapes the *next* stretch is hardware, not
+sequencing:
+
+```
+  GPU is free  ─┬─►  re-measure ngram screen (blocked since 0.2.0)
+                ├─►  route 1 vs route 2 for MTP (issue #12, needs -md + a NextN model)
+                └─►  live-validate the throughput floors actually save what the
+                     arithmetic says
+```
+
+None of these can be faked in-process, and none of them ran this session because
+the card belongs to another project. Everything that *could* be done without a
+GPU has been; see [`NEXT-SESSION.md`](NEXT-SESSION.md) for the current state.
+
+The one non-GPU item worth doing next is not a feature: three separate defects
+this session shared the shape *an estimate answering a different question than
+the one asked is worse than no estimate* (`-ncffn` dropped from the fit argv,
+total-vs-free VRAM, `-md` unparseable by the estimator). Two are handled by one
+mechanism, `fit_blind_flags`; whether the third belongs in it is a design
+question worth settling before a fourth arrives.
