@@ -6,7 +6,7 @@ remaining work in and why, see [`PLAN.md`](PLAN.md). Unlike the other files in
 up next, and should be pruned as items land. Durable reasoning belongs in the
 design docs it points at.
 
-Everything below is committed and pushed to `main` (through `1c69ad5`), the
+Everything below is committed and pushed to `main` (through `ff045dc`), the
 working tree is clean, and `--selftest` passes.
 
 **No live sweep was run this session.** The GPU on the dev box is in use by
@@ -44,6 +44,18 @@ TTY now interviews the user. See [`sweep-cost-design.md`](sweep-cost-design.md).
 
 **Draft model (`1c69ad5`)** — `--draft-model` input, `-ngld` and `-ctkd`/`-ctvd`
 as factors present only with it. First increment of F2.
+
+**`--mmproj` and artifact pricing (`1099475`)** — a projector is an input too,
+and the pruner now prices both it and the draft model from their on-disk size
+scaled by per-row placement, rather than standing down. `llama-fit-params`
+rejects `-md` and `--mmproj`, so this is the only way those rows get pruned at
+all. A lower bound, deliberately: understating wastes time, overstating deletes
+configs that would have fit. Closed issue #13, and superseded the stand-down
+answer given on #12 earlier the same day.
+
+**The defect class written down (`ff045dc`)** — five instances across four
+subsystems, generalised into [`DESIGN.md`](DESIGN.md), with the testing practices
+that catch it.
 
 ## Do these first
 
@@ -100,11 +112,11 @@ device-order trap still needs their hardware.
 - **Route 1 vs route 2 for MTP (needs GPU, ideally not ours).** Whether passing
   `-md` with an already-embedded NextN head measurably differs from omitting it.
   Now expressible; asked on issue #12 for anyone with the setup.
-- **`--mmproj` (issue #12).** Probably a measurement-*validity* question rather
-  than only coverage: a resident projector occupies VRAM whether or not image
-  traffic arrives, shifting the boundary the pruner and context probe reason
-  about. Currently filed under absent workloads in
-  [`flag-coverage.md`](flag-coverage.md); may belong under validity.
+- **Multimodal as a *workload*** — request shape, `--image-min-tokens`,
+  `-mmdev`, and embedding/rerank serving. Still out of scope, and still a
+  decision rather than an oversight ([`flag-coverage.md`](flag-coverage.md)).
+  The *validity* half is done: `--mmproj` is an input and its footprint is
+  priced (issue #13).
 - **Report time saved by the floors.** Nothing says, after a sweep, how much
   `--min-tgs` actually bought. That number is the honest way to tune the advice.
 - **Issue #3** — fix shipped and retroactive; the upstream cause is still
