@@ -17,11 +17,15 @@ speculative decoding**, **ngram self-speculation** (`--ngram`), and
 **crash-safe** — a setting that reboots the box won't be retried into a loop.
 
 ```bash
-# plan only — prints the experiment matrix and commands, uses NO GPU
+# start here — asks four questions, derives the flags, shows the cost, offers
+# to run. Uses NO GPU until you say yes. (Piped/redirected: prints the plan.)
 python3 llama-optimize.py /path/to/model.gguf
 
 # just tune it — autonomous, one command
 python3 llama-optimize.py /path/to/model.gguf --run
+
+# cut the sweep down: 125 runs -> 27, and abandon anything under 10 t/s
+python3 llama-optimize.py /path/to/model.gguf --run --levels 3 --min-tgs 10
 
 # tune for how you actually run it (see "Use cases" below)
 python3 llama-optimize.py /path/to/model.gguf --run --use-case agents
@@ -457,6 +461,8 @@ python3 llama-optimize.py model.gguf --run --levels 3   # 125 runs -> 27
 
 Fewer levels means a coarser grid, not a wrong answer — 3 levels still show
 curvature, 2 only a direction. Explicit `--factor` values are never touched.
+Full reasoning, and the measurements behind it, in
+[sweep cost](docs/sweep-cost-design.md).
 
 **Cap what you are willing to wait for.** Most of a long sweep is spent on
 configs that were never going to win: at `--n-gen 256`, a config running at
@@ -614,6 +620,21 @@ python3 llama-optimize.py MODEL.gguf [options]
   --min-context N    minimum context you need: BALANCED targets it, FASTEST only
                      considers configs verified to hold it, and emitted -c is
                      floored at it where the sweep has evidence (alias: --ctx-floor)
+  --levels N         levels per auto-generated numeric factor (default 5). The
+                     sweep's cost dial: the array is sized by the WIDEST factor,
+                     so narrowing one knob alone changes nothing. 5 -> L125/125
+                     runs, 3 -> L27/27, 2 -> L16/16. --factor values untouched
+  --min-tgs TPS      abandon configs generating slower than TPS. Shortens the
+                     per-config budget by arithmetic (a config that would meet
+                     the floor finishes inside it), so it works on llama-bench
+                     too. Rows are marked SLOW, keep their numbers, and are
+                     excluded from the picks
+  --min-pps TPS      as --min-tgs, for prefill. On the server driver it is
+                     decided as soon as warm-up returns, so a failing config
+                     never pays for its decode reps
+  --tgs-timeout SECS never judge a config on less than this (default 60), so a
+                     small --n-gen cannot derive a budget that measures model
+                     load instead of throughput
   --min-kv TYPE      KV-cache quality floor (default q8_0, near-lossless); never
                      recommends a lossier KV. 'any' to explore all (q5/q4)
   --n-gen N          generated tokens per measurement (default: from profile)
@@ -661,7 +682,10 @@ python3 llama-optimize.py MODEL.gguf [options]
                      own draft-length knobs)
   --thinking         tune for reasoning workloads (long decode, n_gen~2048);
                      default is non-thinking / short answers
-  --timeout SECS     per-run timeout (default: 1200)
+  --timeout SECS     wall-clock budget for ONE config (default: 1200), covering
+                     warm-up and every rep together. The server driver used to
+                     apply this per HTTP request, so a config could take
+                     (1+reps)x it; it is a deadline on both drivers now
   --use-case U       runbook that bundles driver+profile+concurrency:
                      app | single | agents | multi-user (see Use cases above).
                      --driver/--profile/--parallel override the runbook.

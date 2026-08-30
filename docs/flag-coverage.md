@@ -98,6 +98,9 @@ noting them here so that stays a decision.
 - **Workload shape** — `--cache-reuse`, `-cram`, `--cache-prompt`,
   `--cache-idle-slots`, and now `-sps`:
   [`workload-shape-design.md`](workload-shape-design.md)
+- **Sweep cost** — why narrowing one knob does nothing, `--levels`, the
+  throughput floors and the setup interview:
+  [`sweep-cost-design.md`](sweep-cost-design.md)
 
 ## Correctly excluded, with the reason
 
