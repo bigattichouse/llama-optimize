@@ -47,6 +47,17 @@ earlier.
   reachable via `--factor ot=...` — `ncffn` varies *how many layers* offload
   while `ot=ffn_up_cpu` varies *which tensor*, so the two are different axes and
   the finer one does not subsume the lighter one.
+- **`--mmproj`: a multimodal projector is an input the sweep can be told about.**
+  A projector occupies VRAM from load whether or not any image traffic arrives,
+  which made it different from the other absent multimodal *workloads*: those
+  cost nothing when unused, this one silently shrinks the budget `predict_fits`
+  and the max-context probe both reason about. Passing `--mmproj` now emits it to
+  the server, adds `--mmproj-offload` as a factor (the one genuine placement
+  decision it carries), and includes its size in the footprint.
+
+  Coverage of multimodal as a workload — request shape, `--image-min-tokens`,
+  `-mmdev` — remains out of scope. This is about not being wrong when one is
+  loaded.
 - **`--draft-model` / `-md`: the draft-side surface becomes reachable.** First
   increment of F2 ([`draft-model-design.md`](docs/draft-model-design.md)). A
   draft model is an *input*, not a factor — a sweep either has one or it does
@@ -67,12 +78,20 @@ earlier.
   degraded draft cache is verified by the target, then accepted or discarded, so
   quantising it costs acceptance rate (speed), which is the thing being measured.
 
-  **OOM pruning turns off for draft rows.** `llama-fit-params` rejects `-md`
-  ("invalid argument"), so a second resident model cannot be estimated at all.
-  `-md` is passed to the estimator anyway, so the existing capability gate sees
-  it and stands down with a notice. Estimating the target alone while the machine
-  holds two models is the confidently-wrong kind of answer. This revises D3/DM3
-  in the design doc, which had assumed the pruner could be taught about it.
+  **The OOM pruner now prices resident artifacts it cannot ask about.**
+  `llama-fit-params` rejects `-md` and `--mmproj` ("invalid argument"), so it
+  estimates the text model alone while the machine holds two or three. Rather
+  than skip pruning on those rows, `resident_extra_mib` adds what can be measured
+  without it: weights on disk are a hard lower bound on weights in VRAM — the
+  draft GGUF scaled by `-ngld`'s share of its layers, plus the projector when
+  `--mmproj-offload` leaves it resident. Both are per-row, so the figure reaches
+  the fit cache key too.
+
+  A lower bound is the only safe direction, and asymmetrically so: understating
+  prunes fewer rows, so some doomed configs run and cost time, while overstating
+  deletes configs that would have fit and costs information. Compute buffers and
+  the draft model's own KV cache are therefore deliberately not modelled, and an
+  unreadable draft geometry prices as zero rather than as "all of it".
 - **Setup interview on a bare invocation.** `llama-optimize.py model.gguf` on a
   terminal now asks four questions — context actually served, slowest useful
   generation speed, how much of the space to search, repeats — then prints the

@@ -625,6 +625,10 @@ python3 llama-optimize.py MODEL.gguf [options]
                      factors (-ngld, -ctkd/-ctvd), which llama.cpp ignores
                      without it. OOM pruning turns OFF for these rows:
                      llama-fit-params cannot be told a second model exists
+  --mmproj G         multimodal projector (server driver). An INPUT, like
+                     --draft-model: it holds VRAM from load whether or not image
+                     traffic arrives, so a sweep that will serve with one must
+                     measure with one. Adds --mmproj-offload as a factor
   --levels N         levels per auto-generated numeric factor (default 5). The
                      sweep's cost dial: the array is sized by the WIDEST factor,
                      so narrowing one knob alone changes nothing. 5 -> L125/125
@@ -767,6 +771,7 @@ registry in `llama-optimize.py`.
 | `spec_n_min_frac` | `--spec-draft-n-min` | server | float | swept³ | min draft tokens, as a **fraction of `spec_n_max`** (`n_min` = `⌊frac × n_max⌋`)⁵ |
 | `spec_p_min` | `--spec-draft-p-min` | server | float | swept³ | MTP acceptance-probability threshold |
 | `spec_p_split` | `--spec-draft-p-split` | server | float | swept³ | MTP split probability |
+| `mmproj_offload` | `--mmproj-offload` | server | bool | swept⁶ | projector on GPU or CPU — only with `--mmproj` |
 | `spec_draft_ngl` | `-ngld` | server | num | swept⁶ | draft model's GPU layers — where the *drafter* lives |
 | `spec_draft_kv` | `-ctkd -ctvd` | server | cat | swept⁶ | draft KV precision, independent of the target's |
 | `rope_scaling` | `--rope-scaling` | server | cat | opt-in | RoPE scaling: none/linear/yarn |
@@ -806,10 +811,15 @@ as it pattern-matches from the token history. Note that `spec_n_max`
 (`--spec-draft-n-max`) is a draft-model/MTP knob with **no effect on ngram**, so
 it is not an ngram factor.
 
-**⁶ Draft-side factors appear only with `--draft-model`.** llama.cpp reads them
-only when a draft model was given, so without one every level would be the same
-run — an inert column reads as "draft placement doesn't matter" when it was never
-tested. Levels come from the *draft* model's layer count, not the target's.
+**⁶ These appear only when the input they describe is given** — `--draft-model`
+for the draft-side factors, `--mmproj` for `mmproj_offload`. llama.cpp reads them
+only when the artifact is loaded, so without it every level would be the same run
+— an inert column reads as "placement doesn't matter" when it was never tested.
+Draft levels come from the *draft* model's layer count, not the target's.
+
+Because `llama-fit-params` cannot be told either artifact exists, the OOM pruner
+adds their on-disk size (scaled by placement) to the footprint itself — a
+deliberate under-estimate, so it never prunes a config that would have fit.
 
 Note the draft KV is deliberately **not** held to `--min-kv`. That floor protects
 output quality, and the drafter produces no output: a token drafted from a

@@ -79,8 +79,15 @@ model spilling to system RAM), which is where several of these bite hardest.
 | `-ctxcp`, `-cms` | context checkpoints, min step | Recompute cost on context shift — bites at the high-depth end where throughput already sags |
 | RoPE/YaRN tail | `--rope-scale`, `--rope-freq-base`, `--rope-freq-scale`, `--yarn-orig-ctx`, `--yarn-attn-factor`, `--yarn-beta-fast/slow` | We sweep `rope_scaling` and `yarn_factor` and stop. An incomplete family reads as a deliberate scope, and isn't |
 
-Multimodal is a whole uncovered workload rather than a flag: `--mmproj-offload`
-is a genuine placement decision (the projector competes for the same VRAM),
+**`--mmproj` is now an input** (issue #13) and `--mmproj-offload` a factor under
+it. The distinction that forced this: a projector holds VRAM from load whether or
+not image traffic arrives, so unlike the other absent workloads below it made our
+*numbers wrong* rather than merely incomplete — `predict_fits` and the
+max-context probe were both reasoning about a budget it was silently consuming.
+`llama-fit-params` rejects `--mmproj`, so its size is added to the footprint
+directly, as a conservative lower bound.
+
+The rest of multimodal remains an uncovered workload rather than a flag:
 `-mmdev`/`--mmproj-device` (new in `4d19b2876`) makes that placement explicit
 per-device, and
 `--image-min-tokens`/`--image-max-tokens`/`--mtmd-batch-max-tokens` set the

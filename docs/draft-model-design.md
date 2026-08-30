@@ -59,9 +59,14 @@ omits the draft factors entirely when no draft model is set. **The latter is
 preferred** — it matches how `ncmoe`, `mtp` and `ngram` already appear only when
 the model and flags make them meaningful, and it keeps `is_active` single-purpose.
 
-**D3 — REVISED: the OOM pruner cannot account for both models, so it stands
-down.** The original text (below) assumed the pruner could be taught about the
-draft model. It cannot — `llama-fit-params` rejects `-md` outright:
+**D3 — REVISED TWICE. The pruner cannot ask the estimator about a second model,
+so it prices one itself.** The first revision concluded that pruning should
+simply stand down on draft rows. That was too quick: it made the tool honest
+without making it useful, and "we cannot get a perfect number" is not a reason to
+use no number. Standing down admits *every* doomed config; a conservative
+estimate admits only some.
+
+What remains true is that `llama-fit-params` rejects `-md` outright:
 
 ```
 $ llama-fit-params -m model.gguf --fit-print on -md draft.gguf
@@ -73,11 +78,26 @@ no way to tell it a second model exists. Estimating anyway would report the
 target's footprint alone while the machine holds two — confidently wrong, in the
 direction that approves configurations which then abort.
 
-So `-md` is emitted into the estimator's argv precisely so `fit_blind_flags`
-sees it and turns pruning off for those rows, with a notice. Same "blind beats
-wrong" rule the `-ncffn` gate follows, and the inverse of the total-vs-free VRAM
-defect: both are estimates answering a different question than the one asked. If
-llama.cpp ever teaches `llama-fit-params` about `-md`, the gate opens by itself.
+So `resident_extra_mib` adds what we can measure without it: **weights on disk
+are a hard lower bound on weights in VRAM.** The draft model's GGUF size, scaled
+by `-ngld`'s share of its layers, plus the projector's size when
+`--mmproj-offload` leaves it on the GPU. Both are per-row, since placement is a
+factor, so the figure reaches the fit cache key as well.
+
+A lower bound is the only safe direction, and the reason is asymmetric. The
+estimate is compared against a ceiling, so **understating** it prunes fewer rows:
+some configs that will not fit get run anyway, costing time. **Overstating** it
+deletes configs that would have fit, costing information you cannot recover — the
+failure this project keeps rediscovering (issues #5, #7, and the `-ncffn` gate).
+So compute buffers and the draft model's own KV cache are deliberately not
+modelled, and an unreadable draft geometry prices as zero rather than as "all of
+it".
+
+This does not make the estimate correct, and it is not meant to. It makes it
+*directionally useful and never harmful*, which is the most that can be had while
+the estimator cannot be told these artifacts exist. If llama.cpp ever teaches
+`llama-fit-params` about `-md` and `--mmproj`, this term should be deleted rather
+than added to.
 
 The original reasoning, still right about the stakes:
 
@@ -110,10 +130,11 @@ target's, not assume a range.
   `--spec-type draft-simple` with no draft model is a run that cannot speculate;
   it must be unconstructible, not merely unlikely — the `spec_off` telemetry
   (F1) would flag it after the fact, but by then a row has been wasted.
-- **DM3 — VRAM predictions include the draft model, or are not made at all.**
-  Any consumer of the fitted footprint sees both models or is not consulted.
-  Since the estimator cannot see a draft model (D3 revised), "not consulted" is
-  the branch actually taken: pruning is off for draft rows.
+- **DM3 — VRAM predictions account for every resident artifact, at a lower
+  bound.** Any consumer of the fitted footprint sees the draft model and the
+  projector, priced conservatively from their file sizes and per-row placement,
+  or the prediction is not made at all. Never a footprint that silently omits
+  one.
 - **DM4 — Draft factors are staged, not flat.** A dozen new columns in one array
   is the inflation `CONDITIONAL-FACTORS.md` was written to prevent: screen the
   spec type at default knobs, then tune the winner's placement.
@@ -178,8 +199,9 @@ Sensible first cut, cheapest first:
 - [ ] `-ngld` registry entry + level generation from the *draft* model's layer
       count (D5)
 - [ ] `-ctkd`/`-ctvd` registry entries; decide open question 3 first
-- [x] `predict_fits` stands down on draft rows — it cannot account for a second
-      model, and a partial estimate is worse than none (D3 revised / DM3)
+- [x] `predict_fits` prices the draft model and the projector from their file
+      sizes, scaled by per-row placement, as a conservative lower bound the
+      estimator cannot supply (D3 revised twice / DM3)
 - [x] `--draft-model` input, `-md` emission, `-ngld` + `-ctkd`/`-ctvd` as factors
       present only when a draft model is given (D1/D2/DM1)
 - [x] `-ngld` levels generated from the DRAFT model's own layer count (D5)

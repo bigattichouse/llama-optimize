@@ -719,7 +719,7 @@ def gpu_temp_c() -> float | None:
 # build while an older llama-fit-params is found on $PATH or left from a
 # previous checkout. Observed in the other direction too, inside one build tree
 # — llama-fit-params carrying -ncffn while llama-bench did not.
-FIT_RECENT_FLAGS = {"-ncmoe", "-ncffn", "-md"}
+FIT_RECENT_FLAGS = {"-ncmoe", "-ncffn"}
 
 
 def fit_blind_flags(cfg: "Config", f: dict, driver: str) -> list[str]:
@@ -776,8 +776,6 @@ def _fit_params_flags(cfg: "Config", f: dict, driver: str) -> list[str]:
     # -md"). Emitted anyway so fit_blind_flags sees it and turns pruning OFF for
     # these rows: an estimate that silently ignores a whole model is the
     # confidently-wrong kind (DM3, revised — see draft-model-design.md).
-    if getattr(cfg, "draft_model", None):
-        flags += ["-md", str(cfg.draft_model)]
     # Dense FFN placement: the level carries its own flag (-ot or -ncffn), and
     # both spellings are ones fit-params accepts, so this needs no special case
     # beyond asking the level what it emits.
@@ -808,9 +806,65 @@ _fit_blind_warned: set = set()
 _fit_cache: dict[tuple, bool | None] = {}
 
 
+def _file_mib(path) -> int:
+    """Size of a GGUF on disk, in MiB. 0 if it cannot be read."""
+    try:
+        return int(Path(path).stat().st_size / (1024 * 1024))
+    except OSError:
+        return 0
+
+
+def resident_extra_mib(cfg: "Config", f: dict) -> int:
+    """VRAM held by artifacts `llama-fit-params` cannot be told about.
+
+    It rejects `-md` and `--mmproj` outright, so a setup that loads a draft
+    model or a projector is priced for the text model alone. Rather than stand
+    pruning down entirely, add what we can measure ourselves: weights on disk
+    are a hard LOWER bound on weights in VRAM.
+
+    A lower bound is the only safe direction. The estimate is compared against a
+    ceiling, so understating it prunes FEWER rows — it admits some configs that
+    will not fit, costing time, and can never delete one that would have. An
+    overestimate would do the opposite, which is the failure this project keeps
+    finding (issues #5, #7). Compute buffers and the draft model's own KV cache
+    are therefore deliberately not modelled.
+
+    Residency is per-row, not fixed: a projector with `--mmproj-offload 0` is on
+    the CPU and costs nothing, and a draft model at `-ngld 0` likewise."""
+    extra = 0
+    mmproj = getattr(cfg, "mmproj", None)
+    if mmproj and str(f.get("mmproj_offload", "1")) != "0":
+        extra += _file_mib(mmproj)          # projector offloaded (llama.cpp default)
+    draft = getattr(cfg, "draft_model", None)
+    if draft:
+        ngld = f.get("spec_draft_ngl")
+        d_layers = draft_layer_count(draft)
+        try:
+            ngld_n = None if ngld is None else int(ngld)
+        except (TypeError, ValueError):
+            ngld_n = None
+        if ngld is None:
+            frac = 1.0          # not swept: llama.cpp puts the whole drafter on GPU
+        elif ngld_n == 0:
+            frac = 0.0          # explicitly CPU-resident, whatever its geometry
+        elif d_layers and ngld_n is not None:
+            frac = min(1.0, ngld_n / d_layers)
+        else:
+            # placement is swept but the drafter's geometry is unreadable. Do
+            # not guess upward: over-counting prunes rows that would have fit,
+            # which is the expensive direction. Fall back to pricing the text
+            # model alone for this row.
+            frac = 0.0
+        extra += int(_file_mib(draft) * frac)
+    return extra
+
+
 def _fit_cache_key(cfg: "Config", f: dict, driver: str) -> tuple:
-    """Identity of a fit estimate: the model plus the exact args we'd pass."""
-    return (str(cfg.model), tuple(_fit_params_flags(cfg, f, driver)))
+    """Identity of a fit estimate: the model, the exact args we'd pass, and the
+    footprint of anything fit-params cannot be told about — which varies per row
+    with the projector's and drafter's placement, so it has to reach the key."""
+    return (str(cfg.model), tuple(_fit_params_flags(cfg, f, driver)),
+            resident_extra_mib(cfg, f))
 
 
 def parse_fit_print(stdout: str) -> int:
@@ -873,6 +927,8 @@ def predict_fits(cfg: "Config", f: dict, driver: str) -> bool | None:
             _fit_cache[key] = None
             return None
         gpu_used = parse_fit_print(proc.stdout)
+        # fit-params priced the text model only; add the artifacts it cannot see
+        gpu_used += resident_extra_mib(cfg, f)
         limit = total_vram - cfg.fit_headroom_mib
         result = gpu_used < limit
         _fit_cache[key] = result
@@ -1216,6 +1272,7 @@ class Config:
     # Throughput floors: a config below them is a real measurement the user has
     # said they do not want, so waiting for it to finish buys nothing (T1).
     draft_model: Path | None = None   # -md: a SECOND model, an input not a factor (D1)
+    mmproj: Path | None = None        # --mmproj: a THIRD resident artifact, likewise an input
     levels: int = 5             # level count for auto-generated numeric factors
     min_tgs: float = 0.0        # abandon a config generating slower than this
     min_pps: float = 0.0        # ...or prefilling slower than this
@@ -1308,6 +1365,10 @@ def build_factors(cfg: Config):
         factors["spec_n_min_frac"] = ["0.0", "0.5", "1.0"]
         factors["spec_p_min"] = ["0.0", "0.25", "0.5", "0.75", "0.9"]
         factors["spec_p_split"] = ["0.1", "0.3", "0.5"]
+    # Projector placement, present only when there IS a projector — without
+    # --mmproj llama.cpp has nothing to offload and every level is the same run.
+    if cfg.driver == "server" and cfg.mmproj:
+        factors["mmproj_offload"] = ["1", "0"]
     # Draft-model placement (F2 step 2). Present ONLY when a draft model was
     # given: without -md llama.cpp never reads these, so every level would be
     # the same run (D2/DM1). Levels come from the DRAFT model's layer count,
@@ -1656,6 +1717,11 @@ FACTORS = {
     # only inside `if (has_draft)`), so build_factors omits them entirely rather
     # than gating them — an inert column reads as "placement doesn't matter"
     # when the truth is it was never tested (D2/DM1).
+    # Projector placement. Like op_offload, llama.cpp defaults this ON, so the
+    # disabled level has to be spelled rather than omitted (R3).
+    "mmproj_offload": {"bench": None, "server": ("--mmproj-offload",),
+                       "kind": "bool", "off_flag": "--no-mmproj-offload",
+                       "server_only": True},
     "spec_draft_ngl": {"bench": None, "server": ("-ngld",), "kind": "num",
                        "server_only": True},
     "spec_draft_kv":  {"bench": None, "server": ("-ctkd", "-ctvd"), "kind": "cat",
@@ -2811,6 +2877,10 @@ def build_server_args(cfg: Config, f: dict, port: int, n_ctx: int) -> list[str]:
     # way, and only this makes the second route expressible (issue #12).
     if cfg.draft_model:
         args += ["-md", str(cfg.draft_model)]
+    # A multimodal projector is a third resident artifact and the same kind of
+    # input: it occupies VRAM from load, whether or not any image ever arrives.
+    if cfg.mmproj:
+        args += ["--mmproj", str(cfg.mmproj)]
     # --fit is on by default and adjusts unset arguments at load time to make
     # the model fit — silently changing the very configuration being measured,
     # so a row's factors and what actually ran can disagree. Turn it off, but
@@ -5476,6 +5546,8 @@ def selftest() -> bool:
         _hw = {"phys": 8, "logical": 16, "n_layers": 65, "n_ctx_train": 262144,
                "n_experts": 0, "n_nextn": 1, "vram": 24576, "numa_nodes": 1}
         _saved_help = dict(_help_cache)
+        _td_fit = tempfile.TemporaryDirectory()
+        td_fit = _td_fit.name
         try:
             _help_cache[str(_ls)] = _help_cache[str(_fp)] = "-ncmoe N\n"
             _row = {"ngl": "32", "n_depth": "8192", "kv_type": "f16", "nkvo": "1"}
@@ -5515,18 +5587,62 @@ def selftest() -> bool:
             # the thing being measured — so the cheap end must stay reachable.
             assert "q4_0" in _f1["spec_draft_kv"], _f1["spec_draft_kv"]
 
-            # DM3 (revised): llama-fit-params rejects -md outright ("invalid
-            # argument"), so a second resident model cannot be estimated. Blind
-            # beats wrong — pruning turns OFF for these rows rather than
-            # estimating a footprint that ignores an entire model.
-            assert fit_blind_flags(_c1, _row, "server") == ["-md"]
-            assert fit_blind_flags(_c0, _row, "server") == []
+            # DM3: llama-fit-params rejects -md and --mmproj, so it prices the
+            # text model alone. We price the rest ourselves rather than giving
+            # up on pruning — weights on disk are a hard LOWER bound on weights
+            # in VRAM, and a lower bound is the only safe direction: it prunes
+            # FEWER rows, so it can admit a config that will not fit (costing
+            # time) but never delete one that would have (costing information).
+            _tmp = Path(td_fit) / "d.gguf"
+            _tmp.write_bytes(b"x" * (8 * 1024 * 1024))       # 8 MiB drafter
+            _c2 = Config(model=Path("t.gguf"), llama_bench=Path("lb"),
+                         llama_server=_ls, array="L125", ctx_floor=8192,
+                         fit_params=_fp, driver="server",
+                         draft_model=_tmp, hw=dict(_hw))
+            assert resident_extra_mib(_c0, _row) == 0        # nothing extra
+            # not swept => llama.cpp offloads the whole drafter
+            assert resident_extra_mib(_c2, _row) == 8
+            # ...and placement scales it: -ngld 0 leaves it on the CPU
+            assert resident_extra_mib(_c2, {**_row, "spec_draft_ngl": "0"}) == 0
+
+            _proj = Path(td_fit) / "mmproj.gguf"
+            _proj.write_bytes(b"x" * (4 * 1024 * 1024))      # 4 MiB projector
+            _c3 = Config(model=Path("t.gguf"), llama_bench=Path("lb"),
+                         llama_server=_ls, array="L125", ctx_floor=8192,
+                         fit_params=_fp, driver="server",
+                         mmproj=_proj, hw=dict(_hw))
+            assert resident_extra_mib(_c3, _row) == 4        # offloaded default
+            assert resident_extra_mib(_c3, {**_row, "mmproj_offload": "0"}) == 0
+            # both at once, and a missing file prices as 0 rather than raising
+            _c4 = Config(model=Path("t.gguf"), llama_bench=Path("lb"),
+                         llama_server=_ls, array="L125", ctx_floor=8192,
+                         fit_params=_fp, driver="server", draft_model=_tmp,
+                         mmproj=_proj, hw=dict(_hw))
+            assert resident_extra_mib(_c4, _row) == 12
+            assert resident_extra_mib(
+                Config(model=Path("t.gguf"), llama_bench=Path("lb"),
+                       llama_server=_ls, array="L125", ctx_floor=8192,
+                       mmproj=Path("/nonexistent.gguf"), hw=dict(_hw)),
+                _row) == 0
+
+            # the per-row footprint must reach the cache key, or two rows
+            # differing only in placement inherit each other's OOM verdict —
+            # the collision class that has bitten this pruner twice already
+            assert _fit_cache_key(_c3, _row, "server") != \
+                _fit_cache_key(_c3, {**_row, "mmproj_offload": "0"}, "server")
+            assert _fit_cache_key(_c2, _row, "server") != \
+                _fit_cache_key(_c2, {**_row, "spec_draft_ngl": "0"}, "server")
+            # a projector is swept for placement only when one is loaded
+            assert "mmproj_offload" in build_factors(_c3)
+            assert "mmproj_offload" not in build_factors(_c0)
+            assert "--mmproj" in build_server_args(_c3, _row, 8080, 9216)
 
             # draft levels come from the DRAFT's geometry, not the target's
             assert len(_f1["spec_draft_ngl"]) == 5
         finally:
             _help_cache.clear()
             _help_cache.update(_saved_help)
+            _td_fit.cleanup()
         assert draft_layer_count(None) is None
         assert draft_layer_count(Path("/nonexistent-draft.gguf")) is None
 
@@ -7102,6 +7218,13 @@ def main():
                          "without it. Note a model whose MTP head is embedded "
                          "can speculate either way: without -md from its own "
                          "head, with -md from a separate head file")
+    ap.add_argument("--mmproj", type=Path, default=None, metavar="GGUF",
+                    help="multimodal projector (server driver). An INPUT, like "
+                         "--draft-model: it occupies VRAM from load whether or "
+                         "not image traffic arrives, so a sweep that will serve "
+                         "with one must measure with one. Adds --mmproj-offload "
+                         "as a factor. OOM pruning turns OFF for these rows — "
+                         "llama-fit-params cannot be told a projector exists")
     ap.add_argument("--levels", type=int, default=5, metavar="N",
                     help="levels per auto-generated numeric factor (default 5). "
                          "This is the sweep's cost dial: the orthogonal array is "
@@ -7274,6 +7397,7 @@ def main():
         parallel=parallel,
         score=args.score,
         draft_model=args.draft_model,
+        mmproj=args.mmproj,
         levels=max(2, args.levels),
         min_tgs=max(0.0, args.min_tgs),
         min_pps=max(0.0, args.min_pps),
@@ -7336,6 +7460,12 @@ def main():
                      "implies it")
         if not cfg.draft_model.exists():
             ap.error(f"--draft-model not found: {cfg.draft_model}")
+    if cfg.mmproj:
+        if cfg.driver != "server":
+            ap.error("--mmproj needs the server driver (llama-bench has no "
+                     "multimodal path): add --driver server")
+        if not cfg.mmproj.exists():
+            ap.error(f"--mmproj not found: {cfg.mmproj}")
 
     # apply the KV quality floor (quality is essentially only KV-type deep here;
     # MTP is lossless, other knobs don't affect quality)
@@ -7461,6 +7591,9 @@ def main():
         print(f"draft model: {cfg.draft_model.name}"
               + (f"   layers: {d_layers}" if d_layers else "")
               + "  — draft placement swept (-ngld, -ctkd/-ctvd)")
+    if cfg.mmproj:
+        print(f"projector  : {cfg.mmproj.name}  — resident from load; OOM "
+              "pruning off for these rows")
     if n_ctx_train:
         print(f"native ctx : {n_ctx_train}")
     if n_nextn:
