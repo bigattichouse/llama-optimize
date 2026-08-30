@@ -47,6 +47,25 @@ earlier.
   reachable via `--factor ot=...` — `ncffn` varies *how many layers* offload
   while `ot=ffn_up_cpu` varies *which tensor*, so the two are different axes and
   the finer one does not subsume the lighter one.
+- **Setup interview on a bare invocation.** `llama-optimize.py model.gguf` on a
+  terminal now asks four questions — context actually served, slowest useful
+  generation speed, how much of the space to search, repeats — then prints the
+  derived command with its run count and estimate and offers to run it. It stays
+  silent when stdout is redirected (a script blocking on a prompt is a hang) and
+  when any intent-bearing flag is passed, so existing usage is untouched.
+
+  It exists because the cost dials do not compose the way people reasonably
+  assume. `choose_array` sizes on the WIDEST factor, so narrowing one knob
+  changes nothing: `--factor kv_type=q8_0 --factor threads=8` still yields 125
+  runs, and so does `--ctx-size` alone. A user who "limited context sizes" and
+  saw 125 runs anyway would reasonably conclude the flags were ignored.
+- **`--levels N` — the cost dial that actually works.** Narrows every
+  auto-generated factor together, which is the only way the array shrinks:
+  L125/125 runs at the default 5, L27/27 at 3, L16/16 at 2. Explicit `--factor`
+  values are untouched. `five_levels_span` had the count hard-coded, so this
+  also generalised it (and `ngl_levels`, `depth_levels`, `thread_levels`,
+  `cpu_offload_levels`) to take a level count. Previously `n_depth` in
+  particular could only be 5 levels or, via `--ctx-size`, exactly 1.
 - **`--timeout` is a per-config deadline on both drivers.** It used to mean two
   different things. On llama-bench it bounded the whole process, which is what it
   reads like. On the server driver it was handed to each HTTP request, so one

@@ -424,6 +424,40 @@ Four things to read in that output before committing:
 4. **The sample command** — it's the real thing. If it looks wrong for your
    setup, it would have been wrong 125 times.
 
+**Just run it and answer four questions.** On a terminal, a bare invocation now
+interviews you and derives the flags:
+
+```bash
+python3 llama-optimize.py model.gguf
+```
+
+It asks the context you actually serve at, the slowest generation speed worth
+deploying, how much of the space to search, and how many repeats — then prints
+the run count, the time estimate, and the exact command it derived, and offers to
+run it. Nothing is hidden: the command is yours to save, edit or ignore. Pass any
+flag of your own (`--run`, `--factor`, `--levels`, …) and it stays out of the way,
+and it never prompts when stdout is redirected, so scripts are unaffected.
+
+**Why the interview exists rather than just documenting the flags.** The dials
+compose in a way that is easy to get wrong on your own: the orthogonal array is
+sized by the **widest** factor, so narrowing one knob changes nothing. Cutting
+`kv_type` and `threads` to one level each still gives 125 runs; so does
+`--ctx-size` on its own. They only pay off *together*, which is what `--levels`
+does in one move:
+
+```bash
+python3 llama-optimize.py model.gguf --run --levels 3   # 125 runs -> 27
+```
+
+| `--levels` | array | runs |
+|---|---|---|
+| 5 (default) | L125 | 125 |
+| 3 | L27 | 27 |
+| 2 | L16 | 16 |
+
+Fewer levels means a coarser grid, not a wrong answer — 3 levels still show
+curvature, 2 only a direction. Explicit `--factor` values are never touched.
+
 **Cap what you are willing to wait for.** Most of a long sweep is spent on
 configs that were never going to win: at `--n-gen 256`, a config running at
 0.5 t/s takes ~8.5 minutes *per rep*. If you know the slowest result you would

@@ -1046,22 +1046,45 @@ def model_nextn_layers(meta: dict) -> int:
 # ---------------------------------------------------------------------------
 # Factor-level generation
 # ---------------------------------------------------------------------------
-def five_levels_span(lo: int, hi: int) -> list[int]:
-    """Five roughly evenly spaced distinct integer levels in [lo, hi]."""
+def thin_to(values: list, n: int) -> list:
+    """`values` reduced to at most n entries, endpoints kept.
+
+    For level sets that are a fixed list rather than a computed span (ubatch,
+    kv_type): the endpoints are the interesting extremes, so thin the middle."""
+    if len(values) <= n or n < 2:
+        return list(values[:max(1, n)]) if n < 2 else list(values)
+    keep_idx = {round(i * (len(values) - 1) / (n - 1)) for i in range(n)}
+    return [v for i, v in enumerate(values) if i in keep_idx]
+
+
+def n_levels_span(lo: int, hi: int, n: int = 5) -> list[int]:
+    """`n` roughly evenly spaced distinct integer levels in [lo, hi].
+
+    The level COUNT is the sweep's cost dial, which is why this is a parameter
+    rather than the 5 it used to hard-code. `choose_array` sizes on the widest
+    factor, so trimming one knob to three levels buys nothing while another
+    still has five — the array stays L125 either way. Every auto-generated
+    numeric factor has to narrow together or none of them does (--levels)."""
+    n = max(2, int(n))
     if hi <= lo:
         return [lo]
-    raw = [round(lo + (hi - lo) * i / 4) for i in range(5)]
+    raw = [round(lo + (hi - lo) * i / (n - 1)) for i in range(n)]
     out = sorted(set(raw))
     # pad toward hi if collisions removed levels
     i = lo
-    while len(out) < 5 and i <= hi:
+    while len(out) < n and i <= hi:
         if i not in out:
             out.append(i)
         i += 1
-    return sorted(out)[:5]
+    return sorted(out)[:n]
 
 
-def thread_levels(phys: int, logical: int) -> list[int]:
+def five_levels_span(lo: int, hi: int) -> list[int]:
+    """Back-compat alias: the default width."""
+    return n_levels_span(lo, hi, 5)
+
+
+def thread_levels(phys: int, logical: int, levels: int = 5) -> list[int]:
     cand = {
         max(1, phys // 2),
         max(1, phys * 3 // 4),
@@ -1069,27 +1092,32 @@ def thread_levels(phys: int, logical: int) -> list[int]:
         (phys + logical + 1) // 2,
         logical,
     }
-    levels = sorted(c for c in cand if c >= 1)
-    # ensure exactly 5 distinct levels where possible
+    lv = sorted(c for c in cand if c >= 1)
+    # ensure exactly `levels` distinct values where possible
     n = 1
-    while len(levels) < 5 and phys + n <= logical:
-        levels = sorted(set(levels) | {phys + n})
+    while len(lv) < levels and phys + n <= logical:
+        lv = sorted(set(lv) | {phys + n})
         n += 1
-    return levels[:5] if len(levels) >= 5 else levels
+    if len(lv) > levels:                 # thin from the middle, keep endpoints
+        keep = {lv[0], lv[-1]}
+        inner = [x for x in lv if x not in keep]
+        step = max(1, len(inner) // max(1, levels - 2))
+        lv = sorted(keep | set(inner[::step]))[:levels]
+    return lv
 
 
-def ngl_levels(n_layers: int | None) -> list[int]:
+def ngl_levels(n_layers: int | None, levels: int = 5) -> list[int]:
     top = n_layers if n_layers else 99
     # Always include 0 (pure CPU) and the top (all layers). 99 = "all" is safe
     # since llama.cpp clamps to the real layer count.
-    mids = five_levels_span(0, top)
+    mids = n_levels_span(0, top, levels)
     lv = sorted(set([0] + mids + [top]))
-    # trim to 5, keeping endpoints
-    if len(lv) > 5:
+    # trim to `levels`, keeping endpoints
+    if len(lv) > levels:
         keep = {0, top}
         inner = [x for x in lv if x not in keep]
-        step = max(1, len(inner) // 3)
-        lv = sorted(keep | set(inner[::step]))[:5]
+        step = max(1, len(inner) // max(1, levels - 2))
+        lv = sorted(keep | set(inner[::step]))[:levels]
     return lv
 
 
@@ -1116,7 +1144,7 @@ def kv_at_or_above(levels: list, floor: str) -> list:
 
 
 def depth_levels(n_ctx_train: int | None, override_max: int | None = None,
-                 floor: int = 0) -> list[int]:
+                 floor: int = 0, levels: int = 5) -> list[int]:
     """Five n_depth levels spanning floor..min(native ctx, cap). Adaptive so we
     never test beyond the model's native context.  The floor raises the minimum
     depth so the sweep only tests context sizes the user actually needs (--ctx-floor)."""
@@ -1125,12 +1153,12 @@ def depth_levels(n_ctx_train: int | None, override_max: int | None = None,
         top = min(top, override_max)
     if floor >= top:
         return [top]
-    return five_levels_span(floor, top)
+    return n_levels_span(floor, top, levels)
 
 
-def cpu_offload_levels(n_layers: int | None) -> list[int]:
+def cpu_offload_levels(n_layers: int | None, levels: int = 5) -> list[int]:
     """Levels for a first-N-layers-on-CPU knob (-ncmoe, -ncffn): 0..n_layers."""
-    return five_levels_span(0, n_layers if n_layers else 64)
+    return n_levels_span(0, n_layers if n_layers else 64, levels)
 
 
 @dataclass
@@ -1166,6 +1194,7 @@ class Config:
     env_factor_names: set = field(default_factory=set)  # factors that set env vars
     # Throughput floors: a config below them is a real measurement the user has
     # said they do not want, so waiting for it to finish buys nothing (T1).
+    levels: int = 5             # level count for auto-generated numeric factors
     min_tgs: float = 0.0        # abandon a config generating slower than this
     min_pps: float = 0.0        # ...or prefilling slower than this
     slow_grace: int = 60        # never judge a config on less than this many seconds
@@ -1195,13 +1224,18 @@ def build_factors(cfg: Config):
     phys = cfg.hw["phys"]
     logical = cfg.hw["logical"]
     n_layers = cfg.hw.get("n_layers")
-    depths = depth_levels(cfg.hw.get("n_ctx_train"), cfg.max_depth, floor=cfg.ctx_floor)
+    # ONE dial for every auto-generated numeric factor. Narrowing them
+    # individually is a no-op: choose_array sizes on the widest, so an L125
+    # stays an L125 until the last five-level column is gone (--levels).
+    nlv = max(2, int(getattr(cfg, "levels", 5)))
+    depths = depth_levels(cfg.hw.get("n_ctx_train"), cfg.max_depth,
+                          floor=cfg.ctx_floor, levels=nlv)
     factors = {
-        "ngl": [str(x) for x in ngl_levels(n_layers)],
+        "ngl": [str(x) for x in ngl_levels(n_layers, nlv)],
         "n_depth": [str(x) for x in depths],
-        "threads": [str(x) for x in thread_levels(phys, logical)],
-        "kv_type": list(DEFAULT_KV_LEVELS),
-        "ubatch": [str(x) for x in DEFAULT_UBATCH_LEVELS],
+        "threads": [str(x) for x in thread_levels(phys, logical, nlv)],
+        "kv_type": list(DEFAULT_KV_LEVELS)[:nlv],
+        "ubatch": [str(x) for x in thin_to(DEFAULT_UBATCH_LEVELS, nlv)],
         # KV offload (-nkvo) is the VRAM-vs-bandwidth lever: keeping the KV
         # cache in system RAM frees VRAM for layers at a PCIe cost that only a
         # measurement can price on a given box. (fa stays fixed: flash-attn is
@@ -1214,13 +1248,13 @@ def build_factors(cfg: Config):
         # needed and the low-batch regime (which an absolute floor of 2048 used
         # to hide entirely) is reachable again. 1x/4x/16x over ubatch's
         # 128..2048 spans -b 128..32768.
-        "poll": ["0", "50", "100"],
-        "batch_ratio": ["1", "4", "16"],
+        "poll": thin_to(["0", "50", "100"], nlv),
+        "batch_ratio": thin_to(["1", "4", "16"], nlv),
     }
     if cfg.driver == "server":
         # decode threads (-t) and prefill threads (-tb) can want different
         # counts; only llama-server exposes the split
-        factors["threads_batch"] = [str(x) for x in thread_levels(phys, logical)]
+        factors["threads_batch"] = [str(x) for x in thread_levels(phys, logical, nlv)]
     # only sweep NUMA policy on a machine that actually has multiple nodes
     # (on a single node it's an inert column)
     if cfg.hw.get("numa_nodes", 1) > 1:
@@ -1231,15 +1265,15 @@ def build_factors(cfg: Config):
     # beats dropping whole layers (attn_cpu is left out — attention on CPU
     # kills decode; exps_cpu is inert without experts).
     if cfg.hw.get("n_experts", 0) > 0:
-        factors["ncmoe"] = [str(x) for x in cpu_offload_levels(n_layers)]
+        factors["ncmoe"] = [str(x) for x in cpu_offload_levels(n_layers, nlv)]
     else:
         # Dense models: one placement column spanning both mechanisms. -ncffn
         # (llama.cpp b10645) grades how many layers offload; -ot ffn_up_cpu
         # picks a lighter tensor subset across all of them. Neither subsumes
         # the other, and they cannot be two columns — see FFN_PLACE_NONE.
         drv_bin = cfg.llama_bench if cfg.driver == "bench" else cfg.llama_server
-        factors["ffn_place"] = ffn_place_levels(
-            n_layers, supports_flag(drv_bin, "-ncffn"))
+        factors["ffn_place"] = thin_to(
+            ffn_place_levels(n_layers, supports_flag(drv_bin, "-ncffn")), nlv)
     # A model with an MTP/NextN head on the server driver: sweep the whole
     # speculative-decoding surface — on/off, draft lengths, and acceptance
     # thresholds — so the report MEASURES what MTP buys instead of assuming it.
@@ -2474,6 +2508,158 @@ def _left(timeout: int, deadline: float | None) -> int:
 
 def _expired(deadline: float | None) -> bool:
     return deadline is not None and time.time() >= deadline
+
+
+# ---------------------------------------------------------------------------
+# Setup questionnaire (Q1).
+#
+# The cost dials exist (--levels, --ctx-size, --min-tgs, --quick) and are the
+# part nobody finds. Worse, the most natural way to use them does nothing:
+# narrowing one knob leaves the array sized by the widest one, so a user who
+# "limited context sizes" and saw 125 runs anyway reasonably concludes the tool
+# ignores them. Asking a handful of questions and DERIVING the flags is the only
+# interface where the answers compose into a design by construction.
+#
+# Answers -> argv is a pure function so it is testable with no GPU and no
+# terminal; the interactive part only fills the dataclass. The derived command
+# is printed rather than silently applied — the argv IS the record of what ran,
+# and a user has to be able to save, edit and re-run it.
+# ---------------------------------------------------------------------------
+@dataclass
+class Intent:
+    """What the user says about their workload, before it becomes flags."""
+    ctx: int | None = None          # the ONE context they serve at, if fixed
+    levels: int = 5                 # cost dial (see --levels)
+    min_tgs: float = 0.0            # slowest result worth deploying
+    reps: str = "standard"          # quick | standard | full
+
+
+def intent_args(intent: Intent) -> list[str]:
+    """The CLI arguments an Intent implies. Pure — no I/O, no hardware."""
+    args: list[str] = []
+    if intent.ctx:
+        args += ["--ctx-size", str(int(intent.ctx))]
+    if intent.levels != 5:
+        args += ["--levels", str(int(intent.levels))]
+    if intent.min_tgs > 0:
+        args += ["--min-tgs", f"{intent.min_tgs:g}"]
+    if intent.reps == "quick":
+        args.append("--quick")
+    elif intent.reps == "full":
+        args.append("--full")
+    return args
+
+
+def _ask(prompt: str, default: str = "") -> str:
+    """One line of input, or the default. Empty answer keeps the default."""
+    suffix = f" [{default}]" if default else ""
+    try:
+        got = input(f"  {prompt}{suffix}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        raise _Abort() from None
+    return got or default
+
+
+class _Abort(Exception):
+    """User pressed Ctrl-C / Ctrl-D at a prompt."""
+
+
+def _ask_int(prompt: str, default: str = "") -> int | None:
+    while True:
+        got = _ask(prompt, default)
+        if got.lower() in ("", "no", "none", "any", "-"):
+            return None
+        try:
+            return int(got.replace("_", "").replace(",", ""))
+        except ValueError:
+            print("    (a whole number, or blank to skip)")
+
+
+def _ask_float(prompt: str, default: str = "") -> float:
+    while True:
+        got = _ask(prompt, default)
+        if got.lower() in ("", "no", "none", "-"):
+            return 0.0
+        try:
+            return max(0.0, float(got))
+        except ValueError:
+            print("    (a number, or blank to skip)")
+
+
+def ask_intent(n_ctx_train: int | None) -> Intent:
+    """Interview the user. Raises _Abort if they bail out."""
+    it = Intent()
+    print()
+    print("Setup — four questions, then it prints the command it would run.")
+    print("(Enter accepts the default; Ctrl-C to skip and use defaults.)")
+    print()
+    native = f" (this model trains to {n_ctx_train})" if n_ctx_train else ""
+    print(f"1. Context{native}. If you always serve at one size, give it —")
+    print("   pinning context is the single biggest saving, and tuning at a")
+    print("   size you never use is the most common way to waste a sweep.")
+    it.ctx = _ask_int("context you serve at, blank to sweep a range", "")
+    print()
+    print("2. Speed floor. Configs below this are abandoned rather than waited")
+    print("   out — the main reason sweeps take all night.")
+    it.min_tgs = _ask_float("slowest generation t/s worth deploying, blank for none", "")
+    print()
+    print("3. How much of the space to search.")
+    print("   coarse = 3 levels/knob (~27 runs), full = 5 (~125 runs).")
+    coarse = _ask("coarse or full", "coarse").lower().startswith("c")
+    it.levels = 3 if coarse else 5
+    print()
+    print("4. Repeats per config. More reps = less noise, proportionally longer.")
+    it.reps = _ask("quick / standard / full", "standard").lower()
+    if it.reps not in ("quick", "standard", "full"):
+        it.reps = "standard"
+    return it
+
+
+def offer_to_run(argv: list[str]) -> bool:
+    """Print the derived command and ask whether to execute it."""
+    print()
+    print("Derived command:")
+    print()
+    print("  python3 " + " ".join([Path(__file__).name] + argv))
+    print()
+    try:
+        return _ask("run it now? (y/N)", "N").lower().startswith("y")
+    except _Abort:
+        return False
+
+
+# Flags that mean the user already knows what they want. If any appears, the
+# interview would be overriding a decision rather than helping make one.
+_INTENT_FLAGS = ("--run", "--report-only", "--diff", "--selftest", "--factor",
+                 "--levels", "--ctx-size", "-c", "--min-context", "--max-context",
+                 "--ctx-floor", "--max-depth", "--min-tgs", "--min-pps", "--quick",
+                 "--full", "--screen", "--iterate", "--use-case", "--profile",
+                 "--array", "--ctx-scan", "--probe-ctx", "--merge-results")
+
+
+def interview_wanted(args, argv: list[str]) -> "Intent | None":
+    """Run the setup interview and return the Intent, or None to stay as-is.
+
+    Deliberately conservative. A redirected stdout is a script, and a script
+    that blocks on input() is a hang, not a prompt — so the non-TTY path keeps
+    the old plan-only behaviour exactly."""
+    if not args.model or not sys.stdout.isatty():
+        return None
+    if any(a == f or a.startswith(f + "=") for a in argv for f in _INTENT_FLAGS):
+        return None
+    try:
+        return ask_intent(None)
+    except _Abort:
+        print("\n(skipped — using defaults)")
+        return None
+
+
+def apply_intent(ap, args, intent: "Intent | None"):
+    """Re-parse argv with the interview's answers appended, so the derived flags
+    go through the same validation as typed ones — no second code path."""
+    if intent is None:
+        return args
+    return ap.parse_args([str(args.model)] + intent_args(intent))
 
 
 def with_ticker(prefix: str, timeout: int, fn):
@@ -5227,6 +5413,59 @@ def selftest() -> bool:
         assert vram_headroom([]) == (0, 0)
         assert headroom_warning([{"id": "ROCm0", "total_mib": 0,
                                   "free_mib": 0}]) is None
+        # --- setup interview (Q1): answers -> argv is a pure function ---
+        assert intent_args(Intent()) == []            # all defaults: say nothing
+        assert intent_args(Intent(ctx=8192)) == ["--ctx-size", "8192"]
+        assert intent_args(Intent(levels=3)) == ["--levels", "3"]
+        assert intent_args(Intent(min_tgs=10.0)) == ["--min-tgs", "10"]
+        assert intent_args(Intent(reps="quick")) == ["--quick"]
+        assert intent_args(Intent(reps="full")) == ["--full"]
+        assert intent_args(Intent(reps="standard")) == []     # the default
+        assert intent_args(Intent(ctx=4096, levels=3, min_tgs=2.5,
+                                  reps="quick")) == \
+            ["--ctx-size", "4096", "--levels", "3", "--min-tgs", "2.5", "--quick"]
+
+        # The interview must never fire where a prompt would hang something.
+        _a = SimpleNamespace(model=Path("m.gguf"))
+        _tty, sys.stdout.isatty = sys.stdout.isatty, lambda: False
+        try:
+            assert interview_wanted(_a, []) is None       # piped/redirected
+        finally:
+            sys.stdout.isatty = _tty
+        assert interview_wanted(SimpleNamespace(model=None), []) is None
+        # ...nor where the user has already said what they want. Asserted over
+        # the whole list rather than a sample, so a flag added to _INTENT_FLAGS
+        # without a matching guard cannot pass silently.
+        _tty, sys.stdout.isatty = sys.stdout.isatty, lambda: True
+        try:
+            for flag in _INTENT_FLAGS:
+                assert interview_wanted(_a, [flag]) is None, flag
+                assert interview_wanted(_a, [flag + "=x"]) is None, flag
+            # a bare model path on a TTY is the one case that DOES ask, so it
+            # must not be reachable here without stubbing the prompts
+            assert "--run" in _INTENT_FLAGS and "--factor" in _INTENT_FLAGS
+        finally:
+            sys.stdout.isatty = _tty
+
+        # thin_to keeps the extremes: they are the interesting ends of a sweep
+        assert thin_to([128, 256, 512, 1024, 2048], 3) == [128, 512, 2048]
+        assert thin_to([128, 256, 512, 1024, 2048], 5) == \
+            [128, 256, 512, 1024, 2048]
+        assert thin_to(["0", "50", "100"], 2) == ["0", "100"]
+        assert thin_to([1, 2], 5) == [1, 2]            # never invents levels
+
+        # the cost dial: narrowing must reach a SMALLER array, which is the
+        # whole point — trimming one factor at a time never did (choose_array
+        # sizes on the widest, so an L125 stays an L125)
+        assert n_levels_span(0, 64, 3) == [0, 32, 64]
+        assert n_levels_span(0, 64, 5) == [0, 16, 32, 48, 64]
+        assert len(ngl_levels(64, 3)) == 3 and len(ngl_levels(64, 5)) == 5
+        assert len(depth_levels(32768, levels=3)) == 3
+        assert len(cpu_offload_levels(64, 3)) == 3
+        _five = {f"f{i}": ["a", "b", "c", "d", "e"] for i in range(7)}
+        _three = {f"f{i}": ["a", "b", "c"] for i in range(7)}
+        assert choose_array(_five) == "L125" and choose_array(_three) == "L27"
+
         # --- time budget for one config (T1) ---
         _c = SimpleNamespace(min_tgs=0.0, min_pps=0.0, slow_grace=60,
                              reps=3, n_gen=256)
@@ -6738,6 +6977,13 @@ def main():
                          "the server driver applied this per HTTP REQUEST, so a "
                          "config could take (1+reps)x this; it is now a deadline "
                          "on both drivers")
+    ap.add_argument("--levels", type=int, default=5, metavar="N",
+                    help="levels per auto-generated numeric factor (default 5). "
+                         "This is the sweep's cost dial: the orthogonal array is "
+                         "sized by the WIDEST factor, so narrowing one knob "
+                         "changes nothing while another still has 5. --levels 3 "
+                         "narrows them together and drops L125 to L27 — 125 runs "
+                         "to 27. Explicit --factor values are untouched")
     ap.add_argument("--min-tgs", type=float, default=0.0, metavar="TPS",
                     help="abandon a config generating slower than TPS. A config "
                          "that would MEET the floor finishes within "
@@ -6783,6 +7029,11 @@ def main():
                          "configs using more than (vram - headroom) are skipped "
                          "(default: 512)")
     args = ap.parse_args()
+    # Q1: a bare invocation on a terminal is someone finding out what this does.
+    # Anything more specific than that — a flag they chose, a non-sweep action,
+    # or a redirected stdout (a script) — is left exactly as it was.
+    asked = interview_wanted(args, sys.argv[1:])
+    args = apply_intent(ap, args, asked)
 
     if args.selftest:
         sys.exit(0 if selftest() else 1)
@@ -6897,6 +7148,7 @@ def main():
         driver=driver,
         parallel=parallel,
         score=args.score,
+        levels=max(2, args.levels),
         min_tgs=max(0.0, args.min_tgs),
         min_pps=max(0.0, args.min_pps),
         slow_grace=max(1, args.tgs_timeout),
@@ -7134,6 +7386,14 @@ def main():
               f"(~{fmt_dur(len(runs) * per)} at a rough {per:.0f}s/run, "
               f"scaled from model size, reps and n_gen — a guess, not a "
               f"measurement).")
+        if asked is not None:
+            # The estimate above is the "then show the cost" half of the
+            # interview: the numbers are on screen before anything is spent.
+            derived = [str(args.model)] + intent_args(asked) + ["--run"]
+            if offer_to_run(derived):
+                sys.exit(subprocess.call([sys.executable, str(Path(__file__))]
+                                         + derived))
+            print("Not run. Copy the command above when you are ready.")
         return
 
     needed = cfg.llama_server if cfg.driver == "server" else cfg.llama_bench
