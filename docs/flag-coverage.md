@@ -177,14 +177,30 @@ about is how inert columns get created.
       `-ctxcp`/`-cms` — all registered and reachable via `--factor`, none
       auto-swept ([`remaining-factors-design.md`](remaining-factors-design.md), R1)
 - [x] `--load-mode` as a factor, with the fixed-emission interlock
-- [x] `-ncffn` (dense FFN offload, llama.cpp tag b10645) registered and
-      auto-swept for dense models on builds with the flag — replaces `-ot` in
-      the *default design*; builds pre b10645 keep `-ot`. Not a superset:
-      `-ncffn N` offloads gate/up/down for the first N layers, while
-      `ot=ffn_up_cpu` offloads the up-projection only, across all layers —
-      *how many layers* versus *which tensor*. Dropping `ffn_up_cpu` from the
-      default is a deliberate trade (5 graded levels beat 3 coarse ones), and
-      it stays reachable via `--factor ot=none,ffn_up_cpu,ffn_cpu`
+- [x] `-ncffn` (dense FFN offload, llama.cpp tag b10645) registered, and the
+      dense placement surface unified into one `ffn_place` factor. `-ncffn` is
+      not a superset of `-ot`: `-ncffn N` offloads gate/up/down for the first N
+      layers, `ot=ffn_up_cpu` offloads the up-projection only across all of
+      them — *how many layers* versus *which tensor*, and at equal VRAM freed
+      they shape PCIe traffic differently. Both belong in the default design.
+
+      They cannot be two OA columns. `-ncffn` appends per-layer overrides to
+      the same `params.tensor_buft_overrides` vector `-ot` writes to
+      (`common/arg.cpp:2787-2798`), so they compose and `ot=ffn_cpu` swallows
+      every `-ncffn` level — rows that record a level which changed nothing,
+      the inert-column failure [`CONSTRAINED-FACTORS.md`](CONSTRAINED-FACTORS.md)
+      exists to prevent. So: one categorical whose levels are mutually
+      exclusive by construction (the `concurrency` shape), pre-rendered from the
+      layer count (the `ts_levels` pattern from
+      [`multi-gpu-design.md`](multi-gpu-design.md)) so a level is
+      self-describing in the CSV. The factor NAME does not vary with build
+      capability — only the level count — so results stay comparable across a
+      llama.cpp upgrade. Raw `ot`/`ncffn` remain reachable via `--factor`
+- [x] Level sets for `emit` factors are checked for DISTINCTNESS at build time:
+      two levels emitting the same arguments are two names for one run, and the
+      array would balance a column that measures nothing. Caught during this
+      work — a level spelled `up_cpu` missed the `OT_PATTERNS` key
+      `ffn_up_cpu`, emitted nothing, and silently duplicated `none`
 - [x] Placement flags the *estimator* may predate are gated as a set
       (`FIT_GATED_FLAGS`). A footprint flag `llama-fit-params` cannot parse is
       never silently dropped from the estimate — it disables pruning for the

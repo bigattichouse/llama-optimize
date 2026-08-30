@@ -458,7 +458,7 @@ def vram_used_mib() -> int | None:
 # ---------------------------------------------------------------------------
 # Factors that can only do something when llama.cpp can see a GPU. On a CPU-only
 # build every level of these is the same run.
-GPU_ONLY_FACTORS = ("ngl", "ncmoe", "ncffn", "nkvo", "ot")
+GPU_ONLY_FACTORS = ("ngl", "ncmoe", "ncffn", "nkvo", "ot", "ffn_place")
 
 
 def gpu_visibility(vram, vram_src: str, can_ask: bool) -> str:
@@ -644,19 +644,22 @@ def gpu_temp_c() -> float | None:
 # before running a config — skip configs that can't fit, saving a model load
 # + timeout per doomed row (ROADMAP item 2).
 # ---------------------------------------------------------------------------
-# Footprint factors whose llama-fit-params flag is recent enough that a build
-# in the wild may predate it. Gating lives here rather than at each emission
-# site so the next new placement flag is one dict entry, not another branch.
+# Footprint flags recent enough that a llama-fit-params build in the wild may
+# predate them. Keyed on the FLAG rather than the factor, because a factor's
+# level can pick its own flag (`ffn_place` emits -ot for some levels and -ncffn
+# for others), so only the emitted flags say what the estimator is really being
+# asked for. Adding a placement flag is one entry here and nothing else.
 #
 # The estimator and the driver are separate binaries and are gated separately,
 # so the mismatch is reachable in practice: --llama-cpp can point at a fresh
 # build while an older llama-fit-params is found on $PATH or left from a
-# previous checkout.
-FIT_GATED_FLAGS = {"ncmoe": "-ncmoe", "ncffn": "-ncffn"}
+# previous checkout. Observed in the other direction too, inside one build tree
+# — llama-fit-params carrying -ncffn while llama-bench did not.
+FIT_RECENT_FLAGS = {"-ncmoe", "-ncffn"}
 
 
-def fit_blind_factors(cfg: "Config", f: dict) -> list[str]:
-    """Footprint-relevant factors in this row that llama-fit-params cannot see.
+def fit_blind_flags(cfg: "Config", f: dict, driver: str) -> list[str]:
+    """Flags this row's estimate needs that llama-fit-params cannot parse.
 
     Dropping such a flag and estimating anyway is the tempting move and the
     wrong one. These flags all exist to MOVE WEIGHTS OFF THE GPU, so an
@@ -665,8 +668,8 @@ def fit_blind_factors(cfg: "Config", f: dict) -> list[str]:
     first place that overshoots VRAM, every level of the factor is predicted
     OOM, and the whole factor is silently pruned out of the sweep. A wrong
     estimate deletes rows; a missing estimate merely runs them (P3)."""
-    return sorted(n for n, flag in FIT_GATED_FLAGS.items()
-                  if n in f and not supports_flag(cfg.fit_params, flag))
+    emitted = set(_fit_params_flags(cfg, f, driver)) & FIT_RECENT_FLAGS
+    return sorted(fl for fl in emitted if not supports_flag(cfg.fit_params, fl))
 
 
 def _fit_params_flags(cfg: "Config", f: dict, driver: str) -> list[str]:
@@ -676,7 +679,7 @@ def _fit_params_flags(cfg: "Config", f: dict, driver: str) -> list[str]:
 
     Every footprint factor present is emitted unconditionally, including ones
     the estimator may be too old to accept. Whether the binary can be asked at
-    all is `fit_blind_factors`' business, decided once in `predict_fits`;
+    all is `fit_blind_flags`' business, decided once in `predict_fits`;
     keeping it out of here leaves this a pure "what would we pass" function, so
     the cache key it feeds still separates rows that differ only in a gated
     factor."""
@@ -704,6 +707,11 @@ def _fit_params_flags(cfg: "Config", f: dict, driver: str) -> list[str]:
     # Dense FFN offload (llama.cpp #26622, tag b10645)
     if "ncffn" in f:
         flags += ["-ncffn", f["ncffn"]]
+    # Dense FFN placement: the level carries its own flag (-ot or -ncffn), and
+    # both spellings are ones fit-params accepts, so this needs no special case
+    # beyond asking the level what it emits.
+    if "ffn_place" in f:
+        flags += ffn_place_args(f["ffn_place"])
     return flags
 
 
@@ -770,15 +778,14 @@ def predict_fits(cfg: "Config", f: dict, driver: str) -> bool | None:
     # The estimator cannot see one of this row's placement factors, so it cannot
     # answer the question being asked. Say so and run the row (P3) rather than
     # act on a footprint that ignores the offload the row is about.
-    blind = fit_blind_factors(cfg, f)
+    blind = fit_blind_flags(cfg, f, driver)
     if blind:
         names = ", ".join(blind)
         if names not in _fit_blind_warned:
             _fit_blind_warned.add(names)
             print(f"OOM prune: llama-fit-params ({cfg.fit_params.name}) predates "
-                  f"{', '.join(FIT_GATED_FLAGS[n] for n in blind)} — pruning is "
-                  f"OFF for rows that set {names}; they will all run. Update "
-                  "llama.cpp to restore it.", file=sys.stderr)
+                  f"{names} — pruning is OFF for rows needing it; they will all "
+                  "run. Update llama.cpp to restore it.", file=sys.stderr)
         return None
     key = _fit_cache_key(cfg, f, driver)
     if key in _fit_cache:
@@ -1157,15 +1164,13 @@ def build_factors(cfg: Config):
     if cfg.hw.get("n_experts", 0) > 0:
         factors["ncmoe"] = [str(x) for x in cpu_offload_levels(n_layers)]
     else:
-        # Dense models: -ncffn (first N layers' FFN on CPU, llama.cpp b10645)
-        # is the convenient finer-grained form of the -ot lever and replaces it
-        # where the build has it — per-layer instead of all-or-nothing.
-        # Previous builds keep -ot.
+        # Dense models: one placement column spanning both mechanisms. -ncffn
+        # (llama.cpp b10645) grades how many layers offload; -ot ffn_up_cpu
+        # picks a lighter tensor subset across all of them. Neither subsumes
+        # the other, and they cannot be two columns — see FFN_PLACE_NONE.
         drv_bin = cfg.llama_bench if cfg.driver == "bench" else cfg.llama_server
-        if supports_flag(drv_bin, "-ncffn"):
-            factors["ncffn"] = [str(x) for x in cpu_offload_levels(n_layers)]
-        else:
-            factors["ot"] = ["none", "ffn_up_cpu", "ffn_cpu"]
+        factors["ffn_place"] = ffn_place_levels(
+            n_layers, supports_flag(drv_bin, "-ncffn"))
     # A model with an MTP/NextN head on the server driver: sweep the whole
     # speculative-decoding surface — on/off, draft lengths, and acceptance
     # thresholds — so the report MEASURES what MTP buys instead of assuming it.
@@ -1345,6 +1350,65 @@ OT_PATTERNS = {
     "attn_cpu": r"\.attn_.*=CPU",
 }
 
+# ---------------------------------------------------------------------------
+# Dense FFN placement (`ffn_place`) — one categorical over two mechanisms.
+#
+# -ot and -ncffn are not rival spellings of one knob, they are different axes:
+# -ot ffn_up_cpu moves the up-projection ONLY, across EVERY layer; -ncffn N
+# moves the whole FFN (gate/up/down) for the FIRST N layers. Which tensor
+# versus how many layers. At equal VRAM freed they shape PCIe traffic
+# differently — a thin slice touched in every layer against a contiguous block
+# — so which wins is a measurement, not a deduction, and both belong in the
+# default design.
+#
+# They cannot be two orthogonal-array columns. Verified in llama.cpp (6c84c7d5d,
+# common/arg.cpp:2787-2798): -ncffn appends per-layer overrides to the same
+# params.tensor_buft_overrides vector -ot writes to, so they COMPOSE — and
+# ot=ffn_cpu covers all layers, swallowing every -ncffn level. Those rows would
+# record an ncffn level that changed nothing, which is the inert-column failure
+# CONSTRAINED-FACTORS.md exists to prevent. Clamping at emission is not the fix
+# either: it desyncs the recorded level from the config that actually ran.
+#
+# So: one column whose levels are mutually exclusive by construction, the shape
+# the `concurrency` factor already uses for the same reason. Levels are
+# PRE-RENDERED from the layer count (the pattern multi-gpu-design.md plans for
+# `ts_levels`), so a level is self-describing in the CSV: `first_16` says what
+# ran without a lookup.
+FFN_PLACE_NONE = "none"
+
+
+def ffn_place_levels(n_layers: int | None, has_ncffn: bool) -> list[str]:
+    """Levels for the dense FFN placement factor, widest span the build allows.
+
+    Always: none / ffn_up_cpu / ffn_cpu — the three -ot regimes, which every build
+    can express. With -ncffn (llama.cpp b10645+) two graded levels are inserted
+    between "nothing" and "all of it", giving five. The factor NAME does not
+    change with build capability, only the level count, so the CSV column means
+    the same thing everywhere and results stay comparable across upgrades."""
+    levels = [FFN_PLACE_NONE, "ffn_up_cpu"]
+    if has_ncffn:
+        top = n_layers or 64
+        # quarter/half of the layers: the graded middle -ot cannot reach. Guard
+        # against collisions on tiny models, where n//4 and n//2 can coincide.
+        for frac in (4, 2):
+            n = max(1, top // frac)
+            lvl = f"first_{n}"
+            if lvl not in levels:
+                levels.append(lvl)
+    levels.append("ffn_cpu")            # all layers, all three FFN tensors
+    return levels
+
+
+def ffn_place_args(level: str) -> list[str]:
+    """One level of `ffn_place` → the argument group it emits ([] for none).
+
+    Both drivers take the same spelling, so this is driver-independent."""
+    lvl = str(level)
+    if lvl.startswith("first_"):
+        return ["-ncffn", lvl.split("_", 1)[1]]
+    pat = OT_PATTERNS.get(lvl, "")
+    return ["-ot", pat] if pat else []
+
 # ngram --spec-type variants that share one {size-n, size-m, min-hits} knob
 # structure (differing only in the flag's variant token). ngram-mod has its own
 # {n-match, n-min, n-max}. See docs/ngram-design.md.
@@ -1407,6 +1471,12 @@ FACTORS = {
     "ncffn":        {"bench": ("-ncffn",), "server": ("-ncffn",), "kind": "num"},
     "ot":           {"bench": ("-ot",), "server": ("-ot",), "kind": "cat",
                      "translate": OT_PATTERNS},
+    # Dense FFN placement: one categorical spanning -ot and -ncffn, whose level
+    # carries its own flag (see ffn_place_args). `emit` exists because neither
+    # `translate` (one flag, many values) nor `flag_for` (server-only, keyed on
+    # ANOTHER factor's gate) can express "this level picks the flag".
+    "ffn_place":    {"bench": ("-ot",), "server": ("-ot",), "kind": "cat",
+                     "emit": ffn_place_args},
     "nkvo":         {"bench": ("-nkvo",), "server": ("-nkvo",), "kind": "bool"},
     # --- batching ---
     # -b is DERIVED from -ub (docs/CONSTRAINED-FACTORS.md): a batch below the
@@ -1856,10 +1926,32 @@ def validate_factor_levels(factors: dict) -> list:
     declared relation: `at_most` needs scale levels <= 1 / offsets <= 0,
     `at_least` needs scale levels >= 1 / offsets >= 0. Checked at build/argparse
     time so `--factor spec_n_min_frac=2.0` fails before the sweep starts, not
-    silently as an inverted row (C1)."""
+    silently as an inverted row (C1).
+
+    For `emit` factors the levels ARE the flags, so two levels that emit the
+    same arguments are two names for one run: the array balances a column whose
+    levels are not distinct, and the main effect reads as "placement doesn't
+    matter" when the truth is that it was never varied. Caught here rather than
+    in a test because the failure is silent at every later stage — a level
+    whose spelling does not match its pattern table emits nothing at all and
+    collides with `none`."""
     errors: list[str] = []
     for name, levels in factors.items():
         spec = FACTORS.get(name, {})
+        if spec.get("emit") is not None:
+            seen: dict[tuple, str] = {}
+            for lvl in levels:
+                try:
+                    key = tuple(spec["emit"](lvl))
+                except Exception as e:                          # noqa: BLE001
+                    errors.append(f"{name}: emit({lvl!r}) raised {e!r}")
+                    continue
+                if key in seen:
+                    errors.append(
+                        f"{name}: levels {seen[key]!r} and {lvl!r} both emit "
+                        f"{list(key)!r} — an orthogonal-array column whose "
+                        f"levels are not distinct measures nothing")
+                seen[key] = lvl
         dfrom = spec.get("derived_from")
         if dfrom is None:
             continue
@@ -1897,6 +1989,16 @@ def factor_flags(cfg: Config, f: dict, driver: str) -> list[list[str]]:
         if spec is None or name in cfg.env_factor_names or spec.get("request"):
             continue
         if not is_active(name, f):                 # conditional factor inactive here
+            continue
+        if spec.get("emit") is not None:
+            # The LEVEL picks the flag, not just the value. Emitted only where
+            # the driver has some mapping at all, so a driver that cannot
+            # express the factor still skips it.
+            if spec.get(driver) is None:
+                continue
+            group = spec["emit"](val)
+            if group:
+                groups.append(list(group))
             continue
         if spec.get("flag_for") is not None:       # variant-dependent flag spelling
             if driver != "server":                 # flag_for factors are server-only
@@ -4483,9 +4585,9 @@ def selftest() -> bool:
         finally:
             _help_cache.clear()
             _help_cache.update(_saved_help)
-        # default factor set: nkvo/poll/batch always; ncffn (or ot on older
-        # builds) for dense / ncmoe for MoE; threads_batch + the MTP surface
-        # only on the server driver; numa only on a multi-node box
+        # default factor set: nkvo/poll/batch always; ffn_place for dense /
+        # ncmoe for MoE; threads_batch + the MTP surface only on the server
+        # driver; numa only on a multi-node box
         _saved_help = dict(_help_cache)
         try:
             _help_cache[str(cfg_m.llama_server)] = "-m, --model FNAME\n"   # older build
@@ -4494,20 +4596,41 @@ def selftest() -> bool:
                                          "mtp", "spec_n_max", "spec_n_min_frac",
                                          "spec_p_min", "spec_p_split"))
             assert "batch" not in fs and "spec_n_min" not in fs   # renamed, now derived
-            assert "ot" in fs and "ncmoe" not in fs            # dense, older build
+            assert "ncmoe" not in fs                           # dense
             assert "numa" not in fs                            # single NUMA node
+            # Pre-b10645: the -ot regimes only. The factor NAME is the same as
+            # on a new build — capability changes the level count, not the
+            # column, so a CSV stays comparable across a llama.cpp upgrade.
+            assert fs["ffn_place"] == ["none", "ffn_up_cpu", "ffn_cpu"], fs["ffn_place"]
         finally:
             _help_cache.clear()
             _help_cache.update(_saved_help)
-        # -ncffn (dense FFN offload, llama.cpp b10645) replaces -ot where the
-        # build advertises it; the flag rides both drivers
+        # With -ncffn (llama.cpp b10645) two GRADED levels appear between "none"
+        # and "all of it" — the middle -ot cannot express. up_cpu survives: it
+        # is a different axis (which tensor, not how many layers), so -ncffn
+        # does not subsume it.
         _saved_help = dict(_help_cache)
         try:
             _help_cache[str(cfg_m.llama_server)] = ("-ncffn, --n-cpu-ffn N  "
                                                     "keep dense FFN on CPU\n")
             fs2 = build_factors(cfg_m)
-            assert "ncffn" in fs2 and "ot" not in fs2, fs2
-            assert factor_flags(cfg_m, {"ncffn": "16"}, "server") == [["-ncffn", "16"]]
+            assert fs2["ffn_place"] == ["none", "ffn_up_cpu", "first_8",
+                                        "first_16", "ffn_cpu"], fs2["ffn_place"]
+            assert "ot" not in fs2 and "ncffn" not in fs2, fs2   # one column, not three
+            # the level picks the flag: -ncffn for graded, -ot for the rest
+            assert factor_flags(cfg_m, {"ffn_place": "first_16"}, "server") == \
+                [["-ncffn", "16"]]
+            assert factor_flags(cfg_m, {"ffn_place": "ffn_up_cpu"}, "bench") == \
+                [["-ot", OT_PATTERNS["ffn_up_cpu"]]]
+            assert factor_flags(cfg_m, {"ffn_place": "none"}, "server") == []
+            # every level must emit something DIFFERENT, or the column is
+            # balanced over levels that are the same run. The real bug this
+            # caught: a level spelled 'up_cpu' misses the OT_PATTERNS key
+            # 'ffn_up_cpu', emits nothing, and silently duplicates 'none'.
+            assert validate_factor_levels({"ffn_place": fs2["ffn_place"]}) == []
+            dupes = validate_factor_levels(
+                {"ffn_place": ["none", "up_cpu", "ffn_cpu"]})
+            assert dupes and "both emit" in dupes[0], dupes
         finally:
             _help_cache.clear()
             _help_cache.update(_saved_help)
@@ -5436,7 +5559,7 @@ def selftest() -> bool:
         assert "-ncmoe" in s4 and "16" in s4
 
         # ncffn: emitted unconditionally, like every other footprint factor.
-        # Whether the estimator can be ASKED is fit_blind_factors' job — keeping
+        # Whether the estimator can be ASKED is fit_blind_flags' job — keeping
         # the gate out of the flag builder is what lets the cache key below
         # separate rows that differ only in a gated factor.
         f5 = {"ngl": "32", "n_depth": "8192", "ncffn": "16"}
@@ -5453,16 +5576,16 @@ def selftest() -> bool:
             # a fit-params that advertises both flags is blind to neither
             _help_cache[str(_FC.fit_params)] = ("-ncmoe, --n-cpu-moe N\n"
                                                 "-ncffn, --n-cpu-ffn N\n")
-            assert fit_blind_factors(_FC, f5) == []
-            assert fit_blind_factors(_FC, {"ncmoe": "8", "ncffn": "16"}) == []
+            assert fit_blind_flags(_FC, f5, "bench") == []
+            assert fit_blind_flags(_FC, {"ncmoe": "8", "ncffn": "16"}, "bench") == []
             # an older one sees neither, and reports exactly what it is missing
             _help_cache[str(_FC.fit_params)] = "-m, --model FNAME\n"
-            assert fit_blind_factors(_FC, f5) == ["ncffn"]
-            assert fit_blind_factors(_FC, {"ncmoe": "8", "ncffn": "16"}) == \
-                ["ncffn", "ncmoe"]
+            assert fit_blind_flags(_FC, f5, "bench") == ["-ncffn"]
+            assert fit_blind_flags(_FC, {"ncmoe": "8", "ncffn": "16"}, "bench") == \
+                ["-ncffn", "-ncmoe"]
             # a row that sets neither is estimable on any build — the gate must
             # not disable pruning for the whole sweep just because it exists
-            assert fit_blind_factors(_FC, {"ngl": "32", "n_depth": "8192"}) == []
+            assert fit_blind_flags(_FC, {"ngl": "32", "n_depth": "8192"}, "bench") == []
             # ...and a blind row yields None (run it), never a bool. A wrong
             # False here is the silent-prune bug: -ncffn moves weights OFF the
             # GPU, so an estimator that cannot see it reports the un-offloaded
@@ -5477,7 +5600,7 @@ def selftest() -> bool:
                                 array="L25", ctx_floor=8192,
                                 fit_params=_real, hw={"vram": 8192})
             assert _blind_cfg.fit_params.exists()   # else the assert is vacuous
-            assert fit_blind_factors(_blind_cfg, f5) == ["ncffn"]
+            assert fit_blind_flags(_blind_cfg, f5, "bench") == ["-ncffn"]
             _saved_blind = set(_fit_blind_warned)
             _fit_blind_warned.clear()
             _err = io.StringIO()
@@ -5496,7 +5619,7 @@ def selftest() -> bool:
             # the same row on a build that HAS the flag is estimable again:
             # the gate opens rather than disabling pruning permanently
             _help_cache[str(_real)] = "-ncmoe, --n-cpu-moe N\n-ncffn, --n-cpu-ffn N\n"
-            assert fit_blind_factors(_blind_cfg, f5) == []
+            assert fit_blind_flags(_blind_cfg, f5, "bench") == []
         finally:
             _help_cache.clear()
             _help_cache.update(_saved_help)

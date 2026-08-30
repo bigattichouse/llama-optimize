@@ -148,9 +148,8 @@ Swept by default (auto-scaled to your hardware and model):
 | KV offload    | `-nkvo`          | `0, 1`                                 | KV cache in VRAM vs system RAM — the VRAM-vs-PCIe lever |
 | CPU polling   | `--poll`         | `0, 50, 100`                           | busy-wait level for CPU-side work |
 | Logical batch | `-b`             | `1x, 4x, 16x` the `-ub` of the same row | prompt chunking (swept as a *multiple* of `-ub`, so `b≥ub` holds by construction — see [constrained factors](docs/CONSTRAINED-FACTORS.md)) |
-| Tensor placement | `-ot`         | `none, ffn_up_cpu, ffn_cpu`            | **dense models**: FFN tensors on CPU at full `-ngl` often beats dropping whole layers |
 | MoE expert offload | `-ncmoe`   | `0 .. n_layers` (5 levels)             | **MoE models** (replaces `-ot`): how many layers keep experts on CPU |
-| Dense FFN offload | `-ncffn`     | `0 .. n_layers` (5 levels)             | **dense models** on builds with the flag (replaces `-ot` in the default design): how many of the first layers keep their dense FFN weights on CPU |
+| Dense FFN placement | `-ot` / `-ncffn` | `none, ffn_up_cpu, first_N, first_M, ffn_cpu` | **dense models**: where the FFN weights live. One column over two mechanisms — `ffn_up_cpu` moves the up-projection across *all* layers, `first_N` moves the whole FFN for the first N (needs `-ncffn`, llama.cpp b10645+; older builds get the three `-ot` levels) |
 | NUMA policy   | `--numa`         | `distribute, isolate`                  | **multi-NUMA-node boxes only** (inert on one node) |
 | Prefill threads | `-tb`          | same levels as `-t`                    | **server driver**: decode vs prefill thread split |
 | ngram variant  | `--spec-type <variant>` | `none, ng-simple, ng-mod, ng-map-k, ng-map-k4v` | **server driver, --ngram**: which pattern-matching variant — *screened* first (see [ngram staging](#ngram-staged-search)) |
@@ -640,7 +639,8 @@ registry in `llama-optimize.py`.
 | `kv_type` | `-ctk -ctv` | both | cat | swept | KV cache precision (buys context) |
 | `ubatch` | `-ub` | both | num | swept | physical micro-batch |
 | `ncmoe` | `-ncmoe` | both | num | swept¹ | MoE expert layers kept on CPU |
-| `ncffn` | `-ncffn` | both | num | swept¹ | dense FFN layers kept on CPU |
+| `ncffn` | `-ncffn` | both | num | opt-in | dense FFN layers kept on CPU (raw knob; `ffn_place` is what the default design sweeps) |
+| `ffn_place` | `-ot` / `-ncffn` | both | cat | swept¹ | dense FFN placement — the level picks the flag |
 | `batch_ratio` | `-b` | both | num | swept | logical batch, as a **multiple of `ubatch`** (`-b` = `batch_ratio × ubatch`)⁵ |
 | `nkvo` | `-nkvo` | both | bool | swept | keep KV in RAM vs VRAM |
 | `poll` | `--poll` | both | num | swept | CPU polling level |
@@ -665,12 +665,15 @@ registry in `llama-optimize.py`.
 | `spec_p_split` | `--spec-draft-p-split` | server | float | swept³ | MTP split probability |
 | `rope_scaling` | `--rope-scaling` | server | cat | opt-in | RoPE scaling: none/linear/yarn |
 | `yarn_factor` | `--yarn-ext-factor` | server | float | opt-in | YaRN extrapolation (context **beyond** native) |
-¹ `ncmoe` swept for MoE models; `ncffn` for dense ones on builds with the flag
-(`ot` on pre b10645 builds) — the same placement lever, per architecture.
-`ncffn` replaces `ot` in the *default* design only: it grades *how many layers*
-offload, while `ot=ffn_up_cpu` picks *which tensor* (up-projection alone, all
-layers). To sweep that lighter regime, ask for it: `--factor
-ot=none,ffn_up_cpu,ffn_cpu`.  ² fixed on unless swept (precondition for KV-quant; pair with
+¹ `ncmoe` swept for MoE models, `ffn_place` for dense ones — the same placement
+lever, per architecture. `ffn_place` is a single column spanning both dense
+mechanisms, because they are different axes rather than rival spellings:
+`ffn_up_cpu` varies *which tensor* (up-projection alone, every layer) and
+`first_N` varies *how many layers* (whole FFN, first N). They cannot be two
+columns — `-ncffn` appends to the same override list `-ot` writes to, so
+`ffn_cpu` would swallow every `first_N` level and those rows would measure
+nothing. Levels are rendered from the layer count, and a build without
+`-ncffn` simply gets the three `-ot` levels under the same factor name.  ² fixed on unless swept (precondition for KV-quant; pair with
 `--min-kv f16`).  ³ swept when the model ships an MTP/NextN head — such models also
 auto-switch to the server driver so the effect is measured (`--no-mtp` disables).
 ⁴ with `--ngram` (server driver auto-switches), the *variant* is screened first;

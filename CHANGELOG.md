@@ -47,6 +47,35 @@ earlier.
   reachable via `--factor ot=...` — `ncffn` varies *how many layers* offload
   while `ot=ffn_up_cpu` varies *which tensor*, so the two are different axes and
   the finer one does not subsume the lighter one.
+- **`ffn_place` — one dense FFN placement factor spanning `-ot` and `-ncffn`.**
+  The two are different axes, not rival spellings: `ot=ffn_up_cpu` moves the
+  up-projection across *every* layer, `-ncffn N` moves the whole FFN for the
+  *first N*. At equal VRAM freed they shape PCIe traffic differently — a thin
+  slice touched in every layer against a contiguous block — so which wins is a
+  measurement, and both belong in the default design.
+
+  They cannot ride as two orthogonal-array columns. `-ncffn` appends per-layer
+  overrides to the same `params.tensor_buft_overrides` vector `-ot` writes to
+  (llama.cpp `common/arg.cpp:2787-2798`), so they compose and `ot=ffn_cpu`
+  swallows every `-ncffn` level — rows recording a level that changed nothing.
+  So it is one categorical whose levels are mutually exclusive by construction,
+  the same shape the `concurrency` factor uses and for the same reason. Levels
+  are pre-rendered from the layer count (`none`, `ffn_up_cpu`, `first_N`,
+  `first_M`, `ffn_cpu`), so a level is self-describing in the CSV.
+
+  The factor NAME does not change with build capability — a build without
+  `-ncffn` gets the three `-ot` levels under the same column, so results stay
+  comparable across a llama.cpp upgrade rather than changing shape. Raw `ot`
+  and `ncffn` remain reachable via `--factor`. Replaces the straight
+  `ot`→`ncffn` substitution that shipped moments earlier in this same
+  unreleased section.
+- **`emit` factors: level sets are checked for distinctness at build time.** A
+  factor whose *level* picks its flag can silently contain two levels that emit
+  the same arguments — two names for one run. The array then balances a column
+  that measures nothing, and the main effect reads "placement doesn't matter"
+  when the truth is it was never varied. Found the hard way: a level spelled
+  `up_cpu` missed the `OT_PATTERNS` key `ffn_up_cpu`, emitted nothing, and
+  duplicated `none`.
 - **OOM pruning is skipped, not guessed, when the estimator is too old.** The
   driver and `llama-fit-params` are separate binaries with separate flag
   support, so a row can set a placement factor the estimator cannot parse. Such
