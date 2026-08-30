@@ -23,6 +23,23 @@ Field feedback, 2026-08-30:
 Every item is sound advice. Taken one at a time, four of the five do nothing —
 and that is the defect, not the advice.
 
+## The five tips, audited
+
+Checked against the tree as of `5810272`. Four were already satisfiable; the
+failure was that three of them did not *appear* to work when applied singly, and
+one was already the default.
+
+| Tip | Disposition |
+|---|---|
+| "set nkvo to vram only if you plan to leave fit off" | **Already closed, and not our hazard.** Auto-fit is never on in a sweep: `build_server_args` forces `--fit off` where the binary has it, and `llama-bench` has no `--fit` at all — only `--fit-target`/`--fit-ctx`, both default-off and never emitted. `supports_flag`'s boundary match is what keeps `--fit` from matching `--fit-target`, so the server flag is not accidentally sent to bench. `nkvo` is therefore free to sweep in both directions; the tip applies to hand-run llama.cpp |
+| "limit context sizes" | **Works, and is the biggest single saving** — `--ctx-size N` pins `n_depth` to one level. It just did not shrink the array on its own (C1) |
+| "limit thread count" | **Works** — `--factor threads=8`. Same caveat: no effect on run count alone |
+| "limit cache types" | **Already the default.** `--min-kv` defaults to `q8_0`, which drops `q5_1`/`q4_1`/`q4_0`: five levels become two before anyone asks |
+| "look at the dense and moe knobs (`ot`, `ncmoe`)" | **Partly.** The dense side is now one `ffn_place` column spanning `-ot` and `-ncffn` ([`flag-coverage.md`](flag-coverage.md)); `ncmoe` is unchanged for MoE. The interview does not ask about offload tolerance — see Open |
+
+The pattern across all five: the capability existed, the composition did not, and
+nothing in the output distinguished "no effect" from "ignored".
+
 ## Defect: the dials do not compose the way anyone would assume
 
 `choose_array` sizes the design on `max(level counts)` across the varying
