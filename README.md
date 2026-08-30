@@ -396,16 +396,32 @@ minute.
 python3 llama-optimize.py model.gguf --llama-cpp /path/to/llama.cpp/build/bin
 ```
 
-Three things to read in that output before committing:
+Four things to read in that output before committing:
 
 1. **`VRAM : ... (llama.cpp: ROCm0)`** — the source in parentheses matters. If it
    says `rocm-smi` or `nvidia-smi` instead, llama.cpp cannot see your GPU and
    you'll get a loud warning: every run would execute on the CPU and report
    plausible-looking numbers. (Measured at 3.9x wrong on the same model.)
-2. **The run count and estimate** (e.g. `125 runs ... ~187 min`). If that's more
+2. **`VRAM free : ... at start`** — a *different* number from the one above, and
+   the one that decides whether a sweep started now will measure anything. Total
+   VRAM answers "can this model ever fit on this card"; free VRAM answers "can it
+   fit right now". On a shared or workstation GPU those diverge completely, and
+   you get a loud warning below about a quarter free. The OOM pruner compares
+   against **total**, so it will not save you — it passes configs that then abort
+   inside the GPU allocator, and the sweep spends its whole budget finding out.
+
+   `-ngl 0` is not a workaround: llama.cpp still offloads matmul to the GPU
+   backend, so even "CPU-only" rows allocate VRAM and abort with the rest. To
+   tune on the CPU while the card is busy, **hide the device**:
+
+   ```bash
+   HIP_VISIBLE_DEVICES= python3 llama-optimize.py model.gguf --run    # ROCm
+   CUDA_VISIBLE_DEVICES= python3 llama-optimize.py model.gguf --run   # NVIDIA
+   ```
+3. **The run count and estimate** (e.g. `125 runs ... ~187 min`). If that's more
    time than you want, `--quick` cuts reps, and `--screen` finds which knobs even
    matter first.
-3. **The sample command** — it's the real thing. If it looks wrong for your
+4. **The sample command** — it's the real thing. If it looks wrong for your
    setup, it would have been wrong 125 times.
 
 Then start small and widen:

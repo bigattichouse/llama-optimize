@@ -481,6 +481,70 @@ def gpu_visibility(vram, vram_src: str, can_ask: bool) -> str:
     return "blind" if vram else "cpu-only"
 
 
+# Below this fraction of VRAM free, a sweep is likely to abort rather than
+# measure. Deliberately generous: the point is to catch "the card is full",
+# not to second-guess a tight but workable fit. A model needing more than half
+# a free card is a normal thing to tune.
+LOW_VRAM_FREE_FRAC = 0.25
+
+
+def vram_headroom(devs: list[dict]) -> tuple[int, int]:
+    """(free, total) MiB summed over devices; (0, 0) if unknown."""
+    if not devs:
+        return 0, 0
+    return (sum(d.get("free_mib", 0) for d in devs),
+            sum(d.get("total_mib", 0) for d in devs))
+
+
+def headroom_warning(devs: list[dict]) -> str | None:
+    """Why this box is too full to sweep on, or None.
+
+    The OOM pruner reasons about TOTAL VRAM (`detect_vram_mib`), which is the
+    right basis for "can this model ever fit on this card" and the wrong one for
+    "can it fit right now". On a shared box the two diverge completely, and the
+    failure is expensive and confusing: the pruner passes a config, the run
+    aborts inside the CUDA allocator, and the sweep spends its whole budget
+    discovering that another process owns the card. Even `-ngl 0` fails, because
+    llama.cpp still op-offloads matmuls to the GPU backend, so "just run on the
+    CPU" is not the escape it appears to be — the device has to be hidden.
+
+    Free VRAM is not used to PRUNE, only to warn. It is a reading at one instant
+    from a number the vendor tool can misreport (issue #7's APU counts GTT), and
+    whatever holds the card now may release it before the sweep reaches the rows
+    that need it. Refusing to run on it would trade a wasted sweep for a sweep
+    that never starts."""
+    free, total = vram_headroom(devs)
+    if total <= 0 or free >= LOW_VRAM_FREE_FRAC * total:
+        return None
+    per_dev = ", ".join(f"{d['id']} {d.get('free_mib', 0)}/{d.get('total_mib', 0)} MiB"
+                        for d in devs)
+    return (f"only {free} of {total} MiB VRAM is free ({per_dev}) — "
+            f"another process is using this GPU")
+
+
+def warn_vram_headroom(devs: list[dict]) -> None:
+    """Say so before the sweep, not after it has burned its budget."""
+    why = headroom_warning(devs)
+    if not why:
+        return
+    print()
+    print("!" * 70)
+    print(f"!! {why}.")
+    print("!!")
+    print("!! Runs are likely to ABORT rather than measure. The OOM pruner")
+    print("!! compares against TOTAL VRAM, so it will not save you here, and")
+    print("!! --no-oom-prune makes it worse rather than better.")
+    print("!!")
+    print("!! -ngl 0 is not a workaround: llama.cpp still offloads matmul to the")
+    print("!! GPU backend, so CPU-only rows allocate VRAM too and abort with them.")
+    print("!! To tune on the CPU while the card is busy, HIDE the device:")
+    print("!!     HIP_VISIBLE_DEVICES=  (ROCm)   CUDA_VISIBLE_DEVICES=  (NVIDIA)")
+    print("!!")
+    print("!! Otherwise: wait for the card, or tune on the machine you will serve on.")
+    print("!" * 70)
+    print()
+
+
 def warn_gpu_visibility(verdict: str, vram_src: str, factors) -> None:
     """Say so, loudly, when the build cannot see the GPU it is being tuned for."""
     inert = [n for n in GPU_ONLY_FACTORS if n in factors]
@@ -5026,6 +5090,34 @@ def selftest() -> bool:
         # --- GPU visibility: a CPU-only BUILD vs a CPU-only MACHINE ---
         # detect_vram_mib's source string already carries the diagnosis, which is
         # why this needs no second probe.
+        # --- free VRAM: a different question from total ---
+        # The dev box's own state when this was written: another project held
+        # the card, every run aborted in the CUDA allocator, and the pruner
+        # (which compares against TOTAL) passed every one of them first.
+        _busy = [{"id": "ROCm0", "total_mib": 32752, "free_mib": 275}]
+        assert vram_headroom(_busy) == (275, 32752)
+        assert headroom_warning(_busy) is not None
+        assert "another process" in headroom_warning(_busy)
+        assert "275 of 32752" in headroom_warning(_busy)
+        # an idle card says nothing
+        assert headroom_warning([{"id": "ROCm0", "total_mib": 32752,
+                                  "free_mib": 32000}]) is None
+        # a tight but workable fit is not a warning: a model wanting more than
+        # half a free card is ordinary, and crying wolf here trains it away
+        assert headroom_warning([{"id": "CUDA0", "total_mib": 24576,
+                                  "free_mib": 9000}]) is None
+        # summed over devices, like detect_vram_mib — one busy card in a pair
+        # does not read as "fine" because the other is idle (issue #5 shape)
+        _pair = [{"id": "CUDA0", "total_mib": 24117, "free_mib": 300},
+                 {"id": "CUDA1", "total_mib": 11909, "free_mib": 400}]
+        assert vram_headroom(_pair) == (700, 36026)
+        assert "CUDA0 300/24117" in headroom_warning(_pair)
+        assert "CUDA1 400/11909" in headroom_warning(_pair)
+        # unknown / absent free data must not manufacture a warning
+        assert headroom_warning([]) is None
+        assert vram_headroom([]) == (0, 0)
+        assert headroom_warning([{"id": "ROCm0", "total_mib": 0,
+                                  "free_mib": 0}]) is None
         assert gpu_visibility(32752, "llama.cpp: ROCm0", True) == "gpu"
         # the vendor tool sees a card llama.cpp does not: no GPU backend
         assert gpu_visibility(32752, "rocm-smi", True) == "blind"
@@ -6778,6 +6870,14 @@ def main():
     # where it came from is what makes that diagnosable from a paste.
     print(f"VRAM       : {vram} MiB ({vram_src})" if vram
           else "VRAM       : (undetected)")
+    # Free VRAM is a different question from total, and the one that decides
+    # whether a sweep started now will measure anything. Printed whenever the
+    # device list carries it, so the header records the state the run began in.
+    _devs = list_devices(cfg.llama_bench) or list_devices(cfg.llama_server)
+    _free, _total = vram_headroom(_devs)
+    if _total > 0:
+        print(f"VRAM free  : {_free} of {_total} MiB "
+              f"({100.0 * _free / _total:.0f}%) at start")
     # A build that cannot see the GPU produces plausible numbers, not an error,
     # so this is the only place it can be caught before a whole sweep is wasted.
     warn_gpu_visibility(
@@ -6785,6 +6885,7 @@ def main():
                        supports_flag(cfg.llama_bench, "--list-devices")
                        or supports_flag(cfg.llama_server, "--list-devices")),
         vram_src, cfg.factors)
+    warn_vram_headroom(_devs)
     if cfg.oom_prune and vram and cfg.fit_params.exists():
         print(f"OOM prune  : on (llama-fit-params, {cfg.fit_headroom_mib} MiB headroom)")
     elif cfg.oom_prune:

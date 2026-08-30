@@ -47,6 +47,28 @@ earlier.
   reachable via `--factor ot=...` — `ncffn` varies *how many layers* offload
   while `ot=ffn_up_cpu` varies *which tensor*, so the two are different axes and
   the finer one does not subsume the lighter one.
+- **Free-VRAM preflight.** `detect_vram_mib` reports TOTAL VRAM, which is the
+  right basis for "can this model ever fit on this card" and the wrong one for
+  "can it fit right now". The OOM pruner compares against total, so on a card
+  another process is holding it passes every config, each run then aborts inside
+  the GPU allocator, and the sweep spends its entire budget discovering that the
+  card was busy. The device list already carried free memory per device; it was
+  simply never read. The header now prints `VRAM free : N of M MiB at start` and
+  warns loudly below a quarter free.
+
+  Free VRAM warns but does **not** prune: it is one instant's reading of a number
+  the vendor tool can misreport (issue #7's APU counts GTT), and whatever holds
+  the card may release it before the sweep reaches the rows that need it.
+  Refusing to run would trade a wasted sweep for a sweep that never starts.
+
+  The warning also names the escape, because the obvious one does not work:
+  `-ngl 0` still allocates VRAM, since llama.cpp op-offloads matmul to the GPU
+  backend even with no layers resident. Tuning on the CPU while the card is busy
+  needs the device *hidden* (`HIP_VISIBLE_DEVICES=` / `CUDA_VISIBLE_DEVICES=`).
+  Found on the development box: 174 MiB free of 32752, every bench row aborting
+  in `ggml_cuda_pool_leg::alloc`, and the pruner cheerfully approving them all.
+  This is the mirror of the fit-params blindness fixed earlier in this section —
+  that one deleted valid rows, this one admitted doomed ones.
 - **`ffn_place` — one dense FFN placement factor spanning `-ot` and `-ncffn`.**
   The two are different axes, not rival spellings: `ot=ffn_up_cpu` moves the
   up-projection across *every* layer, `-ncffn N` moves the whole FFN for the
