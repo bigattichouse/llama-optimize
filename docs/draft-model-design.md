@@ -93,6 +93,9 @@ So compute buffers and the draft model's own KV cache are deliberately not
 modelled, and an unreadable draft geometry prices as zero rather than as "all of
 it".
 
+The general form of this trap, its five instances so far, and how to test for
+it are in [`DESIGN.md`](DESIGN.md#be-wary-wherever-an-estimate-can-answer-a-different-question-than-the-one-asked).
+
 This does not make the estimate correct, and it is not meant to. It makes it
 *directionally useful and never harmful*, which is the most that can be had while
 the estimator cannot be told these artifacts exist. If llama.cpp ever teaches

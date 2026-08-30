@@ -213,3 +213,68 @@ verification** (`--verify-picks`, default on): the final pick candidates are
 re-measured head-to-head after the sweep and reported as medians with their
 observed spread, rather than trusting one measurement or an additive-model
 extrapolation.
+
+## Be wary wherever an estimate can answer a different question than the one asked
+
+The single most productive defect class this project has found, and the one worth
+testing hardest for. It has now appeared five times, in four different
+subsystems, and every instance looked correct in code review:
+
+| Where | The question asked | The question answered |
+|---|---|---|
+| `-ncmoe`/`-ot` in the fit cache key (PR #4) | "does *this* config fit?" | "does a config with these *other* factors fit?" |
+| VRAM detection on multi-GPU (issue #5) | "how much VRAM is there?" | "how much is on the first card?" |
+| VRAM detection on an APU (issue #7) | "what can llama.cpp allocate?" | "what does the vendor tool call VRAM?" |
+| `-ncffn` dropped from the fit argv (PR #10) | "does this fit with the FFN offloaded?" | "does it fit with the FFN *resident*?" |
+| Total vs free VRAM | "will this run right now?" | "could this ever run on this card?" |
+
+The shape is always the same: a number is produced, it is not obviously wrong,
+nothing downstream can contradict it, and it is quietly about something else.
+
+**Why it is worse than an error.** A failed estimate is loud and degrades to
+"run it anyway". A misdirected estimate is silent and *acts* — in this codebase
+it usually deletes rows, so the evidence that would expose it is exactly what
+gets destroyed. Issue #3's `1e6 t/s` is the same family seen from the other side:
+every field in the response agreed with every other field because they all came
+from one broken counter, and reproducibility confirmed it three times over.
+
+**What to do about it, in order:**
+
+1. **Ask whether the estimator can even see the inputs.** Two binaries built from
+   one tree disagree — `llama-fit-params` carries `-ncffn` on this box while
+   `llama-bench` does not, and it rejects `-md`/`--mmproj` outright. Gate on the
+   flag actually emitted, not on the factor name, since a factor's *level* can
+   pick its flag.
+2. **Prefer a conservative estimate to no estimate, when a bound exists.** For
+   resident artifacts the estimator cannot be told about, weights on disk are a
+   hard lower bound on weights in VRAM. Standing down admits every doomed
+   config; a lower bound admits only some. Getting this wrong in the *first*
+   direction merely wastes time, so choose the direction deliberately and say
+   which one you chose (`resident_extra_mib`).
+3. **Stand down only where no bound exists**, and say so where the user can see
+   it — never silently.
+4. **Cross-check against a clock or a quantity the estimator does not supply.**
+   The wall-clock ceiling on `tg` (issue #3) works because the server cannot
+   fake our stopwatch.
+
+**How to test for it.** Ordinary unit tests do not catch this, because the
+misdirected number is well-formed. Three things do, and all three have earned
+their place:
+
+- **Property tests over the whole input set, not samples.** Assert that
+  perturbing *any* footprint-relevant factor changes the fit cache key, and
+  iterate the real list rather than a hand-picked few — the `-ncffn` collision
+  survived precisely because the perturbation list was hand-enumerated and the
+  new factor was not added to it.
+- **Mutation-test the guard.** Re-introduce the defect and confirm the test
+  fails. A test written after the fix that passes against the *old* behaviour is
+  not testing anything.
+- **Assert against a stub, never against absence.** A capability check driven by
+  a missing binary passes for every flag and would pass with the gate inverted.
+  Stub the `--help` text and assert both the positive and negative case.
+
+**Beware the truncated read.** Two diagnoses this project got wrong began with a
+listing cut short — `head -14` on a tensor table read as "these tensors are
+absent", and a partial GGUF header parsed as "this metadata key is missing".
+When concluding that something is *not* there, check that you looked at all of
+it.

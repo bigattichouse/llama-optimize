@@ -64,18 +64,21 @@ rather than inverting, so the check never trips — but the margin on the
 deep-context profile is thinner than the constant was reasoned from. Worth
 revisiting `TG_OVER_PP_LIMIT` regardless of what the reporter says.
 
-### 2. The estimate/answer rule now has three instances — consider generalising
+### 2. The estimate/answer rule is now written down — apply it
 
-Three separate defects this session had one shape: **an estimate that answers a
-different question than the one asked is worse than no estimate.**
+Five instances across four subsystems, generalised into
+[`DESIGN.md`](DESIGN.md#be-wary-wherever-an-estimate-can-answer-a-different-question-than-the-one-asked)
+with the testing practices that actually catch it (property tests over the whole
+input set, mutation-testing the guard, asserting against a stub rather than
+against absence).
 
-1. `-ncffn` dropped from the fit argv → estimated the un-offloaded footprint
-2. total VRAM vs free → approved configs with no room to run
-3. `-md` unparseable by `llama-fit-params` → would estimate one model of two
+The refinement worth remembering, because the first answer was wrong: prefer a
+**conservative estimate** to no estimate wherever a bound exists — standing down
+admits every doomed config, a lower bound admits only some. Stand down only where
+no bound exists.
 
-Each is handled, and `fit_blind_flags` is the shared mechanism for (1) and (3).
-Whether (2) belongs in it too — a "the card is too full to price this" blind
-condition rather than a warning — is an open design question, not a bug.
+Still open as a design question, not a bug: whether total-vs-free VRAM should
+become a blind condition in `fit_blind_flags` rather than a warning.
 
 ### 3. Multi-GPU (issue #5) — the reporter's own numbers moved this
 
