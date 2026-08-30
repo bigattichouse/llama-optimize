@@ -719,7 +719,7 @@ def gpu_temp_c() -> float | None:
 # build while an older llama-fit-params is found on $PATH or left from a
 # previous checkout. Observed in the other direction too, inside one build tree
 # — llama-fit-params carrying -ncffn while llama-bench did not.
-FIT_RECENT_FLAGS = {"-ncmoe", "-ncffn"}
+FIT_RECENT_FLAGS = {"-ncmoe", "-ncffn", "-md"}
 
 
 def fit_blind_flags(cfg: "Config", f: dict, driver: str) -> list[str]:
@@ -771,6 +771,13 @@ def _fit_params_flags(cfg: "Config", f: dict, driver: str) -> list[str]:
     # Dense FFN offload (llama.cpp #26622, tag b10645)
     if "ncffn" in f:
         flags += ["-ncffn", f["ncffn"]]
+    # A second resident model changes the footprint more than any factor here,
+    # and llama-fit-params has no way to be told about it ("invalid argument:
+    # -md"). Emitted anyway so fit_blind_flags sees it and turns pruning OFF for
+    # these rows: an estimate that silently ignores a whole model is the
+    # confidently-wrong kind (DM3, revised — see draft-model-design.md).
+    if getattr(cfg, "draft_model", None):
+        flags += ["-md", str(cfg.draft_model)]
     # Dense FFN placement: the level carries its own flag (-ot or -ncffn), and
     # both spellings are ones fit-params accepts, so this needs no special case
     # beyond asking the level what it emits.
@@ -1057,6 +1064,20 @@ def thin_to(values: list, n: int) -> list:
     return [v for i, v in enumerate(values) if i in keep_idx]
 
 
+def draft_layer_count(path: "Path | None") -> int | None:
+    """Layer count of the draft GGUF, or None if it cannot be read.
+
+    Separate from the target's `n_layers` because they are different models and
+    routinely different sizes; `-ngld` levels generated from the target's count
+    would ask the drafter to offload layers it does not have (D5)."""
+    if not path:
+        return None
+    try:
+        return _meta_int(read_gguf_metadata(Path(path)), ".block_count")
+    except (OSError, ValueError, struct.error):
+        return None
+
+
 def n_levels_span(lo: int, hi: int, n: int = 5) -> list[int]:
     """`n` roughly evenly spaced distinct integer levels in [lo, hi].
 
@@ -1194,6 +1215,7 @@ class Config:
     env_factor_names: set = field(default_factory=set)  # factors that set env vars
     # Throughput floors: a config below them is a real measurement the user has
     # said they do not want, so waiting for it to finish buys nothing (T1).
+    draft_model: Path | None = None   # -md: a SECOND model, an input not a factor (D1)
     levels: int = 5             # level count for auto-generated numeric factors
     min_tgs: float = 0.0        # abandon a config generating slower than this
     min_pps: float = 0.0        # ...or prefilling slower than this
@@ -1286,6 +1308,27 @@ def build_factors(cfg: Config):
         factors["spec_n_min_frac"] = ["0.0", "0.5", "1.0"]
         factors["spec_p_min"] = ["0.0", "0.25", "0.5", "0.75", "0.9"]
         factors["spec_p_split"] = ["0.1", "0.3", "0.5"]
+    # Draft-model placement (F2 step 2). Present ONLY when a draft model was
+    # given: without -md llama.cpp never reads these, so every level would be
+    # the same run (D2/DM1). Levels come from the DRAFT model's layer count,
+    # not the target's — a 0.5B drafter beside a 27B target has its own
+    # geometry, and reusing the target's would emit -ngld values the drafter
+    # does not have (D5).
+    if cfg.driver == "server" and cfg.draft_model:
+        d_layers = draft_layer_count(cfg.draft_model)
+        factors["spec_draft_ngl"] = [str(x) for x in
+                                     ngl_levels(d_layers, nlv)]
+        # The drafter's KV is a separate budget from the target's, and on a card
+        # they share it is the cheaper one to quantise (F2's vLLM evidence).
+        #
+        # Deliberately NOT held to --min-kv. That floor exists to protect output
+        # quality, and the draft model does not produce output: a token drafted
+        # from a degraded draft KV is either accepted after the target verifies
+        # it, or discarded. Quantising the drafter costs ACCEPTANCE RATE, which
+        # is speed, and speed is what the sweep is measuring. Applying a quality
+        # floor here would rule out the cheap end of the one cache where cheap
+        # is free.
+        factors["spec_draft_kv"] = thin_to(list(DEFAULT_KV_LEVELS), nlv)
     # ngram self-speculative decoding (server only). The --spec-type variant is a
     # gate; its tuning knobs are CONDITIONAL (active_when — docs/CONDITIONAL-FACTORS.md)
     # and must not share a flat array with the gate (that inflates the design and
@@ -1609,6 +1652,14 @@ FACTORS = {
     "mtp":          {"bench": None, "server": ("--spec-type",), "kind": "cat", "server_only": True,
                      "translate": {"1": "draft-mtp", "0": ""}},   # on/off: "" omits the flag
     "spec_n_max":   {"bench": None, "server": ("--spec-draft-n-max",), "kind": "num", "server_only": True},
+    # Draft-model placement. Both are inert without -md (llama.cpp consumes them
+    # only inside `if (has_draft)`), so build_factors omits them entirely rather
+    # than gating them — an inert column reads as "placement doesn't matter"
+    # when the truth is it was never tested (D2/DM1).
+    "spec_draft_ngl": {"bench": None, "server": ("-ngld",), "kind": "num",
+                       "server_only": True},
+    "spec_draft_kv":  {"bench": None, "server": ("-ctkd", "-ctvd"), "kind": "cat",
+                       "server_only": True},
     # n_min is DERIVED from n_max as a FRACTION of it. Swept as an absolute it
     # produced inverted rows (n_max=1, n_min=2 — issue #8), and llama.cpp does not
     # reject those: it drafts at most n_max tokens and then discards any draft
@@ -2753,6 +2804,13 @@ def build_server_args(cfg: Config, f: dict, port: int, n_ctx: int) -> list[str]:
         "--host", "127.0.0.1", "--port", str(port),
         "-c", str(n_ctx),                          # mmap on is the server default
     ]
+    # A draft model is an INPUT, not a factor (D1): a sweep either has one or it
+    # does not. Its presence is also what switches llama.cpp's speculation from
+    # the target's own head to a separate model — has_dft() is simply "was a -md
+    # path given" (common/common.h) — so the same MTP head can be driven either
+    # way, and only this makes the second route expressible (issue #12).
+    if cfg.draft_model:
+        args += ["-md", str(cfg.draft_model)]
     # --fit is on by default and adjusts unset arguments at load time to make
     # the model fit — silently changing the very configuration being measured,
     # so a row's factors and what actually ran can disagree. Turn it off, but
@@ -5413,6 +5471,65 @@ def selftest() -> bool:
         assert vram_headroom([]) == (0, 0)
         assert headroom_warning([{"id": "ROCm0", "total_mib": 0,
                                   "free_mib": 0}]) is None
+        # --- draft model as an INPUT (F2 / issue #12) ---
+        _ls, _fp = Path("ls"), Path("fp")
+        _hw = {"phys": 8, "logical": 16, "n_layers": 65, "n_ctx_train": 262144,
+               "n_experts": 0, "n_nextn": 1, "vram": 24576, "numa_nodes": 1}
+        _saved_help = dict(_help_cache)
+        try:
+            _help_cache[str(_ls)] = _help_cache[str(_fp)] = "-ncmoe N\n"
+            _row = {"ngl": "32", "n_depth": "8192", "kv_type": "f16", "nkvo": "1"}
+
+            # DM1/D2: no draft model => no draft column ANYWHERE. An inert
+            # column would read as "draft placement doesn't matter" when it was
+            # never tested, which is the failure the whole design guards against.
+            _c0 = Config(model=Path("t.gguf"), llama_bench=Path("lb"),
+                         llama_server=_ls, array="L125", ctx_floor=8192,
+                         fit_params=_fp, driver="server", hw=dict(_hw))
+            _f0 = build_factors(_c0)
+            assert not [k for k in _f0 if k.startswith("spec_draft_")], _f0
+            assert "-md" not in build_server_args(_c0, _row, 8080, 9216)
+
+            # with one: placement factors appear, and -md reaches the command.
+            # This is the second route to MTP from issue #12 — the same head can
+            # drive speculation from inside the target or as a separate model,
+            # and only -md makes the latter expressible.
+            _c1 = Config(model=Path("t.gguf"), llama_bench=Path("lb"),
+                         llama_server=_ls, array="L125", ctx_floor=8192,
+                         fit_params=_fp, driver="server",
+                         draft_model=Path("d.gguf"), hw=dict(_hw))
+            _f1 = build_factors(_c1)
+            assert "spec_draft_ngl" in _f1 and "spec_draft_kv" in _f1, _f1
+            _cmd = build_server_args(_c1, _row, 8080, 9216)
+            assert "-md" in _cmd and _cmd[_cmd.index("-md") + 1] == "d.gguf"
+            assert factor_flags(_c1, {"spec_draft_ngl": "16"}, "server") == \
+                [["-ngld", "16"]]
+            # kv rides two flags, like the target's kv_type
+            assert factor_flags(_c1, {"spec_draft_kv": "q4_0"}, "server") == \
+                [["-ctkd", "q4_0"], ["-ctvd", "q4_0"]]
+
+            # The draft KV is NOT held to --min-kv. That floor protects output
+            # quality, and the drafter emits no output: a token drafted from a
+            # degraded draft cache is verified by the target, then accepted or
+            # discarded. Quantising it costs acceptance rate (speed), which is
+            # the thing being measured — so the cheap end must stay reachable.
+            assert "q4_0" in _f1["spec_draft_kv"], _f1["spec_draft_kv"]
+
+            # DM3 (revised): llama-fit-params rejects -md outright ("invalid
+            # argument"), so a second resident model cannot be estimated. Blind
+            # beats wrong — pruning turns OFF for these rows rather than
+            # estimating a footprint that ignores an entire model.
+            assert fit_blind_flags(_c1, _row, "server") == ["-md"]
+            assert fit_blind_flags(_c0, _row, "server") == []
+
+            # draft levels come from the DRAFT's geometry, not the target's
+            assert len(_f1["spec_draft_ngl"]) == 5
+        finally:
+            _help_cache.clear()
+            _help_cache.update(_saved_help)
+        assert draft_layer_count(None) is None
+        assert draft_layer_count(Path("/nonexistent-draft.gguf")) is None
+
         # --- setup interview (Q1): answers -> argv is a pure function ---
         assert intent_args(Intent()) == []            # all defaults: say nothing
         assert intent_args(Intent(ctx=8192)) == ["--ctx-size", "8192"]
@@ -6977,6 +7094,14 @@ def main():
                          "the server driver applied this per HTTP REQUEST, so a "
                          "config could take (1+reps)x this; it is now a deadline "
                          "on both drivers")
+    ap.add_argument("--draft-model", "-md", type=Path, default=None, metavar="GGUF",
+                    help="draft model for speculative decoding (server driver). "
+                         "An INPUT, not a factor — a sweep either has one or it "
+                         "does not. Adding it unlocks the draft-side placement "
+                         "factors (-ngld, -ctkd/-ctvd), which llama.cpp ignores "
+                         "without it. Note a model whose MTP head is embedded "
+                         "can speculate either way: without -md from its own "
+                         "head, with -md from a separate head file")
     ap.add_argument("--levels", type=int, default=5, metavar="N",
                     help="levels per auto-generated numeric factor (default 5). "
                          "This is the sweep's cost dial: the orthogonal array is "
@@ -7148,6 +7273,7 @@ def main():
         driver=driver,
         parallel=parallel,
         score=args.score,
+        draft_model=args.draft_model,
         levels=max(2, args.levels),
         min_tgs=max(0.0, args.min_tgs),
         min_pps=max(0.0, args.min_pps),
@@ -7199,6 +7325,17 @@ def main():
             ap.error(f"--env expects NAME=v1,v2,... (got '{spec}')")
         cfg.factors[name] = levels
         cfg.env_factor_names.add(name)
+
+    # DM2: a draft model is a server-driver concept. llama-bench cannot speculate
+    # at all, so accepting it there would emit a flag the binary rejects — or,
+    # worse, silently sweep draft factors that never reach anything.
+    if cfg.draft_model:
+        if cfg.driver != "server":
+            ap.error("--draft-model needs the server driver (llama-bench cannot "
+                     "speculate): add --driver server, or a --use-case that "
+                     "implies it")
+        if not cfg.draft_model.exists():
+            ap.error(f"--draft-model not found: {cfg.draft_model}")
 
     # apply the KV quality floor (quality is essentially only KV-type deep here;
     # MTP is lossless, other knobs don't affect quality)
@@ -7319,6 +7456,11 @@ def main():
     elif cfg.oom_prune:
         what = "no fit-params binary" if not cfg.fit_params.exists() else "VRAM undetected"
         print(f"OOM prune  : off ({what})")
+    if cfg.draft_model:
+        d_layers = draft_layer_count(cfg.draft_model)
+        print(f"draft model: {cfg.draft_model.name}"
+              + (f"   layers: {d_layers}" if d_layers else "")
+              + "  — draft placement swept (-ngld, -ctkd/-ctvd)")
     if n_ctx_train:
         print(f"native ctx : {n_ctx_train}")
     if n_nextn:

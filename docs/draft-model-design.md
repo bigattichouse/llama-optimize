@@ -59,7 +59,29 @@ omits the draft factors entirely when no draft model is set. **The latter is
 preferred** — it matches how `ncmoe`, `mtp` and `ngram` already appear only when
 the model and flags make them meaningful, and it keeps `is_active` single-purpose.
 
-**D3 — the OOM pruner must account for both models.** `predict_fits` fits a VRAM
+**D3 — REVISED: the OOM pruner cannot account for both models, so it stands
+down.** The original text (below) assumed the pruner could be taught about the
+draft model. It cannot — `llama-fit-params` rejects `-md` outright:
+
+```
+$ llama-fit-params -m model.gguf --fit-print on -md draft.gguf
+error: invalid argument: -md
+```
+
+It accepts `-ctkd`/`-ctvd`, so it knows about draft *cache types*, but there is
+no way to tell it a second model exists. Estimating anyway would report the
+target's footprint alone while the machine holds two — confidently wrong, in the
+direction that approves configurations which then abort.
+
+So `-md` is emitted into the estimator's argv precisely so `fit_blind_flags`
+sees it and turns pruning off for those rows, with a notice. Same "blind beats
+wrong" rule the `-ncffn` gate follows, and the inverse of the total-vs-free VRAM
+defect: both are estimates answering a different question than the one asked. If
+llama.cpp ever teaches `llama-fit-params` about `-md`, the gate opens by itself.
+
+The original reasoning, still right about the stakes:
+
+> **D3 — the OOM pruner must account for both models.** `predict_fits` fits a VRAM
 footprint from `ngl`/`kv_type`/context over one model. With a draft model
 resident the free VRAM for the target shrinks by the draft's own offloaded
 layers and KV cache, and `-ngld` moves that number *within the sweep*. A pruner
@@ -88,8 +110,10 @@ target's, not assume a range.
   `--spec-type draft-simple` with no draft model is a run that cannot speculate;
   it must be unconstructible, not merely unlikely — the `spec_off` telemetry
   (F1) would flag it after the fact, but by then a row has been wasted.
-- **DM3 — VRAM predictions include the draft model.** Any consumer of the fitted
-  footprint sees both models or is not consulted.
+- **DM3 — VRAM predictions include the draft model, or are not made at all.**
+  Any consumer of the fitted footprint sees both models or is not consulted.
+  Since the estimator cannot see a draft model (D3 revised), "not consulted" is
+  the branch actually taken: pruning is off for draft rows.
 - **DM4 — Draft factors are staged, not flat.** A dozen new columns in one array
   is the inflation `CONDITIONAL-FACTORS.md` was written to prevent: screen the
   spec type at default knobs, then tune the winner's placement.
@@ -136,7 +160,15 @@ Sensible first cut, cheapest first:
 - [ ] `-ngld` registry entry + level generation from the *draft* model's layer
       count (D5)
 - [ ] `-ctkd`/`-ctvd` registry entries; decide open question 3 first
-- [ ] `predict_fits` accounts for the draft model's resident footprint (D3/DM3)
+- [x] `predict_fits` stands down on draft rows — it cannot account for a second
+      model, and a partial estimate is worse than none (D3 revised / DM3)
+- [x] `--draft-model` input, `-md` emission, `-ngld` + `-ctkd`/`-ctvd` as factors
+      present only when a draft model is given (D1/D2/DM1)
+- [x] `-ngld` levels generated from the DRAFT model's own layer count (D5)
+- [x] Draft KV deliberately exempt from `--min-kv`: that floor protects output
+      quality, and the drafter emits no output — a token drafted from a degraded
+      draft cache is verified by the target, then accepted or discarded, so
+      quantising it costs acceptance rate (speed), which is what is measured
 - [ ] Stage planner: screen spec type, then tune placement (DM4)
 - [ ] `--selftest` coverage: flag emission, DM1/DM2 as property checks over the
       factor grid, and level generation against a captured draft-model metadata

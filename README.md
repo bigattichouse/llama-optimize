@@ -620,6 +620,11 @@ python3 llama-optimize.py MODEL.gguf [options]
   --min-context N    minimum context you need: BALANCED targets it, FASTEST only
                      considers configs verified to hold it, and emitted -c is
                      floored at it where the sweep has evidence (alias: --ctx-floor)
+  --draft-model G    draft model for speculative decoding (server driver). An
+  -md G              INPUT, not a factor. Unlocks the draft-side placement
+                     factors (-ngld, -ctkd/-ctvd), which llama.cpp ignores
+                     without it. OOM pruning turns OFF for these rows:
+                     llama-fit-params cannot be told a second model exists
   --levels N         levels per auto-generated numeric factor (default 5). The
                      sweep's cost dial: the array is sized by the WIDEST factor,
                      so narrowing one knob alone changes nothing. 5 -> L125/125
@@ -762,6 +767,8 @@ registry in `llama-optimize.py`.
 | `spec_n_min_frac` | `--spec-draft-n-min` | server | float | swept³ | min draft tokens, as a **fraction of `spec_n_max`** (`n_min` = `⌊frac × n_max⌋`)⁵ |
 | `spec_p_min` | `--spec-draft-p-min` | server | float | swept³ | MTP acceptance-probability threshold |
 | `spec_p_split` | `--spec-draft-p-split` | server | float | swept³ | MTP split probability |
+| `spec_draft_ngl` | `-ngld` | server | num | swept⁶ | draft model's GPU layers — where the *drafter* lives |
+| `spec_draft_kv` | `-ctkd -ctvd` | server | cat | swept⁶ | draft KV precision, independent of the target's |
 | `rope_scaling` | `--rope-scaling` | server | cat | opt-in | RoPE scaling: none/linear/yarn |
 | `yarn_factor` | `--yarn-ext-factor` | server | float | opt-in | YaRN extrapolation (context **beyond** native) |
 
@@ -798,6 +805,18 @@ the gate — see [ngram staging](#ngram-staged-search). ngram needs no draft mod
 as it pattern-matches from the token history. Note that `spec_n_max`
 (`--spec-draft-n-max`) is a draft-model/MTP knob with **no effect on ngram**, so
 it is not an ngram factor.
+
+**⁶ Draft-side factors appear only with `--draft-model`.** llama.cpp reads them
+only when a draft model was given, so without one every level would be the same
+run — an inert column reads as "draft placement doesn't matter" when it was never
+tested. Levels come from the *draft* model's layer count, not the target's.
+
+Note the draft KV is deliberately **not** held to `--min-kv`. That floor protects
+output quality, and the drafter produces no output: a token drafted from a
+degraded draft cache is verified by the target and then accepted or discarded.
+Quantising the drafter costs acceptance rate — speed, which is what the sweep
+measures — so the cheap end stays reachable. See
+[draft-model design](docs/draft-model-design.md).
 
 **⁵ Derived factors are swept relative to a sibling**, not as absolutes, so the
 pair's implied ordering (`-b ≥ -ub`, `n_min ≤ n_max`) holds in every row by

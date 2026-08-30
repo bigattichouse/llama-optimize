@@ -47,6 +47,32 @@ earlier.
   reachable via `--factor ot=...` — `ncffn` varies *how many layers* offload
   while `ot=ffn_up_cpu` varies *which tensor*, so the two are different axes and
   the finer one does not subsume the lighter one.
+- **`--draft-model` / `-md`: the draft-side surface becomes reachable.** First
+  increment of F2 ([`draft-model-design.md`](docs/draft-model-design.md)). A
+  draft model is an *input*, not a factor — a sweep either has one or it does
+  not — and giving one adds `-ngld` and `-ctkd`/`-ctvd` as swept factors. Without
+  it they are omitted entirely rather than swept inert, because llama.cpp reads
+  them only when `-md` was given and a null main effect would read as "draft
+  placement doesn't matter" rather than "never tested".
+
+  This also makes the second route to MTP expressible (issue #12). `has_dft()` is
+  just "was a `-md` path given", and it decides whether llama.cpp drafts from the
+  target's own NextN head or loads a separate head file as a second model. Both
+  are real configurations of the same capability, at different VRAM costs; only
+  one of them was reachable before.
+
+  Draft `-ngld` levels come from the **draft** model's layer count, not the
+  target's. Draft KV is deliberately exempt from `--min-kv`: that floor protects
+  output quality and the drafter emits no output — a token drafted from a
+  degraded draft cache is verified by the target, then accepted or discarded, so
+  quantising it costs acceptance rate (speed), which is the thing being measured.
+
+  **OOM pruning turns off for draft rows.** `llama-fit-params` rejects `-md`
+  ("invalid argument"), so a second resident model cannot be estimated at all.
+  `-md` is passed to the estimator anyway, so the existing capability gate sees
+  it and stands down with a notice. Estimating the target alone while the machine
+  holds two models is the confidently-wrong kind of answer. This revises D3/DM3
+  in the design doc, which had assumed the pruner could be taught about it.
 - **Setup interview on a bare invocation.** `llama-optimize.py model.gguf` on a
   terminal now asks four questions — context actually served, slowest useful
   generation speed, how much of the space to search, repeats — then prints the
