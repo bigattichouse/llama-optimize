@@ -6,9 +6,8 @@ remaining work in and why, see [`PLAN.md`](PLAN.md). Unlike the other files in
 up next, and should be pruned as items land. Durable reasoning belongs in the
 design docs it points at.
 
-Everything below is committed to `main` (through `57ff8d7`) and pushed through
-`ff045dc` — the two doc commits after it are local only. The working tree is
-clean and `--selftest` passes.
+Everything below is committed and pushed to `main` (through `e96a076`), the
+working tree is clean, and `--selftest` passes.
 
 **No live sweep was run this session.** The GPU on the dev box is in use by
 another project — 174 MiB free of 32752 at last check — so every change is
