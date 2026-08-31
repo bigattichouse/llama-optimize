@@ -3417,10 +3417,12 @@ class ServerSession:
         prompt = prompts[0]
         n_err = 0
         if par == 1:
-            # Single stream: prefill once (warm request → real pp + primes the KV
-            # cache), then reuse the cached prompt so each rep measures pure decode
-            # (tg) without re-prefilling — much faster at high context, and a
-            # cleaner decode number.
+            # Single stream: the warm request prefills (real pp + primes the KV
+            # cache), then each rep sends the NEXT prompt in the battery. At
+            # reuse 1.0 that is the same prompt, so the reps are pure decode off
+            # a full cache hit; below 1.0 they deliberately are not, and the rep
+            # re-prefills the differing suffix. `wall` below therefore covers
+            # prefill as well as decode at any reuse < 1.0 — see issue #11.
             try:
                 warm = _completion(self.port, prompt, n_gen,
                                    _left(timeout, deadline), cache=True)
@@ -5906,6 +5908,40 @@ def selftest() -> bool:
             assert r_ok["tg_tps"] == 600.0
             assert "draft_acc" not in r_ok and "spec_off" not in r_ok, r_ok
 
+            # --- the `agents` request shape reaches measure() (issue #11) ---
+            # Every case above runs at reuse 1.0, the pre-4ffa97a shape where
+            # each rep is a full cache hit and `wall` is decode plus a round
+            # trip. The profiles have not defaulted to that since 4ffa97a, and
+            # nothing here noticed: at reuse < 1.0 the reps send DIFFERENT
+            # prompts, so each one re-prefills its differing suffix inside the
+            # request that I5 then bounds by wall time. Pin the shape the reps
+            # actually send, so the request I5 is reasoning about is the request
+            # it gets. (Whether the bound itself is still right for this shape
+            # is issue #11 and is not settled here.)
+            seen = []
+
+            def _recording(port, prompt, n_gen, timeout, cache=False):
+                seen.append(prompt)
+                time.sleep(0.02)
+                return {"content": "x",
+                        "timings": {"prompt_per_second": 444.1,
+                                    "predicted_per_second": 600.0,
+                                    "predicted_n": 128, "prompt_n": 8192,
+                                    # llama.cpp reports these too; the fix for
+                                    # #11 will need them and the fake was
+                                    # silently omitting both (server-common.cpp
+                                    # server_slot_stats::to_json)
+                                    "prompt_ms": 18000.0, "cache_n": 7372}}
+
+            sess.cfg = SimpleNamespace(prefix_reuse=0.9)      # the agents shape
+            globals()["_completion"] = _recording
+            r_shape = measure_in_session(fake_cfg, {"n_depth": "8192"}, sess, 30)
+            assert len(seen) == 2, seen                       # warm + one rep
+            assert seen[0] != seen[1], "reps re-use the warm prompt"
+            assert 0.85 <= achieved_reuse(seen) <= 0.95, achieved_reuse(seen)
+            assert 0.85 <= float(r_shape["reuse"]) <= 0.95, r_shape
+            sess.cfg = SimpleNamespace(prefix_reuse=1.0)      # restore
+
             # Same wiring for the speculative telemetry (F1): the counters must
             # survive the trip from the response through measure() into the row.
             spec_cfg = SimpleNamespace(n_prompt=0, n_gen=128, parallel=1, reps=1,
@@ -7141,11 +7177,10 @@ def main():
     ap.add_argument("--prefix-reuse", type=float, default=None, metavar="PCT",
                     help="workload SHAPE: percent of each prompt that is a "
                          "prefix shared across requests (0-100). Describes your "
-                         "traffic, it is not tuned. Default 100 = every request "
-                         "identical, which is the historical behaviour and "
-                         "INFLATES n-gram speculation (see CHANGELOG); an agent "
-                         "stack with a fixed system prompt is nearer 90, "
-                         "independent requests are 0")
+                         "traffic, it is not tuned. Defaults to the profile's "
+                         "shape (0, or 90 for `agents`). 100 = every request "
+                         "identical, which is the pre-4ffa97a behaviour and "
+                         "INFLATES n-gram speculation (see CHANGELOG)")
     ap.add_argument("--parallel", type=int, default=None,
                     help="concurrent request streams for the server driver "
                          "(default: from profile)")
