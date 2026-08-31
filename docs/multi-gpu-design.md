@@ -67,10 +67,16 @@ Three things that data settles:
 - A VRAM-proportional starting split is roughly **2:1** (24117 : 11909), which
   is a long way from the even split llama.cpp picks by default. There is real
   headroom here, which is what makes the sweep worth running.
-- **`free` differs sharply from total** (6672 free of 24117 on CUDA0, because a
-  display or another workload holds the rest). Level generation must use *free*,
-  not total, or the proportional split will be derived from capacity the run
-  cannot actually have. Add to the checklist.
+- **`free` here was a snapshot, not the resting state.** The 6672-of-24117 line
+  on CUDA0 read like a display or another workload permanently holding two
+  thirds of the card, and an earlier draft of this file concluded from it that
+  level generation must use *free* rather than total. The reporter has since
+  [corrected that](https://github.com/bigattichouse/llama-optimize/issues/5#issuecomment-5471917817):
+  a model was loaded when they captured it, and at rest roughly 1 GiB is used per
+  card. So `ts_levels()` derives from **total**, which is the stable property of
+  the hardware; free VRAM stays what `headroom_warning` made it — a warning about
+  the instant the sweep starts, not an input to the design. Worth keeping as a
+  reminder that a single reading of a device list describes a moment, not a box.
 
 It also demonstrates the ordering hazard concretely: the 3090 is the larger and
 faster card, so getting the order backwards would hand two thirds of the model to
@@ -130,6 +136,17 @@ will repeat the mis-scoping bug in a new form: right total, wrong distribution.
 This is the part to design carefully; a wrong verdict here silently deletes
 configurations.
 
+The single-pool assumption is not hypothetical — it is in the code today.
+`parse_fit_print` sums llama-fit-params' per-device lines into one scalar, and
+`predict_fits` compares that scalar against summed total VRAM. For "does a 35B
+fit across 36 GiB" that is the right question and it answers it correctly. For
+issue #5's 24 GiB + 12 GiB pair it is the wrong one: a config can clear the
+summed total and still overflow the 3060. The per-device breakdown needed to fix
+it is already in the text being parsed and is discarded a line before it would be
+useful, so the fix is a change of return type rather than of source — but every
+caller then has to say *which* device it is asking about, which is why this is
+the risky checklist item and not a small one.
+
 ## Invariants
 
 - **M1 — No inert columns.** `-ts` is emitted only in rows whose `-sm` splits,
@@ -179,12 +196,15 @@ same shape that took ngram from 9 knobs to 3 collapsed ones and L125 back to L25
       asks llama.cpp first and falls back to smi, which satisfies **M0** for
       capacity. Ordering is carried but nothing consumes it yet.
 - [ ] Per-device capacities recorded in `hw` (parsing already returns them)
-- [ ] `ts_levels()` derives from **free** VRAM, not total — issue #5's CUDA0
-      reports 6672 MiB free of 24117
+- [ ] `ts_levels()` derives from per-device **total** VRAM; free VRAM is a
+      start-of-run warning only (see the correction above)
 - [ ] `M2` guard: placement factors only when >1 device is detected
 - [ ] `-sm` registry entry (gate) + `-ts`/`-mg` with `active_when`
 - [ ] `ts_levels()` generator + normalisation/dedup, with tests
 - [ ] `validate_factor_registry` coverage for M1
+- [ ] `parse_fit_print` returns per-device figures instead of a sum, and
+      `predict_fits` compares each against that device's capacity — prerequisite
+      for `-ts`, since a split changes the distribution and not the total
 - [ ] OOM pruner made split-aware (N2/M4) — the risky one
 - [ ] Report: show the chosen split and per-device footprint
 - [ ] Validate end-to-end on a real two-GPU box (we do not have one — issue #5's
