@@ -97,7 +97,26 @@ knobs plus `draft-simple`/`draft-dflash`/`draft-dspark`. Prerequisite:
 `predict_fits` must account for two resident models — which is step 4, so these
 are naturally sequential.
 
-### 7. Multi-GPU — *blocked on hardware we do not have*
+### 7. `ngl` levels that know about VRAM — *no hardware needed*
+
+[Issue #14](https://github.com/bigattichouse/llama-optimize/issues/14).
+`ngl_levels()` spans 0 → n_layers evenly and never consults VRAM, so a 40-layer
+model that fits entirely on the GPU still gets `[0, 10, 20, 30, 40]` and spends
+four of five levels below the answer. Since `choose_array` sizes on the widest
+factor, that is not one wasted column but a share of the whole sweep — which
+makes this a sweep-cost item ([`sweep-cost-design.md`](sweep-cost-design.md)) as
+much as a correctness one, and the cheapest remaining one.
+
+Placed here because it needs no GPU: level generation is a pure function and its
+tests are `--selftest` material. The care is in the fit test, not the grid — it
+has to be taken at the deepest context in the sweep, and it should keep the even
+span whenever it cannot be confident, since a wrongly optimistic verdict deletes
+exactly the partial-offload rows that would have rescued a run.
+
+Found by chasing issue #5's "35B kept getting offloaded" past two VRAM bugs that
+turned out not to explain it.
+
+### 8. Multi-GPU — *blocked on hardware we do not have*
 
 [`multi-gpu-design.md`](multi-gpu-design.md). Tiers 1 and 2 of its test plan
 (parser tests, single-NVIDIA validation) are doable; tier 3 — the split itself —
@@ -116,8 +135,8 @@ needs two non-identical GPUs and by construction cannot be tested here.
 ## What this plan assumes
 
 That the GPU is shared and frequently busy, so anything needing it is scheduled
-opportunistically rather than depended on. Everything in steps 2–6 is
-reachable with `--selftest` and plan-only runs; only steps 1 and 7 genuinely
+opportunistically rather than depended on. Everything in steps 2–7 is
+reachable with `--selftest` and plan-only runs; only steps 1 and 8 genuinely
 require hardware.
 
 ## After 0.2.0 — what actually shapes the order now
