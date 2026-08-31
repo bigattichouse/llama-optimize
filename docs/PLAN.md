@@ -116,6 +116,14 @@ exactly the partial-offload rows that would have rescued a run.
 Found by chasing issue #5's "35B kept getting offloaded" past two VRAM bugs that
 turned out not to explain it.
 
+**This placement is by cost, and cost is not the only argument.** It sits ahead
+of step 8 because it is cheap and needs no hardware. Against that: it unblocks
+nobody. The reporter on issue #5 has the only two-GPU box this project can reach,
+and what they are waiting on is `-sm`/`-ts` — so a session optimising for *the
+thing only they can test* should take step 8's per-device prerequisite first and
+leave this. Both readings are defensible; take the order deliberately rather than
+by inheritance.
+
 ### 8. Multi-GPU — *blocked on hardware we do not have*
 
 [`multi-gpu-design.md`](multi-gpu-design.md). Tiers 1 and 2 of its test plan

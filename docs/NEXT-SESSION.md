@@ -125,6 +125,28 @@ The transferable part: a device list is a reading of a moment, and the design
 treated it as a property of a machine. Anything derived from `free` inherits
 that, which is why free warns and total decides.
 
+### 4. Issue #14 — `ngl` levels that know about VRAM
+
+Step 7 in [`PLAN.md`](PLAN.md), which carries the reasoning. The complement of
+the OOM pruner: that deletes rows above the fit, this stops spending the grid far
+below it. Needs no GPU — level generation is a pure function and its tests are
+`--selftest` material.
+
+Two things to get right. What decides "fits" when there is no `llama-fit-params`
+binary: only a crude file-size estimate exists, and biasing on one that errs
+optimistic drops exactly the partial-offload rows a run would need, so it should
+keep the even span unless it can be confident. And the fit test has to be taken
+at the *deepest* context in the sweep, not depth 0, or the grid is optimistic
+precisely where OOM is likeliest.
+
+**The ordering here is contested, deliberately left open.** `PLAN.md` sequences
+this ahead of multi-GPU on cost: it is cheap, needs no hardware, and helps every
+user. The argument against is that it unblocks nobody — issue #5's reporter has
+the only two-GPU box available to this project, and what they are waiting on is
+`-sm`/`-ts`, whose prerequisite is the per-device `parse_fit_print` work in
+step 8. Cheapest-first and unblock-the-tester-first genuinely disagree, and the
+next session should pick knowingly rather than inherit the order by default.
+
 ## Then
 
 - **Draft-model staging (F2 continued).** The staged screen from
@@ -140,11 +162,6 @@ that, which is why free warns and total decides.
   decision rather than an oversight ([`flag-coverage.md`](flag-coverage.md)).
   The *validity* half is done: `--mmproj` is an input and its footprint is
   priced (issue #13).
-- **Issue #14 — bias `ngl` levels toward the top when the model provably fits.**
-  The complement of the OOM pruner: that one deletes rows above the fit, this
-  stops spending the grid far below it. Open questions are what decides "fits"
-  without a `llama-fit-params` binary, and that the fit test has to be taken at
-  the *deepest* context in the sweep rather than depth 0.
 - **Report time saved by the floors.** Nothing says, after a sweep, how much
   `--min-tgs` actually bought. That number is the honest way to tune the advice.
 - **Issue #3** — fix shipped and retroactive; the upstream cause is still
