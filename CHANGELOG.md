@@ -23,7 +23,48 @@ earlier.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The wall-clock validity check (I5) rejected honest deep-context runs.**
+  Reported as [issue #11]. A server's self-reported `tg` covers decode alone, but
+  the check bounded it by the whole request's elapsed time — sound only while the
+  request *is* decode. It stopped being that when workload profiles gained a
+  shared-prefix fraction: below `--prefix-reuse 100` every rep sends a different
+  prompt and re-prefills its differing suffix inside the request being timed. On
+  the reporter's box that was 17.6s of a 23.5s request, so an honest 43.1 t/s was
+  discarded as "4× faster than the wall clock permits". Deep context makes both
+  terms worse at once — the prompt to re-prefill grows while the generation stays
+  at `n_gen` — so the profiles that hurt most are exactly the ones aimed at long
+  contexts.
+
+  The prefill is now subtracted before the ceiling is formed, from the same
+  response's `timings.prompt_ms`, falling back to `(1 − reuse) × prompt_len / pp`
+  priced off the warm request for servers that do not report it. The credit is
+  capped at 90% of the wall: it comes from the same clock this check exists to
+  distrust, and uncapped, a response claiming it spent the entire request on
+  prefill would switch the check off against precisely the fault it was written
+  for. Capped, a broken server can loosen its own ceiling by at most 10×, against
+  a defect ([issue #3]) that overshot by ~1500×.
+
 ### Added
+
+- **A rejected row now carries the evidence for its own appeal.** [Issue #11]
+  took five round trips with a reporter because I5 zeroes `pp_tps` and `tg_tps`
+  on the row it discards, wrote the reason only to the console, and never
+  recorded what the server said about the request. So: `implausible` is a
+  results-CSV column, its text carries the breakdown (tokens, wall, credited
+  prefill) and the measured `pp`; `--report-only` prints discards as well as the
+  live sweep, since it is the one command a reporter can run with no GPU and no
+  llama.cpp build.
+
+- **`cache_hit` column: the prefix reuse the server actually delivered.** `reuse`
+  records only what the prompt battery asked for. llama.cpp matches on tokens and
+  can decline to reuse a prefix the client believes it shares — a context too
+  small to hold prompt plus generation, a slot reset, an eviction — and when it
+  does, a rep the tool believes is pure decode pays a full prefill instead.
+  Nothing in the row could tell those apart. A large gap between requested and
+  delivered is now warned about rather than rejected: the numbers are real, they
+  just measure a colder workload than the one being tuned for.
 
 - **`concurrency` factor, and `kv_unified` recorded per row.** llama.cpp couples
   slot count and the unified KV cache, so they cannot ride an orthogonal array as
@@ -222,6 +263,19 @@ earlier.
 ## [0.2.0] — 2026-08-26
 
 ### ⚠️ Affects existing results
+
+- **Server-driver rows discarded as `IMPLAUSIBLE` may have been honest.** The
+  wall-clock check rejected real measurements wherever prefill was a large share
+  of the request — which, since profiles gained a shared-prefix fraction, is any
+  single-stream server run at `--prefix-reuse` below 100 with a deep `n_depth`.
+  Rejected rows score as 0, so a sweep did not merely lose them: it ranked the
+  configs that tripped the check *below* configs that were genuinely slower.
+
+  **Re-run any single-stream `--driver server` sweep that reported IMPLAUSIBLE
+  rows at depth.** Rows that came back `OK` are unaffected — this check only ever
+  removed measurements, never altered one. Concurrency runs (`--parallel > 1`)
+  are unaffected: that path computes its rates from our own wall clock and never
+  ran the check. Bench-driver sweeps never ran it either.
 
 - **ngram sweep results are upper bounds, not estimates.** llama.cpp's n-gram
   speculation keeps state *across requests*, and the sweep sends one identical
@@ -430,3 +484,5 @@ crash journal, `--resume`, `--iterate`, `--diff`, and a GPU-free `--selftest`.
   ordered pairs are now derived so the inverted assignment cannot be constructed.
 
 [issue #8]: https://github.com/bigattichouse/llama-optimize/issues/8
+[issue #3]: https://github.com/bigattichouse/llama-optimize/issues/3
+[issue #11]: https://github.com/bigattichouse/llama-optimize/issues/11

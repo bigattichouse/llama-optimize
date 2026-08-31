@@ -3175,29 +3175,104 @@ def _realistic_prompt(n_tokens: int) -> str:
     return _fill(max(1, n_tokens) * CHARS_PER_TOKEN, random.Random(0))
 
 
-# Slack on the wall-clock bound (I5). Wall time covers HTTP round trip and any
-# prefill the cache did not spare, so it always exceeds pure decode — the bound
-# is already generous in the server's favour and this only absorbs clock
-# granularity on very short requests. Rejecting a real measurement is the worse
+# Slack on the wall-clock bound (I5). What is left of the wall after prefill is
+# credited is still not pure decode: it carries the HTTP round trip, the JSON
+# transfer, and server-side tokenization — which for a 160 KB prompt is not free,
+# and which `prompt_ms` does not cover, since llama.cpp starts that clock AFTER
+# tokenizing (server-context.cpp). Rejecting a real measurement is the worse
 # error (P3), so the margin is deliberately loose: the defect it exists to catch
 # overshoots by four orders of magnitude, not by tens of percent.
 WALL_CLOCK_MARGIN = 2.0
 
+# The most of a request's wall clock that may be credited to prefill. The credit
+# comes from the server's own `timings.prompt_ms` — the same clock I5 exists to
+# distrust — so it is capped rather than trusted: a server whose counters are
+# broken can loosen its own ceiling by at most 10x, and issue #3's 1e6 t/s row
+# overshot by ~1500x. Uncapped, a response claiming `prompt_ms == wall` drives
+# the denominator to zero and switches the check off against exactly the fault it
+# was written for.
+WALL_PREFILL_CREDIT_MAX = 0.9
 
-def exceeds_wall_clock(tg: float, ceilings: list[float]) -> str | None:
+
+def decode_wall(wall: float, prefill_s: float) -> float:
+    """The part of a request's elapsed time that could have been decode.
+
+    Bounding a decode-only rate by a whole-request wall only holds while the
+    request IS decode. It stopped being that when profiles gained a shared-prefix
+    fraction (`4ffa97a`): at reuse < 1.0 — and whenever the prompt cache misses
+    for any other reason — every rep re-prefills inside the request I5 is timing,
+    and the prefill can be the larger part of it (issue #11: 17.6s of a 23.5s
+    request, which read as "4x faster than the wall clock permits")."""
+    if wall <= 0:
+        return 0.0
+    return wall - min(max(prefill_s, 0.0), WALL_PREFILL_CREDIT_MAX * wall)
+
+
+@dataclass(frozen=True)
+class RepClock:
+    """One rep's clocks: what we timed from outside, and how much of it the
+    server says it spent on prefill rather than decode."""
+    n_dec: int
+    wall: float
+    prefill_s: float = 0.0
+
+    @property
+    def ceiling(self) -> float:
+        """The fastest decode rate this rep's elapsed time can support."""
+        d = decode_wall(self.wall, self.prefill_s)
+        return self.n_dec / d if d > 0 else 0.0
+
+
+def exceeds_wall_clock(tg: float, reps: list) -> str | None:
     """Why the server's self-reported rate is impossible, or None.
 
     Compares a server-reported tg against what its own request duration allows.
     Independent of any hardware assumption: it asks only whether the tokens
     could have been produced in the time the request actually took."""
-    if tg <= 0 or not ceilings:
+    usable = [r for r in reps if r.n_dec > 0 and r.ceiling > 0]
+    if tg <= 0 or not usable:
         return None
-    ceiling = max(ceilings)                    # kindest rep to the server
-    if tg > ceiling * WALL_CLOCK_MARGIN:
-        return (f"server reported tg={tg:.1f} t/s, but the request's own "
-                f"duration allows at most {ceiling:.1f} t/s "
-                f"({tg / ceiling:.0f}x faster than the wall clock permits)")
-    return None
+    best = max(usable, key=lambda r: r.ceiling)   # kindest rep to the server
+    if tg <= best.ceiling * WALL_CLOCK_MARGIN:
+        return None
+    # The breakdown travels with the verdict. A rejected row is zeroed, so the
+    # reason line is the only surviving evidence of what was measured — and
+    # issue #11 took five round trips because it did not say which term was
+    # large (docs/measurement-validity.md).
+    credited = min(max(best.prefill_s, 0.0), WALL_PREFILL_CREDIT_MAX * best.wall)
+    spent = (f"{best.wall:.1f}s wall − {credited:.1f}s prefill"
+             if credited > 0 else f"{best.wall:.1f}s wall")
+    return (f"server reported tg={tg:.1f} t/s, but the request's own "
+            f"duration allows at most {best.ceiling:.1f} t/s "
+            f"({tg / best.ceiling:.0f}x faster than the wall clock permits; "
+            f"{best.n_dec} tokens in {spent})")
+
+
+def delivered_cache_hit(timings: list) -> float | None:
+    """Fraction of prompt tokens the server actually served from its cache.
+
+    The DELIVERED counterpart to `reuse`, which records only what the battery
+    ASKED for. llama.cpp matches on tokens and can decline to reuse a prefix the
+    client believes it shares — a context that will not hold prompt plus
+    generation, a slot reset, an eviction — and when it does, a rep the tool
+    believes is pure decode pays a full prefill instead. Nothing in the row could
+    tell those apart, which is most of why issue #11 stayed open.
+
+    `prompt_n` is the tokens llama.cpp ran through the model and `cache_n` the
+    ones it skipped, so the two sum to the prompt. None when the server reports
+    no `cache_n` at all — an unknown, not a zero."""
+    reused = processed = 0
+    seen = False
+    for t in timings:
+        if "cache_n" not in t:
+            continue
+        seen = True
+        reused += int(t.get("cache_n") or 0)
+        processed += int(t.get("prompt_n") or 0)
+    if not seen:
+        return None
+    total = reused + processed
+    return round(reused / total, 4) if total else 0.0
 
 
 def raise_for_server_error(body):
@@ -3357,6 +3432,10 @@ class ServerSession:
     (only the request — prompt length via n_depth — varies). Launch once, issue
     many measurements, close once."""
 
+    # class-level so it survives sessions constructed without __init__, and so
+    # the cache-miss warning is said once rather than once per config
+    _cache_warned = False
+
     def __init__(self, cfg: Config, launch_f: dict, n_ctx: int, timeout: int):
         self.cfg = cfg
         self.ok = False
@@ -3432,7 +3511,16 @@ class ServerSession:
                             or getattr(self, "cpt", None))
             except (urllib.error.URLError, OSError, json.JSONDecodeError):
                 pp, n_err = 0.0, n_err + 1
-            tps, ceilings, timings = [], [], []
+            tps, clocks, timings = [], [], []
+            # Prefill the rep cannot avoid, priced client-side, for servers that
+            # report no `prompt_ms`. Deliberately a LOWER bound on the credit:
+            # `pp` is measured on the warm request's uncontended full prefill, so
+            # this under-credits rather than over-credits and the ceiling stays
+            # tighter than the truth. That direction costs some P3 headroom, but
+            # it cannot weaken P1 — an estimate that can only under-credit can
+            # never talk the check out of a rejection it should make.
+            prefill_est = ((1.0 - self.last_reuse) * prompt_len / pp
+                             if pp > 0 else 0.0)
             # A prefill floor is answerable the moment the warm request returns,
             # before any decode rep is paid for — the cheapest possible exit.
             _min_pps = float(getattr(self.cfg, "min_pps", 0.0) or 0.0)
@@ -3460,20 +3548,31 @@ class ServerSession:
                 # (server_slot stats, `n_gen_tps()`); when that counter is wrong nothing
                 # inside the response can reveal it. Our wall time is the one
                 # number the server does not supply, and the request cannot have
-                # produced tokens faster than it elapsed — so predicted_n / wall
-                # is a hard upper bound on any rate it may claim.
+                # produced tokens faster than it elapsed — so predicted_n over the
+                # DECODE part of that wall is a hard upper bound on any rate it
+                # may claim. Only the decode part: the rest of the request is
+                # prefill, which the server did not claim that rate for and which
+                # at reuse < 1.0 is most of the wall (issue #11).
                 n_dec = t.get("predicted_n", 0) or 0
                 if wall > 0 and n_dec > 0:
-                    ceilings.append(n_dec / wall)
+                    try:
+                        reported = float(t.get("prompt_ms") or 0.0)
+                    except (TypeError, ValueError):
+                        reported = 0.0     # unparseable is not a credit
+                    prefill = reported / 1000.0 if reported > 0 else prefill_est
+                    clocks.append(RepClock(n_dec, wall, prefill))
             tg = sum(tps) / len(tps) if tps else 0.0
             # the warm request is excluded from `tps` (it primes the cache and is
             # not a measured rep) but IS counted in err_rate: a config that
             # cannot serve the first request has failed a request.
+            hit = delivered_cache_hit(timings)
+            self._warn_cache_miss(hit)
             return {"pp": pp, "tg": tg,
-                    "problem": exceeds_wall_clock(tg, ceilings),
+                    "problem": exceeds_wall_clock(tg, clocks),
                     "draft": _draft_totals(timings),
                     "err_rate": n_err / (max(1, reps) + 1),
-                    "reuse": self.last_reuse}
+                    "reuse": self.last_reuse,
+                    "cache_hit": hit}
         # Concurrency: realistic serving — every request prefills; aggregate over
         # the streams. Warmup once, then average per-round throughput over reps.
         # These rates are computed from our own wall clock already, so they
@@ -3504,7 +3603,27 @@ class ServerSession:
         return {"pp": sum(pps) / len(pps), "tg": sum(tps) / len(tps),
                 "problem": None, "draft": _draft_totals(timings),
                 "err_rate": n_err / n_sent if n_sent else 0.0,
-                "reuse": self.last_reuse}
+                "reuse": self.last_reuse,
+                "cache_hit": delivered_cache_hit(timings)}
+
+    def _warn_cache_miss(self, hit):
+        """Say so once when the server delivers far less prefix reuse than the
+        battery asked for.
+
+        Not an IMPLAUSIBLE: the numbers are real, they just answer a different
+        question than the requested shape. A run whose reps were meant to be
+        cache hits and were not measured a colder workload than the one being
+        tuned for, and every derived `secs` and time budget is off with it."""
+        want = float(getattr(self.cfg, "prefix_reuse", 1.0) or 0.0)
+        if hit is None or want < 0.5 or hit >= want / 2 or self._cache_warned:
+            return
+        self._cache_warned = True
+        print(f"\n!! prompt cache delivered {hit * 100:.0f}% reuse where the "
+              f"workload asked for {want * 100:.0f}%.")
+        print("!! Reps are re-prefilling instead of decoding off a cache hit, so")
+        print("!! this measures a colder workload than the one being tuned for.")
+        print("!! Usual cause: the context cannot hold prompt + generation, so")
+        print("!! the slot is reset between requests. Try a smaller --n-depth.\n")
 
     def close(self):
         if self.proc and self.proc.poll() is None:
@@ -3593,6 +3712,9 @@ def measure_in_session(cfg: Config, f: dict, session, timeout: int) -> dict:
            "err_rate": round(err_rate, 4),
            # what the battery ACTUALLY shared, not what was asked for (F6)
            "reuse": m.get("reuse", ""),
+           # and what the SERVER actually reused of it, which is a different
+           # number and the one that decides whether a rep was decode (#11)
+           "cache_hit": "" if m.get("cache_hit") is None else m["cache_hit"],
            # derivable from the emitted flags, so recorded rather than left to
            # be re-derived by whoever reads the CSV later (KV2)
            "kv_unified": 1 if kv_unified_for(cfg, f) else 0,
@@ -3600,7 +3722,12 @@ def measure_in_session(cfg: Config, f: dict, session, timeout: int) -> dict:
     if status == "OK":                     # speculative telemetry (F1) — a
         res.update(draft_cols(cfg, f, m.get("draft", {})))  # never sets status
     if status == "OK" and m.get("problem"):   # the wall-clock cross-check (I5)
-        res.update(status="IMPLAUSIBLE", implausible=m["problem"],
+        # The numbers are zeroed because they cannot be true, but the reason
+        # keeps a record of what was rejected. A false reject is otherwise
+        # unreviewable from the CSV alone — the evidence for its own appeal is
+        # exactly what the rejection destroys (issue #11).
+        res.update(status="IMPLAUSIBLE",
+                   implausible=f"{m['problem']}; measured pp={pp:.1f} t/s",
                    pp_tps=0.0, tg_tps=0.0)
     # Below a floor the user set. A real measurement they have said they do not
     # want, so it keeps its numbers and is merely not OK — unlike IMPLAUSIBLE,
@@ -3810,6 +3937,21 @@ def ttft_note(r: dict, ctx: int) -> str | None:
     return note
 
 
+def show_discards(rows: list[dict]) -> None:
+    """Say which rows were thrown away and why, wherever a report is printed.
+
+    The sweep says it as each row is rejected (P4: never discard quietly), but a
+    report rebuilt from a CSV said nothing at all — so the one command a reporter
+    can run without a GPU could not answer the one question a false reject
+    raises. It can now: the reason travels in the row (issue #11)."""
+    gone = [r for r in rows if r.get("implausible")]
+    if not gone:
+        return
+    print(f"\n### DISCARDED as impossible ({len(gone)} of {len(rows)})")
+    for r in gone:
+        print(f"  run {r.get('run_id', '?')}: {r['implausible']}")
+
+
 def report(cfg: Config, rows: list[dict], probe: dict | None = None):
     ok = [r for r in rows if r["status"] == "OK"]
     print("\n" + "=" * 70)
@@ -3820,6 +3962,7 @@ def report(cfg: Config, rows: list[dict], probe: dict | None = None):
         for r in rows:
             bad[r["status"]] = bad.get(r["status"], 0) + 1
         print("No successful runs. Status breakdown:", bad)
+        show_discards(rows)
         return
 
     if cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0:
@@ -3893,6 +4036,8 @@ def report(cfg: Config, rows: list[dict], probe: dict | None = None):
         print(f"  depth={int(r['n_depth']):>6}  {cfg.score}={score_of(r):6.1f} t/s  "
               f"{raw}ngl={r['ngl']:>3}  "
               f"kv={r['kv_type']:>4}  ub={r['ubatch']:>4}")
+
+    show_discards(rows)
 
 
 def factor_level_means(rows: list[dict], factor: str) -> dict:
@@ -5803,18 +5948,64 @@ def selftest() -> bool:
         # I5, the causal check: a request cannot have produced tokens faster
         # than its own wall clock allows. 128 tokens over a 5s request permits
         # ~26 t/s no matter what the server's internal counter says.
-        assert exceeds_wall_clock(1_000_000.0, [128 / 5.0])
-        assert "wall clock" in exceeds_wall_clock(1_000_000.0, [128 / 5.0])
+        _rc = RepClock
+        assert exceeds_wall_clock(1_000_000.0, [_rc(128, 5.0)])
+        assert "wall clock" in exceeds_wall_clock(1_000_000.0, [_rc(128, 5.0)])
         # honest measurements survive, including a rate slightly above the
-        # bound (wall time includes HTTP + prefill, so it always understates
-        # pure decode a little)
-        assert exceeds_wall_clock(25.0, [128 / 5.0]) is None
-        assert exceeds_wall_clock(30.0, [128 / 5.0]) is None      # inside margin
+        # bound (wall time includes HTTP + tokenization, so it always
+        # understates pure decode a little)
+        assert exceeds_wall_clock(25.0, [_rc(128, 5.0)]) is None
+        assert exceeds_wall_clock(30.0, [_rc(128, 5.0)]) is None   # inside margin
         # the kindest rep decides, so one slow round trip cannot condemn a run
-        assert exceeds_wall_clock(50.0, [128 / 60.0, 128 / 2.4]) is None
+        assert exceeds_wall_clock(50.0, [_rc(128, 60.0), _rc(128, 2.4)]) is None
         # nothing to compare against -> no verdict (never invent a rejection)
         assert exceeds_wall_clock(1_000_000.0, []) is None
-        assert exceeds_wall_clock(0.0, [26.0]) is None
+        assert exceeds_wall_clock(0.0, [_rc(128, 5.0)]) is None
+
+        # ...and the wall it is bounded by is the DECODE part of the request.
+        # Issue #11's row, to its own arithmetic: a 23.5s request that spent
+        # 17.6s re-prefilling 33,280 tokens and 5.9s generating 256. Against the
+        # whole request that reads as 10.9 t/s and rejects an honest 43.1;
+        # against the decode it actually claims, it passes.
+        _agents = [_rc(256, 23.5, 17.6)]
+        assert exceeds_wall_clock(43.1, [_rc(256, 23.5)]) is not None   # the bug
+        assert exceeds_wall_clock(43.1, _agents) is None               # the fix
+        # and the fix does not cost the check its teeth: issue #3's row still
+        # goes, prefill credit or no prefill credit
+        assert exceeds_wall_clock(1_000_000.0, _agents) is not None
+        # the credit is capped, so a server claiming it spent the ENTIRE request
+        # on prefill cannot switch off the check that distrusts it. 10x of
+        # slack, against a defect that overshoots by ~1500x.
+        _liar = [_rc(256, 23.5, 23.5)]
+        assert abs(decode_wall(23.5, 23.5) - 23.5 * 0.1) < 1e-9
+        assert exceeds_wall_clock(1_000_000.0, _liar) is not None
+        assert exceeds_wall_clock(23.5, _liar) is None
+        # a negative or absurd prompt_ms cannot tighten the bound either
+        assert decode_wall(5.0, -100.0) == 5.0
+        assert decode_wall(0.0, 1.0) == 0.0
+
+        # delivered cache hit: what the server reused, not what we asked for
+        assert delivered_cache_hit([{"cache_n": 7373, "prompt_n": 819}]) == 0.9
+        assert delivered_cache_hit([{"cache_n": 0, "prompt_n": 8192}]) == 0.0
+        # a server that does not report it leaves an unknown, never a zero --
+        # "no cache_n" and "cache never hit" are different facts
+        assert delivered_cache_hit([{"prompt_n": 8192}]) is None
+        assert delivered_cache_hit([]) is None
+
+        # a discarded row says so wherever a report is printed, not only in the
+        # live sweep. --report-only is the one command a reporter can run
+        # without a GPU, and it used to answer "why was this rejected" with
+        # silence.
+        _buf = io.StringIO()
+        with contextlib.redirect_stdout(_buf):
+            show_discards([{"run_id": 1, "implausible": "because reasons"},
+                           {"run_id": 2}])
+        assert "DISCARDED as impossible (1 of 2)" in _buf.getvalue()
+        assert "run 1: because reasons" in _buf.getvalue()
+        _quiet = io.StringIO()
+        with contextlib.redirect_stdout(_quiet):
+            show_discards([{"run_id": 1}])       # nothing thrown away, no noise
+        assert _quiet.getvalue() == ""
 
         # I1: decode cannot outrun prefill. The reporter's exact row.
         assert implausible_reason(444.1, 1_000_000.0) is not None
@@ -5923,15 +6114,19 @@ def selftest() -> bool:
             def _recording(port, prompt, n_gen, timeout, cache=False):
                 seen.append(prompt)
                 time.sleep(0.02)
+                # the warm request prefills the lot; the reps hit the cache for
+                # all but their differing suffix. Split that way rather than
+                # flat, because `prompt_n` and `cache_n` sum to the prompt and a
+                # fake where they do not cannot exercise the hit ratio at all
+                # (server-common.cpp server_slot_stats::to_json)
+                warm = len(seen) == 1
                 return {"content": "x",
                         "timings": {"prompt_per_second": 444.1,
                                     "predicted_per_second": 600.0,
-                                    "predicted_n": 128, "prompt_n": 8192,
-                                    # llama.cpp reports these too; the fix for
-                                    # #11 will need them and the fake was
-                                    # silently omitting both (server-common.cpp
-                                    # server_slot_stats::to_json)
-                                    "prompt_ms": 18000.0, "cache_n": 7372}}
+                                    "predicted_n": 128,
+                                    "prompt_n": 8192 if warm else 819,
+                                    "prompt_ms": 18000.0 if warm else 1800.0,
+                                    "cache_n": 0 if warm else 7373}}
 
             sess.cfg = SimpleNamespace(prefix_reuse=0.9)      # the agents shape
             globals()["_completion"] = _recording
@@ -5940,6 +6135,76 @@ def selftest() -> bool:
             assert seen[0] != seen[1], "reps re-use the warm prompt"
             assert 0.85 <= achieved_reuse(seen) <= 0.95, achieved_reuse(seen)
             assert 0.85 <= float(r_shape["reuse"]) <= 0.95, r_shape
+            # the server's delivered reuse rides along with the requested one
+            assert r_shape["cache_hit"] == 0.9, r_shape
+
+            # --- and the bound is right for that shape (issue #11) ---
+            # A request that is mostly prefill: 0.35s on the wall, 0.30s of it
+            # spent re-prefilling by the server's own account, 128 tokens
+            # generated in the rest. Against the WHOLE request that permits
+            # ~366 t/s and an honest 1500 reads as impossible; against the
+            # decode it is actually a claim about, it is fine.
+            def _prefill_heavy(per_second, prompt_ms=300.0, pps=444.1):
+                def f(port, prompt, n_gen, timeout, cache=False):
+                    time.sleep(0.35)
+                    t = {"prompt_per_second": pps,
+                         "predicted_per_second": per_second,
+                         "predicted_n": 128, "prompt_n": 8192, "cache_n": 0}
+                    if prompt_ms is not None:
+                        t["prompt_ms"] = prompt_ms
+                    return {"content": "x", "timings": t}
+                return f
+
+            # reuse 0.0 — the reporter's own no-profile run, where every rep is
+            # MEANT to re-prefill and the cache hit of 0 is correct, not a fault
+            sess.cfg = SimpleNamespace(prefix_reuse=0.0)
+            globals()["_completion"] = _prefill_heavy(1500.0)
+            r_pre = measure_in_session(fake_cfg, {"n_depth": "8192"}, sess, 30)
+            assert r_pre["status"] == "OK", r_pre      # was IMPLAUSIBLE (#11)
+            assert r_pre["tg_tps"] == 1500.0, r_pre
+            assert r_pre["cache_hit"] == 0.0, r_pre   # nothing was reused
+
+            # crediting prefill must not buy the server an escape: issue #3's
+            # row is still impossible against the decode window
+            globals()["_completion"] = _prefill_heavy(1_000_000.0)
+            r_liar = measure_in_session(fake_cfg, {"n_depth": "8192"}, sess, 30)
+            assert r_liar["status"] == "IMPLAUSIBLE", r_liar
+            # the reason carries the breakdown AND what was measured, because
+            # the rejection zeroes the only other record of it
+            assert "prefill" in r_liar["implausible"], r_liar
+            assert "measured pp=" in r_liar["implausible"], r_liar
+
+            # a server too old to report prompt_ms falls back to pricing the
+            # prefill client-side, off the warm request's own pp. Same shape,
+            # same verdict — 8192 tokens at 27306 t/s is the same 0.30s.
+            globals()["_completion"] = _prefill_heavy(1500.0, prompt_ms=None,
+                                                      pps=27306.0)
+            r_old = measure_in_session(fake_cfg, {"n_depth": "8192"}, sess, 30)
+            assert r_old["status"] == "OK", r_old
+            globals()["_completion"] = _prefill_heavy(1_000_000.0, prompt_ms=None,
+                                                      pps=27306.0)
+            assert measure_in_session(fake_cfg, {"n_depth": "8192"},
+                                      sess, 30)["status"] == "IMPLAUSIBLE"
+
+            # The warning, which is the other half of the fix: a rep that was
+            # supposed to decode off a cache hit and instead re-prefilled is a
+            # real measurement of the WRONG workload, so it is said out loud
+            # rather than rejected. Gated on the requested shape — reuse 0.0
+            # above expects a 0% hit and must stay quiet.
+            def _said(want, hit):
+                s = ServerSession.__new__(ServerSession)
+                s.cfg = SimpleNamespace(prefix_reuse=want)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    s._warn_cache_miss(hit)
+                    s._warn_cache_miss(hit)      # said once, not once per config
+                return buf.getvalue()
+
+            assert "delivered 0% reuse" in _said(0.9, 0.0)
+            assert _said(0.9, 0.0).count("delivered") == 1
+            assert _said(0.0, 0.0) == ""          # asked for nothing, got nothing
+            assert _said(0.9, 0.88) == ""         # delivered what it asked for
+            assert _said(0.9, None) == ""         # server does not say -> silent
             sess.cfg = SimpleNamespace(prefix_reuse=1.0)      # restore
 
             # Same wiring for the speculative telemetry (F1): the counters must
@@ -6450,7 +6715,7 @@ def load_results_csv(path: Path, factors: dict) -> list[dict]:
 RESULT_COLS = {"run_id", "pp_tps", "tg_tps", "eff_tps", "status", "secs",
                "temp_c", "vram_mib", "implausible", "draft_acc", "spec_off",
                "tool_version", "llama_build", "backend", "err_rate", "reuse",
-               "draft_cov", "kv_unified", "too_slow"}
+               "draft_cov", "kv_unified", "too_slow", "cache_hit"}
 
 
 def merge_result_rows(cfg: Config, rows: list[dict],
@@ -7745,10 +8010,13 @@ def main():
             + (["draft_acc", "draft_cov", "spec_off"]
                if spec_cols_wanted(cfg) else [])
             + (["backend"] if cfg.driver == "bench"
-               else ["err_rate", "reuse", "kv_unified"])
+               else ["err_rate", "reuse", "cache_hit", "kv_unified"])
             # only when floors are in play, so ordinary sweeps keep their shape
             + (["too_slow"] if (cfg.min_tgs > 0 or cfg.min_pps > 0) else [])
-            + ["tool_version", "llama_build"])
+            # why a row was rejected, on the row. It costs one mostly-empty
+            # column and it is the difference between a bug report that can be
+            # decided on sight and one that takes five round trips (issue #11).
+            + ["implausible", "tool_version", "llama_build"])
 
     # Resume keys on run_id (unique per array row), not config values, because
     # orthogonal arrays can repeat a config across rows (intentional replication).

@@ -111,13 +111,60 @@ not supply — and a request cannot have produced tokens faster than it elapsed.
 So `predicted_n / wall_seconds` is a hard upper bound on any rate the server may
 claim, resting on no hardware assumption at all.
 
-Applied with a 2× margin, because wall time also covers the HTTP round trip and
-any prefill the cache did not spare, and therefore always overstates pure decode
-a little. The bound uses the *kindest* rep, so one slow round trip cannot
-condemn a run. The reporter's row exceeds it by ~1500×.
+**The wall must be the decode wall.** The bound is only sound while the request
+IS decode, and it stopped being that when profiles gained a shared-prefix
+fraction (`4ffa97a`): at `prefix_reuse < 1.0` every rep sends a *different*
+prompt and re-prefills its differing suffix inside the request being timed. A
+server-reported `tg` covers decode alone, so comparing it against a whole-request
+wall compares two different spans and rejects honest runs — issue #11, where
+17.6s of a 23.5s request was prefill and an honest 43.1 t/s read as "4× faster
+than the wall clock permits". Deep context makes it worse in both terms at once:
+the prompt to re-prefill grows while the generation stays at `n_gen`.
+
+So the prefill is subtracted before the ceiling is formed, from the same
+response's `timings.prompt_ms`, falling back to `(1 − reuse) × prompt_len / pp`
+priced off the warm request when the server does not report it.
+
+**Credit from the server, capped.** `prompt_ms` comes off the same clock I5
+exists to distrust, so it is not trusted — it is capped at 90% of the wall
+(`WALL_PREFILL_CREDIT_MAX`). A server with broken counters can loosen its own
+ceiling by at most 10×; issue #3's row overshot by ~1500×. Uncapped, a response
+claiming `prompt_ms == wall` drives the denominator to zero and switches the
+check off against precisely the fault it was written for. The client-side
+fallback needs no cap for P1 — it can only under-credit — but is capped by the
+same code path anyway.
+
+Applied with a 2× margin on top, because what is left after the credit is still
+not pure decode: it carries the HTTP round trip, the JSON transfer of a prompt
+that can be 160 KB, and server-side tokenization — which `prompt_ms` does not
+cover, since llama.cpp starts that clock *after* tokenizing. The bound uses the
+*kindest* rep, so one slow round trip cannot condemn a run.
 
 Only the single-stream path needs it: the concurrency path already computes its
 rates from our wall clock, so it cannot exceed it by construction.
+
+## A rejection must survive its own review
+
+I5 zeroes `pp_tps` and `tg_tps` on the row it rejects — correctly, since anything
+reading the numbers before checking status must not use them. But that destroys
+the only evidence for deciding whether the rejection was right, and the reason
+went to the console and nowhere else. Issue #11 took five round trips with a
+reporter for want of numbers that were in the response all along.
+
+Three things follow, and all three are now done:
+
+- The reason travels **in the row** (`implausible` is a results-CSV column), and
+  carries the breakdown — tokens, wall, credited prefill — plus the measured `pp`
+  the zeroing discards.
+- `--report-only` prints discards too, not just the live sweep. It is the one
+  command a reporter can run without a GPU or a llama.cpp build.
+- `cache_hit` records what the server **delivered**, next to `reuse`, which is
+  only what the battery **asked for**. llama.cpp matches on tokens and can
+  decline to reuse a prefix the client believes it shares; when it does, a rep
+  the tool believes is pure decode pays a full prefill instead, and nothing in
+  the row could tell those apart. A large gap between the two is warned about
+  rather than rejected: the measurement is real, it just answers a colder
+  workload than the one being tuned for.
 
 Alongside it, a completion carrying an `error` object is raised rather than
 returned. llama-server answers some failures with HTTP 200 and an error body,
