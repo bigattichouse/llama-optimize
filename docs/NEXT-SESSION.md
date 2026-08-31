@@ -6,8 +6,9 @@ remaining work in and why, see [`PLAN.md`](PLAN.md). Unlike the other files in
 up next, and should be pruned as items land. Durable reasoning belongs in the
 design docs it points at.
 
-Everything below is committed and pushed to `main` (through `ff045dc`), the
-working tree is clean, and `--selftest` passes.
+Everything below is committed to `main` (through `57ff8d7`) and pushed through
+`ff045dc` — the two doc commits after it are local only. The working tree is
+clean and `--selftest` passes.
 
 **No live sweep was run this session.** The GPU on the dev box is in use by
 another project — 174 MiB free of 32752 at last check — so every change is
@@ -92,15 +93,38 @@ no bound exists.
 Still open as a design question, not a bug: whether total-vs-free VRAM should
 become a blind condition in `fit_blind_flags` rather than a warning.
 
-### 3. Multi-GPU (issue #5) — the reporter's own numbers moved this
+### 3. Multi-GPU (issue #5) — the free-VRAM reading was a red herring
 
-`--list-devices` on their box: 6672 MiB free of 24117 on the 3090, 9837 of 11909
-on the 3060. **16.5 GB free against 36 GB total**, which likely explains their
-"35B kept getting offloaded" report better than the single-device VRAM bug did.
-Asked them to re-run and report the new `VRAM free` header line, since it changes
-what a multi-GPU split should be aiming at. `-sm`/`-ts` remain unimplemented;
-[`multi-gpu-design.md`](multi-gpu-design.md) is still the plan of record, and the
-device-order trap still needs their hardware.
+Last session read 6672 MiB free of 24117 on the reporter's 3090 and concluded
+that 16.5 GB free against 36 GB total probably explained their "35B kept getting
+offloaded" report. [They have since corrected
+it](https://github.com/bigattichouse/llama-optimize/issues/5#issuecomment-5471917817):
+a model was loaded when they captured that output, and the box idles at about
+1 GiB used per card. Free is ~35 of 36 GB, and `headroom_warning` will never fire
+there.
+
+The single-device VRAM bug does not explain it either. `cfg.hw["vram"]` has
+exactly one consumer — `predict_fits` — so if the pruner had been active *and*
+misreading capacity, their forced `ngl=99` would have been pruned to `SKIP_PRED`
+along with everything else. It ran. The low-`ngl` rows were simply the default
+grid: `ngl_levels()` spans 0 → n_layers evenly and never consults VRAM, so a
+40-layer model that fits gets `[0, 10, 20, 30, 40]` and spends four levels below
+the answer. Filed as **issue #14**.
+
+Two corrections landed in `57ff8d7`. `ts_levels()` is now specified against
+per-device **total** VRAM — the checklist said *free*, reasoned entirely from
+that one transient reading, which on their box would have derived the tensor
+split from a number that was true for a minute. And `parse_fit_print`'s
+single-pool sum is now written down as a `-ts` prerequisite rather than an
+abstraction inside N2: it sums per-device footprints and compares against summed
+total, so a config can clear 36 GB and still overflow the 3060.
+
+`-sm`/`-ts` remain unimplemented; [`multi-gpu-design.md`](multi-gpu-design.md) is
+still the plan of record, and the device-order trap still needs their hardware.
+
+The transferable part: a device list is a reading of a moment, and the design
+treated it as a property of a machine. Anything derived from `free` inherits
+that, which is why free warns and total decides.
 
 ## Then
 
@@ -117,6 +141,11 @@ device-order trap still needs their hardware.
   decision rather than an oversight ([`flag-coverage.md`](flag-coverage.md)).
   The *validity* half is done: `--mmproj` is an input and its footprint is
   priced (issue #13).
+- **Issue #14 — bias `ngl` levels toward the top when the model provably fits.**
+  The complement of the OOM pruner: that one deletes rows above the fit, this
+  stops spending the grid far below it. Open questions are what decides "fits"
+  without a `llama-fit-params` binary, and that the fit test has to be taken at
+  the *deepest* context in the sweep rather than depth 0.
 - **Report time saved by the floors.** Nothing says, after a sweep, how much
   `--min-tgs` actually bought. That number is the honest way to tune the advice.
 - **Issue #3** — fix shipped and retroactive; the upstream cause is still
