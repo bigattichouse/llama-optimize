@@ -39,11 +39,16 @@ with the observed spread printed on the pick (persisted to
 `<results>.verify.json` so `--report-only` re-applies it). Motivated by a real
 sweep where the same config measured 10.6 vs 7.7 tg t/s (~27% swing, thermal).
 
+The server driver keeps per-rep samples as of issue #11: each rep is screened
+against its own request's duration, the survivors take the **median**, and
+`rejected_reps` records how many could not be believed. Aggregating by mean
+against the kindest rep was letting one broken counter zero a whole config.
+
 Remaining:
 
 - llama-bench `-o json` already reports `stddev_ts` per test — capture it into
-  the CSV as `pp_std`/`tg_std`; have the server driver keep per-rep samples and
-  do the same.
+  the CSV as `pp_std`/`tg_std`, and report the spread the server driver's per-rep
+  samples already make available.
 - Report: flag a pick that is statistically tied with its runner-up (within
   ~2σ of the combined noise).
 - Tie-breaking: among tied configs prefer more context, then lower measured

@@ -1,19 +1,19 @@
-# Handoff — open work as of 2026-08-30
+# Handoff — open work as of 2026-09-01
 
-Working state at the end of the 2026-08-30 session. For what order to do the
+Working state at the end of the 2026-09-01 session. For what order to do the
 remaining work in and why, see [`PLAN.md`](PLAN.md). Unlike the other files in
 `docs/`, this one is **transient**: it records what is in flight and what to pick
 up next, and should be pruned as items land. Durable reasoning belongs in the
 design docs it points at.
 
-Everything below is committed and pushed to `main` (through `e96a076`), the
+Everything below is committed and pushed to `main` (through `63452e7`), the
 working tree is clean, and `--selftest` passes.
 
-**No live sweep was run this session.** The GPU on the dev box is in use by
-another project — 174 MiB free of 32752 at last check — so every change is
-verified by `--selftest`, in-process exercise with a stubbed `_help_cache`, and
-CPU-only runs with the device hidden. Anything below marked "needs GPU" is
-genuinely unverified on hardware, not merely untested by convention.
+**A live sweep did run this session**, but only on CPU: gemma-3-270m through the
+server driver, two configs, to exercise the calibration probe and the new
+delivered-depth column end to end. The GPU is still another project's. Anything
+below marked "needs GPU" is genuinely unverified on hardware, not merely untested
+by convention.
 
 ## What landed
 
@@ -53,63 +53,79 @@ all. A lower bound, deliberately: understating wastes time, overstating deletes
 configs that would have fit. Closed issue #13, and superseded the stand-down
 answer given on #12 earlier the same day.
 
+**Issue #11, in three commits (`b1170ed`, `032c153`, `63452e7`)** — the
+wall-clock check, then three defects the reporter's data exposed underneath it:
+per-rep rejection, prompts running at 2/3 of their stated depth, and four inert
+speculative columns sizing the array. Section 1 below has the detail. Verified on
+a CPU sweep as well as `--selftest`: delivered depth 1540/2565 tokens against
+1536/2560 requested, `cache_hit` 0.90 against a requested 0.90.
+
 **The defect class written down (`ff045dc`)** — five instances across four
 subsystems, generalised into [`DESIGN.md`](DESIGN.md), with the testing practices
 that catch it.
 
 ## Do these first
 
-### 1. Issue #11 — I5 fixed; one anomaly in the report is still unexplained
+### 1. Issue #11 — closed out; one question left with the reporter
 
-**The check was wrong and is now fixed** (see CHANGELOG *Fixed*, and I5 in
-[`measurement-validity.md`](measurement-validity.md)). The reporter's second CSV
-closes to its own arithmetic and needs no further data:
+**Everything this issue produced has landed** (`b1170ed`, `032c153`, `63452e7`).
+Four defects, only the first of which the issue was filed about:
 
-| | |
-|---|---|
-| no profile → `single`, `prefix_reuse=0.0`, `n_depth=32768` | `prompt_len` = 33,280 |
-| `secs` 98.34 over warm + 3 reps | **24.6s per request** |
-| reported ceiling 10.9 t/s | best rep wall = 256/10.9 = **23.5s** |
-| honest decode at tg=43.1 | 256/43.1 = **5.9s** |
-| residual | **17.6s** → 33,280 tok ≈ 1,890 t/s prefill |
-| verdict | 43.1/10.9 = 3.95 → the "4x" they saw |
+- **I5 bounded a decode-only rate by a whole-request wall.** Fixed by crediting
+  the prefill from the same response's `prompt_ms`, capped at 90% of the wall.
+  See I5 in [`measurement-validity.md`](measurement-validity.md).
+- **A rejection was wider than its fault.** The check compared the *mean* rate
+  across reps to the *kindest* rep's ceiling, so one broken counter zeroed a
+  config that had good measurements in it. Reps are now screened individually,
+  survivors take the median, and `rejected_reps` records partial rejections.
+- **Server prompts ran at ~2/3 of their stated depth.** Chars-per-token was
+  measured from the warm request — after the prompts were built. A probe now runs
+  at session open and the ratio holds for the session; `prompt_tok` records what
+  the prompt became. [`constants-audit.md`](constants-audit.md) C-B.
+- **`--factor mtp=0` still swept four inert speculative knobs** — 25 runs of one
+  configuration, and a main-effects table crediting each knob with noise. New
+  `gated_by` relation, [`CONDITIONAL-FACTORS.md`](CONDITIONAL-FACTORS.md).
 
-Every term reconciles: at reuse 0.0 each rep re-prefills the whole prompt *by
-design*, and I5 was bounding a decode-only rate by a whole-request wall.
+**The two mysteries from the last handoff are both solved, and both guesses in
+it were wrong.**
 
-**Still open, and it is a different bug.** `--prefix-reuse 100` should make all
-four prompts byte-identical (`prompt_battery`, the `n_shared >= n_chars` branch),
-so the reps are pure decode off a full cache hit, wall ≈ 6s, ceiling ≈ tg, no
-trip. The reporter says it tripped anyway. Their first CSV says the same thing
-independently: at reuse 0.9 the rep should re-prefill ~4,096 tokens (~2s) for a
-ceiling near 31 t/s, but the observed ceiling of 7.5 implies ~28s of prefill.
-**The prompt cache is not hitting on their box.**
+*The prompt cache not hitting* is not a context overrun. Their model is
+`general.architecture = qwen35` with `qwen35.ssm.*` metadata — hybrid
+SSM/attention — and llama.cpp cannot roll a recurrent state back to an arbitrary
+prefix, so it forces full re-processing unless a context checkpoint covers it
+(`tools/server/server-context.cpp`). Delivered reuse was 0% at depth 8192 too,
+where `n_ctx` had ~6k tokens to spare, which is what rules the overrun theory
+out. Prefix reuse is a property the model has or does not:
+[`workload-shape-design.md`](workload-shape-design.md).
 
-The I5 fix covers them anyway — `prompt_ms` reports the prefill that actually
-happened, not the one we predicted — and the new `cache_hit` column plus its
-warning will show whether this is real the moment they re-run. So it is no longer
-blocking, but it should not be forgotten.
+*`secs=113.4`, which "does not fit any story"*, fits the depth bug exactly. Their
+prose tokenizes at **6.05 chars/token** (measured with `llama-tokenize`), so the
+prompt was ~26,900 tokens, not 40,960. Four requests × (26.9k prefill at pp=1184
++ 256 tokens at tg=45.6) = **113.3 s** against the recorded 113.36. Their second
+CSV agrees independently. No deadline cut anything short.
 
-Leading suspect, unverified: `n_ctx` = `n_prompt + max_depth + n_gen + 256`
-= 41,472 against a 40,960-token prompt *sized with the assumed*
-`CHARS_PER_TOKEN = 4`. `self.cpt` is calibrated from the warm response but the
-prompts are already generated by then (`measure()`), so on a single-config run
-the calibration never applies. If their model tokenizes that prose below 4
-chars/token, every request overruns the context and re-prefills. Worth deciding
-whether the battery should be sized after the first response rather than before.
+**Outstanding with the reporter, and it is the only thing:** one run with
+`--factor mtp=0` and the `spec_*` factors dropped, at `--factor n_depth=8192`.
+Both remaining unknowns point at the speculative path — the 333,362 t/s counter,
+and whether any reuse survives with MTP off — and that single run separates them.
+It was asked for before `63452e7` and generated 25 runs; on current `main` it is
+one. Nothing is blocked on the answer.
 
-Also unexplained: their first run's `secs=113.4` does not fit any story — three
-reps at the implied 34.1s leave under 11s for a warm request that must prefill
-40,960 tokens. Either the deadline cut reps short or `predicted_n < 256`, and
-neither is visible in the CSV. The `implausible` column now records the
-breakdown, so a re-run will say which.
+**Left open deliberately, not forgotten:**
 
-Unrelated finding from the earlier investigation, still worth acting on: the
-guard's comment claims "the honest ratio runs 10-100x in prefill's favour", but
-measured on CPU (gemma-3-270m, `-p 8192 -n 256`) it is 11.7x at depth 0, **7.5x
-at 8192** and 7.3x at 32768. It flattens rather than inverting, so the check
-never trips — but the margin on the deep-context profile is thinner than the
-constant was reasoned from. Worth revisiting `TG_OVER_PP_LIMIT`.
+- **`-ctxcp` / `--ctx-checkpoints` and `--cache-ram` are not swept or set.** On
+  hybrid/recurrent and SWA models they are the only llama.cpp knobs that can
+  restore any prefix reuse, so the `agents` profile currently measures a workload
+  those users cannot get. A factor decision, not a bug fix.
+- **MTP's knobs still share a flat array with `mtp` when it is swept** rather
+  than pinned. The correct shape is the staged decomposition the ngram gate
+  already uses; it changes what every MTP sweep does, so it is sequenced
+  separately ([`CONDITIONAL-FACTORS.md`](CONDITIONAL-FACTORS.md), "Still open").
+- **`TG_OVER_PP_LIMIT`.** The guard's comment claims "the honest ratio runs
+  10-100x in prefill's favour"; measured on CPU (gemma-3-270m, `-p 8192 -n 256`)
+  it is 11.7x at depth 0, **7.5x at 8192** and 7.3x at 32768. It flattens rather
+  than inverting, so the check never trips — but the margin on the deep-context
+  profile is thinner than the constant was reasoned from.
 
 ### 2. The estimate/answer rule is now written down — apply it
 
@@ -216,6 +232,11 @@ next session should pick knowingly rather than inherit the order by default.
 - **`llama-fit-params` and the driver are separate binaries with separate flag
   support**, and they *do* diverge inside one build tree — on this box
   fit-params has `-ncffn` while llama-bench does not.
+- **`pkill -f llama-optimize` kills your own shell.** The pattern matches the
+  command line of the shell running it. Use a bracket (`llama-optimiz[e]`), or
+  kill by PID.
+- **Piping a long run into `tail` shows nothing until it exits.** stdout is block
+  buffered through a pipe: run with `python3 -u` and redirect to a file.
 - **Metadata declares an architecture, not a file's contents.** Both
   `Qwen3.8-27B-UD-IQ4_XS` and the standalone `mtp-*.gguf` report
   `nextn_predict_layers = 1`; only the tensor list distinguishes them. Checking
