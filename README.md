@@ -249,6 +249,16 @@ Runs that **OOM, crash, or time out** are recorded as data (`tg=0`, with a statu
 `-ngl` with an `f16` KV cache is *expected* to OOM — that failure is the memory cliff
 we're mapping, not a bug.
 
+Those failures are then **read as boundary measurements**. A level where *every*
+row failed is out of bounds rather than unlucky — the array visits each level
+beside different partners, which is what makes that readable — so the report names
+it under `OUT OF BOUNDS` with the statuses that decided it, and the next
+`--iterate` pass stops spending runs there. One failure is never enough (a single
+crash in a Taguchi row implicates the whole combination, not one column), `SLOW`
+and `IMPLAUSIBLE` don't count (both had a working launch), and a factor whose
+every level died is reported as nothing — that is the model or the box failing,
+not the knob.
+
 Runs whose numbers **cannot be true** are recorded as `IMPLAUSIBLE` and excluded
 from the picks, the Pareto frontier and the main effects, with the reason printed
 as they are discarded. A driver can exit cleanly and still report an impossible

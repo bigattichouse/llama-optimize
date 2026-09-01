@@ -272,6 +272,25 @@ their place:
 - **Assert against a stub, never against absence.** A capability check driven by
   a missing binary passes for every flag and would pass with the gate inverted.
   Stub the `--help` text and assert both the positive and negative case.
+- **Assert that the two sides AGREE, not that each is plausible.** Wherever the
+  tool describes the same configuration twice — once to run it, once to estimate
+  it — the bug lives in the gap between the descriptions and neither side looks
+  wrong alone. `_fit_params_flags` told `llama-fit-params` the KV cache was in
+  system RAM for exactly the level at which the drivers put it on the GPU: a 6 GB
+  error on every row, admitting configurations that then OOM and deleting ones
+  that would have fitted. Both halves read fine in isolation, and the regression
+  test asserted the inversion, so it locked the bug in for as long as it existed.
+  The test that finds this is the one that loops over every level and asserts
+  *driver emits the flag ⟺ estimator emits the flag*.
+
+**Mutation-test the whole change set, not the function you were thinking about.**
+Running one sweep over every function a session touched found six untested paths
+that individually looked covered: an aggregate stated as `max` rather than the
+median it should describe, a probe that would still have worked while costing 256
+tokens instead of 1, a footprint cap that would happily be raised by a sibling
+that OOMed, and the two halves of the fit verdict — the headroom subtracted from
+capacity, and the artifacts the estimator cannot be told about. Each is a silent
+admit-or-delete decision; none had a test.
 
 **Beware the truncated read.** Two diagnoses this project got wrong began with a
 listing cut short — `head -14` on a tensor table read as "these tensors are

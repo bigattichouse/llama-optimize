@@ -5920,6 +5920,19 @@ def selftest() -> bool:
         _deep = {"n_depth": "49152", "ngl": "99", "status": "OK",
                  "prompt_tok": "57600"}
         assert recommended_ctx(cfg_m, _short, 49152, [_short, _deep]) > 27392
+        # ...but only a sibling that SUCCEEDED. A row that OOMed at depth is
+        # evidence the context does not hold, so letting it raise the cap would
+        # paste a -c that is known not to load.
+        _oomed = {**_deep, "status": "OOM"}
+        assert (recommended_ctx(cfg_m, _short, 49152, [_short, _oomed])
+                == recommended_ctx(cfg_m, _short, 49152, [_short]))
+        assert verified_footprint(cfg_m, [_oomed], _short, 1) == 0
+        # ...and only a sibling of THIS launch config. A different ngl is a
+        # different server, and its footprint says nothing about this one.
+        _other = {**_deep, "ngl": "40"}
+        assert verified_footprint(cfg_m, [_other], _short, 1) == 0
+        assert (recommended_ctx(cfg_m, _short, 49152, [_short, _other])
+                == recommended_ctx(cfg_m, _short, 49152, [_short]))
 
         # verified_depth_of: deepest OK sibling sharing the launch factors
         cfg_v = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
@@ -6934,6 +6947,19 @@ def selftest() -> bool:
         assert _rejected_reason([_liar_rep]) is not None
         assert "wall clock" in _rejected_reason([_liar_rep])
         assert _rejected_reason([RepSample(1e6, None)]) is None
+        # the reason is stated against the MEDIAN of the rejected rates, not the
+        # worst one: it should describe the number that would have been recorded,
+        # and a max would overstate the overshoot in the text that survives
+        _r2 = _rejected_reason([RepSample(1000.0, _rc(256, 23.5, 17.6)),
+                                RepSample(2000.0, _rc(256, 23.5, 17.6)),
+                                RepSample(9000.0, _rc(256, 23.5, 17.6))])
+        assert "tg=2000.0" in _r2, _r2
+
+        # the calibration probe must stay cheap -- it runs before every session's
+        # first prompt, so it asks for one token, not a generation
+        import inspect as _inspect
+        _cal_src = _inspect.getsource(ServerSession.calibrate)
+        assert "_completion(self.port, probe, 1," in _cal_src, _cal_src
 
         # what the prompt actually became: run through the model plus spared by
         # the cache. `n_depth` is only ever the request (#11).
@@ -7605,6 +7631,49 @@ def selftest() -> bool:
     except AssertionError as e:
         print(f"selftest FAILED: {e}")
         return False
+
+    # --- OOM pruning: the fit verdict itself ---
+    # Both sides of the comparison had gone untested: the headroom subtracted
+    # from capacity, and the artifacts fit-params cannot be told about. Each is
+    # a silent admit-or-delete decision on every row, and `full_offload_fits`
+    # now rides on the same verdict to shape the ngl grid.
+    with tempfile.TemporaryDirectory() as _td:
+        _fp = Path(_td) / "llama-fit-params"
+        _fp.write_text("#!/bin/sh\n")
+        cfg_fit = Config(model=Path("m.gguf"), llama_bench=Path("b"),
+                         llama_server=Path("s"), array="auto", ctx_floor=8192,
+                         driver="server", fit_params=_fp,
+                         fit_headroom_mib=512,
+                         hw={"phys": 8, "logical": 16, "n_layers": 32,
+                             "vram": 10000, "n_ctx_train": 32768,
+                             "n_experts": 0, "n_nextn": 0})
+        _real_sub, _real_parse = subprocess, parse_fit_print
+        _reported = {"mib": 0}
+        try:
+            globals()["subprocess"] = SimpleNamespace(
+                run=lambda *a, **k: SimpleNamespace(returncode=0, stdout=""),
+                TimeoutExpired=_real_sub.TimeoutExpired)
+            globals()["parse_fit_print"] = lambda _out: _reported["mib"]
+
+            # capacity is total VRAM MINUS the headroom, not total VRAM: 9600
+            # fits under 10000-512=9488? no -- and that is the whole point
+            _fit_cache.clear(); _reported["mib"] = 9400
+            assert predict_fits(cfg_fit, {"ngl": "32"}, "server") is True
+            _fit_cache.clear(); _reported["mib"] = 9600
+            assert predict_fits(cfg_fit, {"ngl": "32"}, "server") is False, \
+                "headroom is not being subtracted from capacity"
+
+            # and a resident draft model counts against the same budget, since
+            # fit-params rejects -md and cannot see it (issue #13)
+            _fit_cache.clear(); _reported["mib"] = 9400
+            cfg_md = replace(cfg_fit, draft_model=Path(_td) / "d.gguf")
+            (Path(_td) / "d.gguf").write_bytes(b"x" * (400 * 1024 * 1024))
+            assert predict_fits(cfg_md, {"ngl": "32"}, "server") is False, \
+                "artifacts fit-params cannot see are not being priced"
+        finally:
+            globals()["subprocess"] = _real_sub
+            globals()["parse_fit_print"] = _real_parse
+            _fit_cache.clear()
 
     # --- OOM pruning: fit-params flag generation ---
     try:
