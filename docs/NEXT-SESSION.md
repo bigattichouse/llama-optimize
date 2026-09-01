@@ -126,9 +126,16 @@ but MTP is earning its keep on this model.
 same treatment as #14:
 
 - **Issue #15** — prefix reuse is unattainable on hybrid/recurrent and SWA
-  models, and `--ctx-checkpoints` is not swept.
-- **Issue #16** — MTP's tuning knobs share a flat array with the `mtp` gate when
-  it is swept. `gated_by` fixed only the pinned case.
+  models, and `--ctx-checkpoints` is not swept. **Still open; needs a hybrid or
+  SWA model on a GPU.**
+- **~~Issue #16~~** — done (`866e9e3`), and the fix is not the one the issue
+  proposed. Staging the `mtp` gate was measured first and rejected: eleven other
+  factors already force L125, so removing the four spec columns shrinks nothing
+  and a screen-plus-tune split would cost 150 runs instead of 125. What was real
+  was F1/F3, and `is_inert` fixes both without an executor. The transferable
+  finding is in [`CONDITIONAL-FACTORS.md`](CONDITIONAL-FACTORS.md): F2 is a claim
+  about a specific design, not a property of the shape — check it against
+  `choose_array` before paying for a staged executor.
 
 **Still only written down here:**
 
