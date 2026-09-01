@@ -227,6 +227,66 @@ real MoE model before choosing between `gated_by`, a constrained pair, or lettin
 Step 8 (multi-GPU) is next on its own merits, and still needs hardware this
 project does not have.
 
+## Queued: one GPU run, waiting on the card (#18, #15, #11)
+
+**Not yet run — deliberately.** Needs ~25.6 GiB and the card currently has 22.1
+free (another project holds 9.8 of 32.0). **Precondition: the other process down
+to ≤ 6.4 GiB.** Check with `rocm-smi --showmeminfo vram`.
+
+**Model: `Qwen3.8-27B-UD-Q6_K_XL.gguf`** (23.6 GiB). Chosen over the smaller
+`Qwen3.6-27B-Q5_K_M` (18.2 GiB, would fit today) because it is the only local
+model that is hybrid-SSM **and** carries an MTP head — matching issue #11's
+reporter exactly:
+
+| | size | arch | blocks | MTP | hybrid |
+|---|---|---|---|---|---|
+| Qwen3.8-27B-UD-Q6_K_XL | 23.6 GiB | qwen35 | 65 | **yes** | yes |
+| Qwen3.6-27B-UD-Q6_K_XL | 24.2 GiB | qwen35 | 65 | yes | yes |
+| Qwen3.6-27B-Q5_K_M | 18.2 GiB | qwen35 | 64 | **no** | yes |
+
+The MTP head is what makes it worth the extra 5 GiB: it is the only way to
+characterise issue #11's 333,362 t/s counter, and the smaller model cannot.
+
+### Step 1 — does full offload load at all? (#18)
+
+```
+llama-server -m Qwen3.8-27B-UD-Q6_K_XL.gguf -c 8192 -ngl 99 -fa 1 --fit off
+```
+
+Load-only; kill it once healthy. Known already: `-ngl 5` and `-ngl 40` core-dump
+on `Qwen3.6-27B-Q5_K_M`, `-ngl 0` is fine.
+
+- **Loads** → partial offload is the fault, and the `ngl` grid should collapse to
+  `[0, 99]` on hybrid models. That is the fix for #18 and it needs no more GPU.
+- **Core-dumps** → hybrid models are not GPU-usable in this build at all. Much
+  bigger, and an upstream report rather than a grid change.
+
+### Step 2 — everything else, in one sweep
+
+Only if step 1 loads. Uses the tool itself rather than a bespoke probe, since
+`cache_hit`, `prompt_tok` and `rejected_reps` are now columns:
+
+```
+python3 llama-optimize.py <model> --run --driver server --no-probe \
+  --profile agents --factor ngl=99 --factor n_depth=8192 \
+  --factor mtp=0,1 --reps 3 --results qwen38.csv
+```
+
+Three answers off one CSV:
+
+- **`cache_hit`** — #15's recurrent half. Expected 0.0 at both `mtp` levels; that
+  confirms speculation was never the cause and the architecture is. If it is
+  non-zero at `mtp=0`, the recurrent claim is wrong and #15 reopens wider.
+- **`tg_tps` / `rejected_reps`** — issue #11's 333,362 t/s counter. If reps get
+  rejected at `mtp=1` and not at `mtp=0`, that characterises the llama.cpp
+  speculative-timing bug well enough to report upstream, which is the one thing
+  still owed to that reporter's data.
+- **`prompt_tok`** — should land within ~1% of `n_prompt + n_depth` = 16,384.
+  Confirms the calibration probe on the exact model that motivated it; measured
+  6.05 chars/token there via `llama-tokenize`.
+
+Budget: ~10 minutes once the card is free, most of it loading 23.6 GiB.
+
 ## Then
 
 - **Draft-model staging (F2 continued).** The staged screen from
