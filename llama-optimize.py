@@ -5562,8 +5562,20 @@ def selftest() -> bool:
         # a named ngram variant needs no draft model alongside it
         _nc = spec_type_args(_cfg_e3, "ngram-cache")
         assert _nc == ["--spec-type", "ngram-cache"], _nc
-        # a DETECTED architecture is still left to llama.cpp's own inference
-        assert "--spec-type" not in spec_type_args(_cfg_e3, "dflash")
+        # a DETECTED architecture is still left to llama.cpp's own inference --
+        # but only when the draft can be read and names itself, which is why the
+        # reader is stubbed here rather than pointed at a path that is not there
+        _real_meta3 = read_gguf_metadata
+        try:
+            globals()["read_gguf_metadata"] = \
+                lambda _p: {"general.architecture": "dflash"}
+            assert "--spec-type" not in spec_type_args(_cfg_e3, "dflash")
+            # ...and an unreadable one still gets a type named for it, which is
+            # the deliberate choice made for sharded drafts
+            globals()["read_gguf_metadata"] = lambda _p: {}
+            assert "draft-simple" in spec_type_args(_cfg_e3, "dflash")
+        finally:
+            globals()["read_gguf_metadata"] = _real_meta3
         # and the note fires for exactly the types llama.cpp cannot infer
         assert "cannot infer" in (spec_type_note("draft-eagle3") or "")
         assert spec_type_note("draft-mtp") is None
