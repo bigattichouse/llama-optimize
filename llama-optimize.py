@@ -6540,6 +6540,17 @@ def selftest() -> bool:
             # with the impossible rep contributing nothing to it
             assert r_one["tg_tps"] == 610.0, r_one
 
+            # the aggregate is the MEDIAN of the survivors, not their mean: with
+            # three believable but skewed reps the two disagree, and the mean
+            # walks toward whichever rep was furthest out. 600/610/900 are all
+            # possible against their own clocks, so none is screened -- this is
+            # the aggregation rule alone, with no rejection involved.
+            _seq["i"] = 0
+            globals()["_completion"] = _per_rep([600.0, 610.0, 900.0])
+            r_med = measure_in_session(rep_cfg, {"n_depth": "8192"}, sess, 30)
+            assert r_med["rejected_reps"] == 0, r_med      # nothing rejected
+            assert r_med["tg_tps"] == 610.0, r_med         # median, not 703.3
+
             # every rep impossible is still a rejected configuration, and the
             # reason still travels with it
             _seq["i"] = 0
