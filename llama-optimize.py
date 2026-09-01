@@ -1245,17 +1245,32 @@ def ngl_levels(n_layers: int | None, levels: int = 5,
     """`levels` values for -ngl, spanning 0 (pure CPU) to all layers.
 
     `recurrent=True` — the model has SSM/recurrent memory — collapses the grid to
-    `[0, 99]`, the only two placements that WORK. Every partial offload
-    core-dumps llama-server: measured on `Qwen3.6-27B-Q5_K_M` (`qwen35`) at both
-    `-ngl 5` and `-ngl 40`, right after `resolve_fused_ops: layer 0 is assigned to
-    device CPU but fused Gated Delta Net (chunked) is assigned to device ROCm0`.
-    It is the split that kills it, not the amount. An even span therefore spends
-    three of five levels on rows that abort rather than measure (issue #18).
+    `[0, 99]`, which on this class are the only two USEFUL placements that run.
+    Mapped on `qwen35moe` (`Qwen3.6-35B-A3B`, 40 blocks, `-ncmoe 40`):
 
-    99 rather than `n_layers` deliberately: `-ngl 99` is the spelling that was
-    verified, and `-ngl n_layers` still leaves the output tensor on the CPU, which
-    is a split of a different kind and was not tested. llama.cpp clamps 99 to the
-    real count.
+        -ngl   0   1   2   3   5  10  20  30  38  39  40  41  99
+              ok  ok  ok   X   X   X   X   X   X   X   X  ok  ok
+
+    The crash band is **3 .. n_layers**, and every death is a segfault right after
+    `resolve_fused_ops: layer 0 is assigned to device CPU but fused Gated Delta
+    Net (chunked) is assigned to device ROCm0`. It is not "any split": 1 and 2
+    layers on the GPU are fine — presumably too few for the fused op to be placed
+    on ROCm at all — they are simply useless placements, ~CPU speed on a 40-layer
+    model.
+
+    **`-ngl n_layers` dies and `n_layers + 1` lives**, which is why the top level
+    is 99 and not `n_layers`: at 40 the output tensor takes the last slot and
+    block 0 is left on the CPU, which is exactly the straddle that crashes.
+    llama.cpp clamps 99 to the real count.
+
+    **Evidence and its limits.** Two models, one architecture family, one backend
+    (ROCm): `qwen35moe` as mapped above, plus `qwen35`
+    (`Qwen3.6-27B-Q5_K_M`, dense, 64 blocks) dying at `-ngl 5` and `-ngl 40`. The
+    gate is `ssm_state > 0`, which is BROADER — Mamba, Jamba, RWKV and Falcon-H1
+    all match and none was tested. Applied anyway because the errors are not
+    symmetric: wrong here costs three grid levels that
+    `--factor ngl=0,16,32,48,64` hands straight back; wrong the other way costs
+    three fifths of every sweep on rows that cannot produce a number.
 
     `fits=True` — the model provably fits in VRAM at the most demanding cell of
     this design — biases the levels toward full offload: the reason to put layers
@@ -8863,8 +8878,10 @@ def main():
     # depends on an estimate is one the reader cannot check (issue #14).
     if getattr(cfg, "ngl_recurrent", False):
         print("  note: ngl is 0 or 99 only — this model has recurrent (SSM) "
-              "memory, and llama-server core-dumps on any partial offload "
-              "(issue #18). Those levels would abort, not measure.")
+              "memory, and every partial offload core-dumped llama-server when "
+              "measured (issue #18), so those levels would abort rather than "
+              "produce a number. Measured on qwen35/qwen35moe + ROCm; if partial "
+              "offload works for you, --factor ngl=0,16,32,48,64 restores it.")
     elif getattr(cfg, "ngl_biased", False):
         print(f"  note: ngl levels bias to full offload — every layer fits in "
               f"VRAM at depth {max(int(d) for d in cfg.factors['n_depth'])}. "

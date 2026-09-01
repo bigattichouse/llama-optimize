@@ -228,14 +228,50 @@ resolve_fused_ops: layer 0 is assigned to device CPU but fused Gated Delta Net
   (chunked) is assigned to device ROCm0 (usually due to missing support)
 ```
 
-Measured on `Qwen3.6-27B-Q5_K_M` (`qwen35`, 64 blocks) at `-ngl 5` **and**
-`-ngl 40`; `-ngl 0` runs, and `-ngl 99` runs. It is the split that kills it, not
-the amount — the recurrent half of the model ends up straddling two devices.
+Mapped on `Qwen3.6-35B-A3B` (`qwen35moe`, 40 blocks, `-ncmoe 40`):
+
+```
+-ngl   0   1   2   3   5  10  20  30  38  39  40  41  99
+      ok  ok  ok   X   X   X   X   X   X   X   X  ok  ok
+```
+
+Two things in that map were not what the first pass assumed, and both matter.
+
+**It is not "any split".** `-ngl 1` and `-ngl 2` run fine — presumably too few
+layers on the GPU for the fused op to be placed on ROCm at all. They are simply
+useless placements, roughly CPU speed on a 40-layer model. The crash band is
+**3 .. n_layers**.
+
+**`-ngl n_layers` dies; `n_layers + 1` lives.** At 40 the output tensor takes the
+last slot and block 0 is left on the CPU — exactly the straddle that crashes. The
+first pass chose `99` over `n_layers` on the reasoning that the output tensor was
+an untested boundary; that guess was right, and is now measured.
+
+Confirmed on a second model of the same family: `Qwen3.6-27B-Q5_K_M` (`qwen35`,
+dense, 64 blocks) dies at `-ngl 5` and `-ngl 40`.
 
 So on `ssm_state > 0` the grid is `[0, 99]`: the only two placements that
 execute. Three of five default levels would otherwise be recorded as `SIGNAL`,
 which is honest but useless, and on a first run it looks like the tool is broken
 rather than the placement being impossible.
+
+**The gate is broader than the evidence, deliberately.** `ssm_state > 0` also
+matches Mamba, Jamba, RWKV and Falcon-H1, none of which has been tested, and all
+of the evidence is one architecture family on one backend (ROCm). Partial offload
+is ordinary and works fine for most models — it is only this class that has been
+seen to abort. The gate is applied anyway because the two errors are not
+symmetric:
+
+- **Wrong here**: three grid levels lost on a model that could have used them, on
+  a knob the user can hand back with `--factor ngl=0,16,32,48,64`. The printed
+  note says exactly that.
+- **Wrong the other way**: three fifths of every sweep spent on rows that cannot
+  produce a number, on an architecture where nothing the user does helps.
+
+A recoverable loss against an unrecoverable one. If a recurrent architecture
+turns up that *does* support partial offload, the honest fix is to narrow the gate
+— or to make it adaptive, dropping the remaining partial levels only after one has
+actually died (`died_on_signal` already detects that).
 
 **99 rather than `n_layers`**, deliberately: `-ngl 99` is the spelling that was
 verified, and `-ngl n_layers` still leaves the output tensor on the CPU — a split
