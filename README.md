@@ -173,7 +173,8 @@ context. Pass `--min-kv any` to explore the full `f16, q8_0, q5_1, q4_1, q4_0` l
 **Fixed** (not swept): flash-attention on (`-fa 1` — a near-certain win on gfx906 and
 a *precondition* for quantized KV cache, so sweeping it would structurally fail every
 `fa=0` × KV-quant row) and mmap on (bench `-mmp 1`; the server default). Sweep fa
-explicitly with `--factor fa=0,1 --min-kv f16`. Also not swept by default: CPU
+explicitly with `--factor fa=0,1` — the quantized KV levels are dropped for you,
+with a note saying which, since `-fa off` cannot create a context with them. Also not swept by default: CPU
 affinity masks (`cpu_mask`/`cpu_range` — no universal levels), RoPE/YaRN scaling
 (extends context by *changing model behavior*, a quality tradeoff, not a perf knob),
 and `parallel` (a property of your workload — set it via `--use-case`/`--parallel`).
@@ -832,8 +833,12 @@ gets the three `-ot` levels under the same factor name, so results stay
 comparable across a llama.cpp upgrade.
 
 **² Flash attention is fixed on unless swept.** It is a precondition for
-quantized KV, so sweeping it blindly would just fail every `fa=0` × KV-quant row.
-To sweep it anyway, pair it with a floor: `--factor fa=0,1 --min-kv f16`.
+quantized KV — measured: `-fa off -ctk q8_0` fails to create a context, `-fa on`
+with the same cache loads. Sweep it with `--factor fa=0,1`; the quantized
+`kv_type` levels are dropped for you, with a note naming them, so no row in the
+design is unlaunchable. Note the pin itself is still an assumption chosen on one
+GPU — whether `fa=on` is *faster* on your hardware is not something the default
+sweep asks (`docs/constants-audit.md` C-A).
 
 **³ The MTP surface is swept when the model ships an MTP/NextN head.** Such
 models also auto-switch to the server driver, so the effect is measured rather

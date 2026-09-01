@@ -75,6 +75,29 @@ invalidate every `q8_0` row. So the honest fix is to *probe* whether FA is
 active and gate `kv_type` on the answer, not simply to stop pinning it. Needs a
 GPU on more than one backend to validate.
 
+**The complication is now measured, not assumed** (issue #20). On this box:
+
+```
+llama-server -fa off -ctk q8_0 -ctv q8_0  ->  failed to create context with model
+llama-server -fa on  -ctk q8_0 -ctv q8_0  ->  loads
+```
+
+So the precondition is real, and `--factor fa=0,1` was a footgun: every
+quantized-KV cell in such a design can only ever be a `SIGNAL` row. The tool now
+drops the quantized `kv_type` levels itself when an `fa` off-level is swept, and
+says which and why — the README's manual `--min-kv f16` recipe, applied
+automatically. `auto` is deliberately not read as "off": that is llama.cpp
+deciding, not the user asking for none.
+
+**What is still assumed.** Whether `fa=on` is *faster* remains unasked by default;
+it is still pinned. Sweeping it properly alongside quantized KV needs a
+constrained relation between the two factors rather than a level filter — the
+cells that must not exist are an interaction, and an orthogonal array has no way
+to omit one cell. Two shapes worth considering: derive `kv_type`'s live set from
+`fa` the way `spec_n_min_frac` derives from `spec_n_max`
+([`CONSTRAINED-FACTORS.md`](CONSTRAINED-FACTORS.md)), or run the FA question as
+its own small stage with `kv_type` pinned, the way the ngram gate is screened.
+
 ### C-B. `CHARS_PER_TOKEN = 4` — model-poisoned, and load-bearing
 
 Used to turn a requested token count into prompt text, so it sets the real
