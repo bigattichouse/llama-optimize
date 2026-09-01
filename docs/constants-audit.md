@@ -89,6 +89,24 @@ says which and why — the README's manual `--min-kv f16` recipe, applied
 automatically. `auto` is deliberately not read as "off": that is llama.cpp
 deciding, not the user asking for none.
 
+**Retracted: "flash attention is 33% slower here".** An earlier run in this
+session measured `fa=off` at 9.79 tg t/s against `fa=on` at 6.53 on
+Mistral-Small-24B Q8_0 at 4k depth, and it was reported as a 33% loss. It was
+not a result. The `temp_c` column records 44 °C for the `fa=off` row and 91 °C for
+`fa=on` — a cold card against a hot one, because the run used
+`--no-thermal-wait`. Re-run with execution order randomised and both rows hot:
+
+| depth | tg off | tg on | on/off |
+|---|---|---|---|
+| 4096 | 6.85 | 7.06 | **1.03x** |
+
+No difference worth reporting at that operating point. The pin may still be
+wrong, but nothing here shows it — and the failure mode is worth more than the
+finding would have been: the tool records `temp_c` per row precisely so this is
+catchable, the thermal settle is on by default precisely so it does not happen,
+and both guards were bypassed for speed. A ~27% between-run swing is already
+documented here, which is larger than most effects the sweep looks for.
+
 **What is still assumed.** Whether `fa=on` is *faster* remains unasked by default;
 it is still pinned. Sweeping it properly alongside quantized KV needs a
 constrained relation between the two factors rather than a level filter — the

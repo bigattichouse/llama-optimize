@@ -207,11 +207,20 @@ numbers the report would later reject.
 
 ## A result is never a general fact
 
-Every number this tool prints is conditioned on a quant, a model, a machine and
-an operating point, and the same knob flips answer across all four. Flash
-attention measured **33% slower** on Mistral-Small-24B **Q8_0** on an MI50 at 4k
-depth with an f16 KV cache — and the same card is known to gain from it on other
-models. Both are true.
+Every number this tool prints is conditioned on a quant, a model, a machine, an
+operating point **and the conditions it was taken in** — and the same knob flips
+answer across all of them.
+
+A flash-attention comparison here read as a **33% loss** on Mistral-Small-24B
+Q8_0 at 4k depth, and it was wrong. The `temp_c` column showed the two rows were
+measured at 44 °C and 91 °C: a cold card against a hot one, with `--no-thermal-wait`
+disabling the guard that exists for exactly this. Re-run with execution order
+randomised and both rows hot, the same comparison came out at **1.03x** — no
+difference worth reporting. The retraction is in `docs/constants-audit.md` C-A.
+
+That is why `temp_c` is a column and not a log line, and why the thermal settle is
+on by default. A between-run swing here has been measured at ~27%, which is larger
+than most effects the sweep is looking for.
 
 A finding printed without its scope reads as a property of llama.cpp. It then
 gets adopted as a default and shipped to people whose hardware disagrees, which

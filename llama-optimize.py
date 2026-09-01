@@ -4792,12 +4792,16 @@ def result_scope(cfg: Config) -> str:
     """The sentence every number below the header is conditioned on.
 
     A measurement is never a general fact: the same knob flips answer across the
-    quant, the model and the box. Flash attention measured 33% SLOWER on
-    Mistral-Small-24B Q8_0 on an MI50 at 4k depth, and faster on other models on
-    that same card. A result printed without its scope reads as a property of
-    llama.cpp, gets adopted as a default, and ships to people whose hardware
-    disagrees — which is how `FIXED_FA = 1` came to be justified as "helps
-    gfx906" (docs/constants-audit.md C-A)."""
+    quant, the model, the box AND the thermal state it was taken in. A result
+    printed without its scope reads as a property of llama.cpp, gets adopted as a
+    default, and ships to people whose hardware disagrees — which is how
+    `FIXED_FA = 1` came to be justified as "helps gfx906"
+    (docs/constants-audit.md C-A).
+
+    The scope has to include the conditions, not just the hardware: a flash
+    attention comparison here read as a 33% loss until the `temp_c` column showed
+    the two rows were taken at 44°C and 91°C. Re-run with the order randomised
+    and both rows hot, the difference was 1.03x — nothing."""
     src = str(cfg.hw.get("vram_src") or "").replace("llama.cpp: ", "")
     vram = cfg.hw.get("vram")
     if src and vram:
@@ -5713,12 +5717,10 @@ def selftest() -> bool:
         assert "--spec-type draft-mtp" in server_command(cfg_no, {"ngl": "99"}, 4096)
 
         # --- a result is never a general fact ---
-        # The same knob flips answer across the quant, the model and the box:
-        # flash attention measured 33% SLOWER on Mistral-Small-24B Q8_0 on an
-        # MI50 at 4k depth, and faster on other models on that same card. A
-        # number printed without its scope reads as a property of llama.cpp and
-        # gets adopted as a default -- which is how FIXED_FA came to be justified
-        # as "helps gfx906".
+        # The same knob flips answer across the quant, the model, the box and
+        # the thermal state. A number printed without its scope reads as a
+        # property of llama.cpp and gets adopted as a default -- which is how
+        # FIXED_FA came to be justified as "helps gfx906".
         _cfg_sc = Config(model=Path("Some-Model-Q4_K_M.gguf"),
                          llama_bench=Path("b"), llama_server=Path("s"),
                          array="auto", ctx_floor=8192, driver="server",
