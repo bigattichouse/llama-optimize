@@ -97,32 +97,29 @@ knobs plus `draft-simple`/`draft-dflash`/`draft-dspark`. Prerequisite:
 `predict_fits` must account for two resident models — which is step 4, so these
 are naturally sequential.
 
-### 7. `ngl` levels that know about VRAM — *no hardware needed*
+### 7. ~~`ngl` levels that know about VRAM~~ — **done** (`aa63d19`)
 
-[Issue #14](https://github.com/bigattichouse/llama-optimize/issues/14).
-`ngl_levels()` spans 0 → n_layers evenly and never consults VRAM, so a 40-layer
-model that fits entirely on the GPU still gets `[0, 10, 20, 30, 40]` and spends
-four of five levels below the answer. Since `choose_array` sizes on the widest
-factor, that is not one wasted column but a share of the whole sweep — which
-makes this a sweep-cost item ([`sweep-cost-design.md`](sweep-cost-design.md)) as
-much as a correctness one, and the cheapest remaining one.
+[Issue #14](https://github.com/bigattichouse/llama-optimize/issues/14), closed.
+When `predict_fits` says every layer fits at the deepest depth and largest KV in
+the design, `ngl_levels` spans the top quarter instead of the whole range:
+`[0, 30, 33, 37, 40]` rather than `[0, 10, 20, 30, 40]` on a 40-layer model.
+`ngl=0` survives every verdict, because the verdict can be wrong and it is then
+the only row that can still measure something (SC5); `--no-oom-prune` restores the
+even span. Reasoning in [`sweep-cost-design.md`](sweep-cost-design.md).
 
-Placed here because it needs no GPU: level generation is a pure function and its
-tests are `--selftest` material. The care is in the fit test, not the grid — it
-has to be taken at the deepest context in the sweep, and it should keep the even
-span whenever it cannot be confident, since a wrongly optimistic verdict deletes
-exactly the partial-offload rows that would have rescued a run.
+The framing changed while doing it, and the note is worth keeping: this is not
+"80% of a factor's levels wasted". In an orthogonal array every row informs every
+factor's main effect, so those rows were never wasted for information. They cost
+**wall clock** — `ngl=0` is CPU-only decode, a minority of the design and a
+majority of its runtime — and **additivity**, since `kv_type` at `ngl=0` is not
+the same phenomenon as at `ngl=40`.
 
-Found by chasing issue #5's "35B kept getting offloaded" past two VRAM bugs that
-turned out not to explain it.
+Spun out: [issue #17](https://github.com/bigattichouse/llama-optimize/issues/17),
+the `ngl`/`ncmoe` overlap on MoE models, which wants a real MoE model to settle.
 
-**This placement is by cost, and cost is not the only argument.** It sits ahead
-of step 8 because it is cheap and needs no hardware. Against that: it unblocks
-nobody. The reporter on issue #5 has the only two-GPU box this project can reach,
-and what they are waiting on is `-sm`/`-ts` — so a session optimising for *the
-thing only they can test* should take step 8's per-device prerequisite first and
-leave this. Both readings are defensible; take the order deliberately rather than
-by inheritance.
+**The ordering argument this entry carried is now moot** — it was placed ahead of
+step 8 on cost, against the objection that it unblocks nobody. It is done, and
+step 8 is next on its own merits.
 
 ### 8. Multi-GPU — *blocked on hardware we do not have*
 

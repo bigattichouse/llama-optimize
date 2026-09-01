@@ -187,27 +187,25 @@ The transferable part: a device list is a reading of a moment, and the design
 treated it as a property of a machine. Anything derived from `free` inherits
 that, which is why free warns and total decides.
 
-### 4. Issue #14 — `ngl` levels that know about VRAM
+### 4. ~~Issue #14~~ — done (`aa63d19`), and it spun out #17
 
-Step 7 in [`PLAN.md`](PLAN.md), which carries the reasoning. The complement of
-the OOM pruner: that deletes rows above the fit, this stops spending the grid far
-below it. Needs no GPU — level generation is a pure function and its tests are
-`--selftest` material.
+`ngl_levels` now spans the top quarter when `predict_fits` says every layer fits
+at the deepest depth and largest KV in the design; `ngl=0` survives every verdict
+because the verdict can be wrong, and `--no-oom-prune` restores the even span.
+Reasoning in [`sweep-cost-design.md`](sweep-cost-design.md), which also records
+the framing correction worth carrying: this was never "80% of a factor's levels
+wasted" — in an orthogonal array every row informs every factor. It cost wall
+clock and additivity.
 
-Two things to get right. What decides "fits" when there is no `llama-fit-params`
-binary: only a crude file-size estimate exists, and biasing on one that errs
-optimistic drops exactly the partial-offload rows a run would need, so it should
-keep the even span unless it can be confident. And the fit test has to be taken
-at the *deepest* context in the sweep, not depth 0, or the grid is optimistic
-precisely where OOM is likeliest.
+**Issue #17** is what fell out: on MoE models `ngl` and `ncmoe` both decide what
+lives on the CPU, and `ngl=0 × any ncmoe` is a cell where `ncmoe` cannot act yet
+still votes on its own main effect — the `--factor mtp=0` shape again. Wants a
+real MoE model before choosing between `gated_by`, a constrained pair, or letting
+`ncmoe` own the axis outright.
 
-**The ordering here is contested, deliberately left open.** `PLAN.md` sequences
-this ahead of multi-GPU on cost: it is cheap, needs no hardware, and helps every
-user. The argument against is that it unblocks nobody — issue #5's reporter has
-the only two-GPU box available to this project, and what they are waiting on is
-`-sm`/`-ts`, whose prerequisite is the per-device `parse_fit_print` work in
-step 8. Cheapest-first and unblock-the-tester-first genuinely disagree, and the
-next session should pick knowingly rather than inherit the order by default.
+**The ordering question this section used to pose is settled by having done it.**
+Step 8 (multi-GPU) is next on its own merits, and still needs hardware this
+project does not have.
 
 ## Then
 

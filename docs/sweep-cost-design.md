@@ -217,13 +217,16 @@ pruner uses, so the two cannot disagree about what fits. It answers True / False
   estimator enough to delete rows has not asked it to trust it enough to shape
   the grid either.
 
-### Not addressed here
+### Not addressed here — issue #17
 
 Whether `ngl` and `ncmoe` should both be arguing about what lives on the CPU on
 MoE models. The bias makes them agree more often — a fitting MoE model now gets
-its `ngl` levels near the top, leaving `ncmoe` as the offload axis — but nothing
-here stops them contradicting each other, and the fix for that is a constrained
-or conditional relation, not a level-set change.
+its `ngl` levels near the top, leaving `ncmoe` as the offload axis — but that is a
+side effect, not a fix: nothing stops them contradicting each other, and on a
+model that does *not* fit the even span is restored and the overlap is back in
+full. `ngl=0 × any ncmoe` is the sharp case, where `ncmoe` cannot act yet still
+votes on its own main effect. The fix is a constrained or conditional relation,
+not a level-set change, and it wants a real MoE model to choose between them.
 
 ## Invariants
 
