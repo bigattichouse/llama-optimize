@@ -66,7 +66,7 @@ that catch it.
 
 ## Do these first
 
-### 1. Issue #11 — closed out; one question left with the reporter
+### 1. Issue #11 — closed
 
 **Everything this issue produced has landed** (`b1170ed`, `032c153`, `63452e7`).
 Four defects, only the first of which the issue was filed about:
@@ -104,12 +104,23 @@ prompt was ~26,900 tokens, not 40,960. Four requests × (26.9k prefill at pp=118
 + 256 tokens at tg=45.6) = **113.3 s** against the recorded 113.36. Their second
 CSV agrees independently. No deadline cut anything short.
 
-**Outstanding with the reporter, and it is the only thing:** one run with
-`--factor mtp=0` and the `spec_*` factors dropped, at `--factor n_depth=8192`.
-Both remaining unknowns point at the speculative path — the 333,362 t/s counter,
-and whether any reuse survives with MTP off — and that single run separates them.
-It was asked for before `63452e7` and generated 25 runs; on current `main` it is
-one. Nothing is blocked on the answer.
+**The confirming run came back and settled both unknowns** (`mtp=0`,
+`n_depth=8192`, on `63452e7`):
+
+- `cache_hit=0.0` with speculation off, at a depth with `n_ctx` to spare — so the
+  cache miss is the architecture, not the speculative path. Issue #15.
+- `tg=15.98`, `rejected_reps=0`, no discard — so the 333,362 t/s counter follows
+  MTP. A llama.cpp accounting problem in the speculative path, not ours; the
+  per-rep screening handles it by dropping the rep rather than the row.
+- `prompt_tok=16435` against 16,384 requested (**+0.3%**), where the old sizing
+  would have built 10,832 (66%). The calibration fix is confirmed on their model,
+  not just on gemma-3.
+- The row reconciles to 101.8s against a recorded `secs` of 102.89 (1.1%), with
+  a 0.3% spread across reps. Nothing unaccounted for.
+
+Incidental, worth remembering: `mtp=1` measured 45.6 t/s at a *deeper* context
+against 16.0 with MTP off. Different depths, so a floor rather than a number —
+but MTP is earning its keep on this model.
 
 **Spun out rather than left in this issue's tail**, so they do not die with it —
 same treatment as #14:
