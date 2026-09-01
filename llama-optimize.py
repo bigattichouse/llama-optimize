@@ -1165,18 +1165,52 @@ def spec_type_levels(cfg: "Config") -> list[str]:
     return levels
 
 
+# Levels that are llama.cpp `--spec-type` names rather than a detected draft
+# architecture. `spec_type_levels` only ever generates `none`, `draft-mtp` and an
+# architecture, but `--factor spec_type=...` can name any of these by hand.
+SPEC_TYPE_NAMES = frozenset({
+    "draft-simple", "draft-eagle3", "draft-mtp", "draft-dflash", "draft-dspark",
+    "ngram-simple", "ngram-map-k", "ngram-map-k4v", "ngram-mod", "ngram-cache"})
+
+# `--spec-type` values llama.cpp cannot work out from a draft GGUF, so they have
+# to be named. eagle3 is llama.cpp's own outstanding TODO in
+# `common/preset.cpp`: "handle 'eagle3-' when it's supported by
+# common_speculative_types_from_gguf()". Naming it is not the risk; believing it
+# has been exercised here is, so choosing it says so.
+SPEC_TYPES_NOT_INFERRED = frozenset({"draft-eagle3"})
+
+
 def spec_type_args(cfg: "Config", level: str) -> list[str]:
     """Server flags for one `spec_type` level.
 
     `none` emits nothing. `draft-mtp` names the type, since the head is inside
-    the target model and there is nothing to point at. Any other level is a
-    supplied draft model: emit `-md` and let llama.cpp read the type off it,
-    rather than pre-empting an inference it does better (issue #19)."""
+    the target model and there is nothing to point at. A level that IS a
+    llama.cpp type name is passed through, with `-md` alongside it when the type
+    needs a head to point at — that is the path `--factor spec_type=draft-eagle3`
+    takes. Anything else is a detected draft architecture: emit `-md` and let
+    llama.cpp read the type off the file, rather than pre-empting an inference it
+    does better (issue #19)."""
     if level == "none":
         return []
     if level == "draft-mtp":
         return ["--spec-type", "draft-mtp"]
+    if level in SPEC_TYPE_NAMES:
+        dm = getattr(cfg, "draft_model", None)
+        named = ["--spec-type", level]
+        return (["-md", str(dm)] + named
+                if dm and level.startswith("draft-") else named)
     return draft_model_args(cfg)
+
+
+def spec_type_note(level: str) -> str | None:
+    """What a user choosing this level should know before believing the row."""
+    if level in SPEC_TYPES_NOT_INFERRED:
+        return (f"note: --spec-type {level} has to be named explicitly — "
+                f"llama.cpp cannot infer it from a draft GGUF (its own TODO in "
+                f"common/preset.cpp). Supply the head with --draft-model, and "
+                f"treat the first result as unverified: this path has never been "
+                f"exercised here.")
+    return None
 
 
 def draft_self_describes(path) -> bool:
@@ -5512,6 +5546,30 @@ def selftest() -> bool:
         assert "--spec-type draft-mtp" not in server_command(cfg_dm, {"ngl": "99"}, 4096)
         assert "--spec-type draft-mtp" in server_command(cfg_no, {"ngl": "99"}, 4096)
 
+        # --- a hand-named spec type works, and says what it is (issue #19) ---
+        # spec_type_levels only generates none/draft-mtp/<detected arch>, but
+        # --factor spec_type=... can name any of llama.cpp's eleven values. The
+        # ones it cannot infer from a draft GGUF have to be named, and choosing
+        # one should not imply it has been exercised here.
+        _cfg_e3 = Config(model=Path("q.gguf"), llama_bench=Path("b"),
+                         llama_server=Path("s"), array="auto", ctx_floor=8192,
+                         driver="server", draft_model=Path("e3.gguf"),
+                         hw={"phys": 8, "logical": 16, "n_layers": 32,
+                             "n_ctx_train": 32768, "n_experts": 0, "n_nextn": 0})
+        _e3 = spec_type_args(_cfg_e3, "draft-eagle3")
+        assert _e3[_e3.index("--spec-type") + 1] == "draft-eagle3", _e3
+        assert "-md" in _e3, _e3               # the head still has to be pointed at
+        # a named ngram variant needs no draft model alongside it
+        _nc = spec_type_args(_cfg_e3, "ngram-cache")
+        assert _nc == ["--spec-type", "ngram-cache"], _nc
+        # a DETECTED architecture is still left to llama.cpp's own inference
+        assert "--spec-type" not in spec_type_args(_cfg_e3, "dflash")
+        # and the note fires for exactly the types llama.cpp cannot infer
+        assert "cannot infer" in (spec_type_note("draft-eagle3") or "")
+        assert spec_type_note("draft-mtp") is None
+        assert spec_type_note("dflash") is None
+        assert spec_type_note("none") is None
+
         # --- ngram-cache is reachable, though not screened by default ---
         # llama.cpp ships eleven --spec-type values; ngram-cache was the last one
         # the tool could not express at all. It cannot join the screen: the gate
@@ -9526,6 +9584,10 @@ def main():
         print(f"  {name:10s}: {', '.join(levels)}")
     # Say when the ngl grid was reshaped, and why. A level set that silently
     # depends on an estimate is one the reader cannot check (issue #14).
+    for _lvl in cfg.factors.get("spec_type", []):
+        _note = spec_type_note(_lvl)
+        if _note:
+            print(f"  {_note}")
     if getattr(cfg, "ngl_recurrent", False):
         print("  note: ngl is 0 or 99 only — this model has recurrent (SSM) "
               "memory, and every partial offload core-dumped llama-server when "
