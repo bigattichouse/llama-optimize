@@ -136,12 +136,14 @@ needs two non-identical GPUs and by construction cannot be tested here.
   [`constants-audit.md`](constants-audit.md). `FIXED_FA` is the sharpest and the
   least tractable: it needs a non-ROCm backend to validate.
 - **RoPE/YaRN tail** — complete the family or state the scope.
-- **Issue #15 — prefix reuse on hybrid/recurrent and SWA models.** `-ctxcp` /
-  `--ctx-checkpoints` and `--cache-ram` are the only llama.cpp knobs that can
-  deliver any reuse there, and neither is swept or set — so `--profile agents`
-  measures a workload those users cannot get
-  ([`workload-shape-design.md`](workload-shape-design.md)). Needs a hybrid or SWA
-  model on a GPU, so it is opportunistic rather than scheduled.
+- **Issue #15 — prefix reuse on hybrid/recurrent models.** The SWA half is done:
+  `swa_full` is swept automatically, because `--swa-full` is what restores reuse
+  past the window and `--ctx-checkpoints` measurably is not
+  ([`workload-shape-design.md`](workload-shape-design.md)). What remains needs a
+  hybrid model resident on the GPU, so it is opportunistic.
+- **Issue #18 — hybrid models core-dump at partial `-ngl`.** Three of five default
+  levels abort on `qwen35`. Blocked on one ~18 GB run to learn whether `-ngl 99`
+  works; if it does, the grid should collapse to `[0, 99]` on that class.
 - **Issue #17 — `ngl` and `ncmoe` both decide what lives on the CPU on MoE
   models.** `ngl=0 x any ncmoe` is a cell where `ncmoe` cannot act; `is_inert`
   now stops such a cell voting once the relation is declared, but the relation

@@ -125,9 +125,22 @@ but MTP is earning its keep on this model.
 **Spun out rather than left in this issue's tail**, so they do not die with it —
 same treatment as #14:
 
-- **Issue #15** — prefix reuse is unattainable on hybrid/recurrent and SWA
-  models, and `--ctx-checkpoints` is not swept. **Still open; needs a hybrid or
-  SWA model on a GPU.**
+- **Issue #15** — measured (`4cd1931`), and two thirds of what it claimed was
+  wrong. `--ctx-checkpoints` is *not* the lever (no effect at 0/32/128/512, nor
+  `--cache-ram`); **`--swa-full` is**, and it is now swept automatically on models
+  carrying `{arch}.attention.sliding_window`. The failure is also intermittent
+  rather than total — rep1 reuses, rep2 does not, once the window has scrolled
+  past the prefix — and depth decides whether it happens at all (the same model at
+  1,960 tokens reuses fine, which is why the first control saw nothing). **Still
+  open** for the recurrent half: hybrid models have no equivalent knob, and
+  whether `--swa-full` helps a hybrid's *attention* layers is untested because the
+  smallest such model here is 18 GB.
+- **Issue #18** — new, and found while measuring #15: `llama-server` core-dumps at
+  any *partial* `-ngl` on a hybrid SSM model (`-ngl 5` and `-ngl 40` both; `-ngl 0`
+  is fine), so three of five default `ngl` levels abort. The open question is
+  whether `-ngl 99` works, which decides whether the grid should collapse to
+  `[0, 99]` on that model class — it needs ~18 GB on a shared card and was
+  deliberately not spent.
 - **~~Issue #16~~** — done (`866e9e3`), and the fix is not the one the issue
   proposed. Staging the `mtp` gate was measured first and rejected: eleven other
   factors already force L125, so removing the four spec columns shrinks nothing
