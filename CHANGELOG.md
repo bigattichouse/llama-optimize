@@ -84,6 +84,24 @@ earlier.
 - **The recommended `-c` could exceed the context the sweep ever loaded.** It was
   derived from the requested depth; it is now capped by the delivered one.
 
+- **`swa_full` is now swept automatically on sliding-window models.** [Issue #15].
+  Past the sliding window, a shared-prefix workload loses its prompt cache: on
+  gemma-3-270m with a 15.7k-token prompt at 90% requested reuse, the *second* rep
+  re-prefills the entire prompt (0% cache hit) because the window has scrolled
+  past the prefix. `--swa-full` holds it at 90%. Measured against the
+  alternatives, which do nothing: `--ctx-checkpoints` at 0, 32, 128 and 512, and
+  `--cache-ram`. The flag is not free — attention loses the sliding-window
+  shortcut, 388 t/s prefill against 4283 — but it replaces a 15.7k-token
+  re-prefill with a 1.6k-token one, so which side wins is a measurement, not a
+  default. Detected from `{arch}.attention.sliding_window` in the GGUF; server
+  driver only, and skipped on models that attend globally, where llama.cpp
+  disables the flag itself.
+
+  **Hybrid/recurrent models (`qwen35` and friends) have no equivalent knob** — a
+  recurrent state cannot be rolled back to an arbitrary prefix at all — so for
+  that class prefix reuse remains unavailable and `cache_hit` is the thing to
+  read before believing a reuse-shaped result.
+
 - **A speculative knob that could not act still voted on its own main effect.**
   [Issue #16]. With `mtp` swept, half the rows carry `spec_n_max` and friends at
   levels that do nothing, and those rows were averaged into their effects — a
@@ -585,3 +603,4 @@ crash journal, `--resume`, `--iterate`, `--diff`, and a GPU-free `--selftest`.
 [issue #11]: https://github.com/bigattichouse/llama-optimize/issues/11
 [Issue #14]: https://github.com/bigattichouse/llama-optimize/issues/14
 [Issue #16]: https://github.com/bigattichouse/llama-optimize/issues/16
+[Issue #15]: https://github.com/bigattichouse/llama-optimize/issues/15

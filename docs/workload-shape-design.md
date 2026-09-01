@@ -337,16 +337,56 @@ llama.cpp — it is what the architecture costs — but it means the `agents` pr
 measures a workload nobody asked for whenever the model is hybrid/recurrent or
 SWA, and it does so silently unless `cache_hit` is being read.
 
+### Measured: SWA is fixable, recurrent is not (issue #15)
+
+The paragraph above lumped SWA and hybrid/recurrent together and guessed that
+`--ctx-checkpoints` was the lever. Both halves were wrong. Measured on
+gemma-3-270m (SWA, window 512) with the battery's own shape — 15.7k-token prompt,
+90% requested reuse, warm plus two reps:
+
+| server flags | warm | rep1 | rep2 |
+|---|---|---|---|
+| default (`-ctxcp 32`) | 0% | 90% | **0%** |
+| `-ctxcp 0` | 0% | 90% | **0%** |
+| `-ctxcp 128` | 0% | 90% | **0%** |
+| `-ctxcp 512` | 0% | 90% | **0%** |
+| `--cache-ram 8192` | 0% | 90% | **0%** |
+| **`--swa-full`** | 0% | 90% | **90%** |
+
+Three things fall out of that table.
+
+**The failure is intermittent, not total.** rep1 reuses and rep2 does not. After
+rep1, the sliding window has scrolled past the shared prefix, so rep2's
+`pos_min` clears `pos_min_thold` and the checkpoint search decides the whole
+prompt must be reprocessed. A `cache_hit` averaged over reps therefore lands
+somewhere in the middle and looks like partial reuse rather than a switch that
+flipped — which is how this hid.
+
+**Depth decides whether it happens at all.** The same model at a 1,960-token
+prompt reuses 90% on every rep. The first control run was too shallow to see it,
+and it is exactly the deep-context profiles (`agents`) that cross the line.
+
+**`--ctx-checkpoints` is not the lever, `--swa-full` is.** Checkpoints made no
+difference at 0, 32, 128 or 512, and neither did `--cache-ram`. `--swa-full`
+fixes it outright. It is not free — the reused reps run at 388 t/s prefill
+against 4283 t/s without it, because attention no longer takes the sliding-window
+shortcut — but it replaces a 15.7k-token re-prefill with a 1.6k-token one, worth
+roughly 3-6x on this workload. A trade with a real cost on both sides is a thing
+to **measure**, so `swa_full` is now swept automatically whenever
+`{arch}.attention.sliding_window` is present in the GGUF (gemma3, gemma4,
+muse-glimmer here; absent on qwen35).
+
+**Hybrid/recurrent models have no such knob.** There is no `--swa-full` for a
+recurrent state: it cannot be rolled back to an arbitrary prefix at all, which is
+what the source says and what the reporter's 0%-at-every-depth shows. For that
+class, prefix reuse is genuinely unavailable, and the honest thing is to say so
+rather than sweep a knob that cannot help.
+
 Consequences:
 
 - The miss warning names this cause first. Its previous advice ("try a smaller
   `--n-depth`") is the *second* cause, and was wrong here: reuse was 0% at depth
   8192 with ~6k tokens of `n_ctx` to spare.
-- `-ctxcp` / `--ctx-checkpoints` (and `--cache-ram`) are the only llama.cpp knobs
-  that can restore any reuse on these models, and we do not sweep or set either.
-  Filed as **issue #15**, with the open questions — whether checkpoints deliver
-  reuse at `agents` depths at all, at what memory cost, and whether this is a
-  factor or an input.
 - It also explains the reporter's earlier result that `--prefix-reuse 100` did not
   clear the rejection. It was never going to: the delivered reuse was 0 either
   way, so the reps re-prefilled and the wall clock stayed mostly prefill.

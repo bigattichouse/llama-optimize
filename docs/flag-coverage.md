@@ -217,7 +217,12 @@ about is how inert columns get created.
       rows that set it, because these flags reduce the footprint and ignoring
       one over-estimates in the direction that prunes valid configs
 - [ ] `-sps` folded into [`workload-shape-design.md`](workload-shape-design.md)
-- [ ] Auto-sweep `swa_full` if SWA turns out to be detectable from GGUF metadata
+- [x] Auto-sweep `swa_full` — SWA **is** detectable from GGUF metadata
+      (`{arch}.attention.sliding_window`, present on gemma3/gemma4/muse-glimmer,
+      absent on qwen35), and the flag decides whether a shared-prefix workload
+      gets prefix reuse at all past the window: measured 0% vs 90% on the second
+      rep of a 15.7k-token prompt (issue #15,
+      [`workload-shape-design.md`](workload-shape-design.md)). Server driver only.
 - [ ] Decide the RoPE/YaRN tail: complete the family or state the scope
 - [ ] `--audit-flags` mode + exclusion allow-list in code, with `--selftest`
       coverage over captured `--help` text (no binary, no GPU)

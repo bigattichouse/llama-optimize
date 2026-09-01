@@ -1099,6 +1099,33 @@ def model_context_length(meta: dict) -> int | None:
     return _meta_int(meta, ".context_length")
 
 
+def model_hw(meta: dict) -> dict:
+    """The model-derived half of `cfg.hw`, straight from GGUF metadata.
+
+    Extracted so the path from a metadata key to a swept factor can be tested at
+    all. Every entry here gates a factor — `n_experts` picks `ncmoe` vs
+    `ffn_place`, `n_nextn` the speculative family, `n_swa` the `swa_full` pair —
+    so a key that silently reads 0 deletes a whole column from the design, and
+    the deletion looks exactly like a model that does not have the feature.
+    That was untestable while it lived inline in `main` (issue #15)."""
+    return {"n_layers": model_block_count(meta),
+            "n_experts": model_expert_count(meta),
+            "n_ctx_train": model_context_length(meta),
+            "n_nextn": model_nextn_layers(meta),
+            "n_swa": model_swa_window(meta)}
+
+
+def model_swa_window(meta: dict) -> int:
+    """Sliding-window size for a SWA model; 0 when the model attends globally.
+
+    `{arch}.attention.sliding_window` — present and non-zero on gemma3, gemma4
+    and muse-glimmer here; absent on qwen35 and ordinary transformers. Detectable
+    is the whole point: `swa_full` is a knob that decides whether a shared-prefix
+    workload gets prefix reuse at all, and a factor nobody knows to set by hand
+    is one nobody sets (docs/flag-coverage.md, issue #15)."""
+    return _meta_int(meta, ".attention.sliding_window") or 0
+
+
 def model_nextn_layers(meta: dict) -> int:
     """MTP (multi-token-prediction / NextN) head layers; 0 means no MTP head.
     Present in e.g. Unsloth Dynamic quants that support draft-mtp speculative
@@ -1426,6 +1453,17 @@ def build_factors(cfg: Config):
         factors["spec_n_min_frac"] = ["0.0", "0.5", "1.0"]
         factors["spec_p_min"] = ["0.0", "0.25", "0.5", "0.75", "0.9"]
         factors["spec_p_split"] = ["0.1", "0.3", "0.5"]
+    # Sliding-window attention: --swa-full decides whether the SWA layers keep a
+    # full-size KV cache. Measured on gemma-3-270m at a 15.7k-token prompt with a
+    # 90% shared prefix (issue #15): WITHOUT it the second rep re-prefills the
+    # entire prompt (0% cache hit) because the window has scrolled past the
+    # prefix; WITH it every rep reuses 90%. That is a 3-6x difference on this
+    # workload, paid for in KV memory and slower attention -- exactly the shape
+    # of a thing to measure rather than assume. Server-only (`--swa-full` has no
+    # llama-bench spelling), and skipped on models that attend globally, where
+    # llama.cpp disables the flag itself and every level would be the same run.
+    if cfg.driver == "server" and cfg.hw.get("n_swa", 0) > 0:
+        factors["swa_full"] = ["0", "1"]
     # Projector placement, present only when there IS a projector — without
     # --mmproj llama.cpp has nothing to offload and every level is the same run.
     if cfg.driver == "server" and cfg.mmproj:
@@ -4938,6 +4976,61 @@ def selftest() -> bool:
         assert five_levels_span(0, 64) == [0, 16, 32, 48, 64]
         assert ngl_levels(64)[0] == 0 and ngl_levels(64)[-1] == 64
 
+        # --- swa_full is swept when the model has SWA (issue #15) ---
+        # Measured on gemma-3-270m, 15.7k-token prompt, 90% shared prefix: the
+        # SECOND rep re-prefills the whole prompt (0% cache hit) because the
+        # sliding window has scrolled past the shared prefix. `--swa-full` keeps
+        # every rep at 90%. `--ctx-checkpoints` at 0, 32, 128 and 512 changes
+        # nothing, and neither does `--cache-ram` -- which is why this is the
+        # knob and those are not.
+        assert model_swa_window({"gemma3.attention.sliding_window": 512}) == 512
+        assert model_swa_window({"gemma4.attention.sliding_window": 1024}) == 1024
+        # a globally-attending model has no such key, and llama.cpp disables the
+        # flag itself there, so every level would be the same run
+        assert model_swa_window({"qwen35.block_count": 64}) == 0
+        assert model_swa_window({}) == 0
+
+        # the whole path from metadata key to swept factor, in one hop. Every
+        # entry in model_hw gates a factor, so a key that silently reads 0
+        # deletes a column from the design and the deletion is indistinguishable
+        # from a model that lacks the feature.
+        _g3 = model_hw({"gemma3.block_count": 18,
+                        "gemma3.context_length": 32768,
+                        "gemma3.attention.sliding_window": 512})
+        assert _g3 == {"n_layers": 18, "n_experts": 0, "n_ctx_train": 32768,
+                       "n_nextn": 0, "n_swa": 512}, _g3
+        _q = model_hw({"qwen35.block_count": 64,
+                       "qwen35.context_length": 262144,
+                       "qwen35.nextn_predict_layers": 1})
+        assert _q == {"n_layers": 64, "n_experts": 0, "n_ctx_train": 262144,
+                      "n_nextn": 1, "n_swa": 0}, _q
+        # and it reaches the design: metadata in, factor out
+        assert "swa_full" in build_factors(Config(
+            model=Path("g.gguf"), llama_bench=Path("b"), llama_server=Path("s"),
+            array="auto", ctx_floor=8192, driver="server",
+            hw={**_g3, "phys": 8, "logical": 16}))
+        assert "swa_full" not in build_factors(Config(
+            model=Path("q.gguf"), llama_bench=Path("b"), llama_server=Path("s"),
+            array="auto", ctx_floor=8192, driver="server", emit_mtp=False,
+            hw={**_q, "phys": 8, "logical": 16}))
+
+        _hw_swa = {"phys": 8, "logical": 16, "n_layers": 18,
+                   "n_ctx_train": 32768, "n_experts": 0, "n_nextn": 0}
+        cfg_swa = Config(model=Path("g.gguf"), llama_bench=Path("b"),
+                         llama_server=Path("s"), array="auto", ctx_floor=8192,
+                         driver="server", hw={**_hw_swa, "n_swa": 512})
+        assert build_factors(cfg_swa)["swa_full"] == ["0", "1"]
+        # not on a model that attends globally...
+        cfg_glob = Config(model=Path("q.gguf"), llama_bench=Path("b"),
+                          llama_server=Path("s"), array="auto", ctx_floor=8192,
+                          driver="server", hw={**_hw_swa, "n_swa": 0})
+        assert "swa_full" not in build_factors(cfg_glob)
+        # ...and not on the bench driver, which has no spelling for it
+        cfg_bench = Config(model=Path("g.gguf"), llama_bench=Path("b"),
+                           llama_server=Path("s"), array="auto", ctx_floor=8192,
+                           driver="bench", hw={**_hw_swa, "n_swa": 512})
+        assert "swa_full" not in build_factors(cfg_bench)
+
         # --- ngl grid knows about VRAM (issue #14) ---
         # An even 0..n_layers span spends its slowest rows where the answer
         # cannot be: on a model that fits entirely, every CPU-offload level is a
@@ -8264,10 +8357,11 @@ def main():
             args.html.parent.mkdir(parents=True, exist_ok=True)
 
     meta = read_gguf_metadata(args.model)
-    n_layers = model_block_count(meta)
-    n_experts = model_expert_count(meta)
-    n_ctx_train = model_context_length(meta)
-    n_nextn = model_nextn_layers(meta)
+    mhw = model_hw(meta)
+    n_layers = mhw["n_layers"]
+    n_experts = mhw["n_experts"]
+    n_ctx_train = mhw["n_ctx_train"]
+    n_nextn = mhw["n_nextn"]
     phys = detect_physical_cores()
     logical = detect_logical_cores()
     # Resolved before hardware detection: capacity now comes from llama.cpp
@@ -8361,8 +8455,7 @@ def main():
         fit_headroom_mib=args.fit_headroom,
         fit_params=fit_params,
         server_start_timeout=args.server_start_timeout,
-        hw={"phys": phys, "logical": logical, "n_layers": n_layers, "vram": vram,
-            "n_experts": n_experts, "n_ctx_train": n_ctx_train, "n_nextn": n_nextn,
+        hw={**mhw, "phys": phys, "logical": logical, "vram": vram,
             "numa_nodes": detect_numa_nodes()},
     )
     cfg.factors = build_factors(cfg)
