@@ -1126,6 +1126,60 @@ def model_hw(meta: dict) -> dict:
             "ssm_state": model_ssm_state(meta)}
 
 
+def draft_head_kind(path) -> str | None:
+    """The kind of speculative head a draft GGUF is, from its own architecture.
+
+    `dflash` covers both DFlash2 and DSpark — llama.cpp tells them apart by a
+    `markov_w1.weight` tensor, which is a tensor-level question this metadata
+    reader cannot answer and does not need to: the level emits `-md` alone and
+    lets `common_speculative_types_from_gguf` make that call. Any other
+    architecture is an ordinary draft model.
+
+    Measured on `Qwen3.8-27B-DFlash2-Q4_K_M.gguf`: `general.architecture =
+    dflash`, `dflash.block_count = 5`, `dflash.target_layers =
+    [6, 20, 34, 48, 62]`."""
+    if not path:
+        return None
+    try:
+        arch = read_gguf_metadata(Path(path)).get("general.architecture")
+    except (OSError, ValueError):
+        return None
+    return str(arch) if arch else None
+
+
+def spec_type_levels(cfg: "Config") -> list[str]:
+    """The speculative heads this model can actually be measured with.
+
+    `none` always; `draft-mtp` when the target ships a NextN head; and the
+    supplied draft model's own kind when there is one. Two or fewer levels means
+    there is no choice to sweep and the older `mtp` on/off factor covers it —
+    this exists for the case the field report raised (issue #19), where a model
+    has an embedded MTP head AND a DFlash2 head is available, and the question
+    "which one is faster" could not be put to the sweep at all."""
+    levels = ["none"]
+    if cfg.driver == "server" and cfg.hw.get("n_nextn", 0) > 0 and cfg.emit_mtp:
+        levels.append("draft-mtp")
+    kind = draft_head_kind(getattr(cfg, "draft_model", None))
+    if kind and kind not in levels:
+        levels.append(kind)
+    return levels
+
+
+def spec_type_args(cfg: "Config", level: str) -> list[str]:
+    """Server flags for one `spec_type` level.
+
+    `none` emits nothing. `draft-mtp` names the type, since the head is inside
+    the target model and there is nothing to point at. Any other level is a
+    supplied draft model: emit `-md` and let llama.cpp read the type off it,
+    rather than pre-empting an inference it does better (issue #19)."""
+    if level == "none":
+        return []
+    if level == "draft-mtp":
+        return ["--spec-type", "draft-mtp"]
+    dm = getattr(cfg, "draft_model", None)
+    return ["-md", str(dm)] if dm else []
+
+
 def draft_decides_spec_type(cfg: "Config") -> bool:
     """Whether an explicitly supplied draft model should pick the speculative
     type, rather than the target model's own MTP metadata.
@@ -1526,7 +1580,14 @@ def build_factors(cfg: Config):
     # speculative-decoding surface — on/off, draft lengths, and acceptance
     # thresholds — so the report MEASURES what MTP buys instead of assuming it.
     # Bench can't speculate (server-only knobs), and --no-mtp opts out.
-    if cfg.driver == "server" and cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0:
+    # More than one speculative head available (an embedded MTP head AND a
+    # supplied draft head): sweep WHICH one rather than MTP on/off, since that is
+    # the question and `mtp` cannot express it (issue #19). The spec_* tuning
+    # knobs stay at their defaults here — one comparison at a time.
+    _spec_levels = spec_type_levels(cfg)
+    if cfg.driver == "server" and len(_spec_levels) > 2:
+        factors["spec_type"] = _spec_levels
+    elif cfg.driver == "server" and cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0:
         factors["mtp"] = ["1", "0"]
         factors["spec_n_max"] = ["1", "2", "3", "4", "6"]
         # relative: n_min = floor(frac * n_max), so n_min <= n_max always. 0.0 is
@@ -2028,6 +2089,11 @@ FACTORS = {
     # Emitted by build_server_args rather than factor_flags: a level maps to
     # zero, two or three flags, which a flag tuple cannot express.
     "concurrency":  {"bench": None, "server": None, "kind": "cat", "server_only": True,
+                     "emitted_by_caller": True},
+    # Which speculative head to use. Emitted by the caller because the levels do
+    # not share a flag: `draft-mtp` names a type, a supplied draft head is `-md`
+    # and no type at all (llama.cpp reads it off the file), and `none` is silence.
+    "spec_type":    {"bench": None, "server": None, "kind": "cat", "server_only": True,
                      "emitted_by_caller": True},
     # --- context extension / capability (server only) ---
     "rope_scaling": {"bench": None, "server": ("--rope-scaling",), "kind": "cat", "server_only": True},
@@ -3114,7 +3180,11 @@ def build_server_args(cfg: Config, f: dict, port: int, n_ctx: int) -> list[str]:
     # the target's own head to a separate model — has_dft() is simply "was a -md
     # path given" (common/common.h) — so the same MTP head can be driven either
     # way, and only this makes the second route expressible (issue #12).
-    if cfg.draft_model:
+    # A supplied draft model is loaded only when this row asks for it: with a
+    # `spec_type` column the level decides, and loading a head the row is not
+    # measuring would both cost VRAM and let llama.cpp infer a type the row did
+    # not choose (issue #19).
+    if cfg.draft_model and "spec_type" not in f:
         args += ["-md", str(cfg.draft_model)]
     # A multimodal projector is a third resident artifact and the same kind of
     # input: it occupies VRAM from load, whether or not any image ever arrives.
@@ -3134,6 +3204,8 @@ def build_server_args(cfg: Config, f: dict, port: int, n_ctx: int) -> list[str]:
     if "batch_ratio" not in f:
         args += ["-b", str(max(FIXED_BATCH, ub))]
     args += _flat(factor_flags(cfg, f, "server"))
+    if "spec_type" in f:                          # swept: level decides the flags
+        args += spec_type_args(cfg, f["spec_type"])
     if "concurrency" in f:                        # swept: level decides the flags
         args += concurrency_flags(f["concurrency"])
     elif "parallel" not in f and cfg.parallel > 1:  # concurrency (fixed) if not swept
@@ -3141,7 +3213,8 @@ def build_server_args(cfg: Config, f: dict, port: int, n_ctx: int) -> list[str]:
     if cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0:
         # ...unless a draft model was supplied: llama.cpp reads its type off the
         # draft, and forcing draft-mtp here ran MTP instead of what was loaded
-        if "mtp" not in f and not draft_decides_spec_type(cfg):
+        if ("mtp" not in f and "spec_type" not in f
+                and not draft_decides_spec_type(cfg)):
             args += ["--spec-type", "draft-mtp"]
         # default n_max if not swept (and not already pinned for a derived
         # sibling); nothing to bound when mtp is explicitly off
@@ -3707,7 +3780,14 @@ def speculation_requested(cfg, f: dict) -> bool:
     a NextN head and --no-mtp was not given; ngram-mod whenever --ngram is on).
     Reading only the assignment would miss exactly those runs, which are the
     common case."""
-    if "mtp" in f:
+    if "spec_type" in f:
+        # the level IS the answer here: `none` asked for nothing, and every
+        # other level names a head. Checked first, because with this column
+        # present `mtp` is absent and the fixed-on branch below would flag every
+        # row -- including the `none` rows -- as speculation that failed to run.
+        if str(f["spec_type"]) != "none":
+            return True
+    elif "mtp" in f:
         if str(f["mtp"]) == "1":
             return True
     elif cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0:
@@ -5178,6 +5258,76 @@ def selftest() -> bool:
         # factor-level generation
         assert five_levels_span(0, 64) == [0, 16, 32, 48, 64]
         assert ngl_levels(64)[0] == 0 and ngl_levels(64)[-1] == 64
+
+        # --- spec_type: sweep WHICH head, not MTP on/off (issue #19) ---
+        # The field report was "DFlash2 seems a lot better than MTP" on a model
+        # that has both. `mtp` is a binary projection of a categorical axis, so
+        # the sweep could not put that question. It can now.
+        with tempfile.TemporaryDirectory() as _dtd:
+            _dfl = Path(_dtd) / "dflash.gguf"
+            _dfl.write_bytes(b"x")
+            _hw_two = {"phys": 8, "logical": 16, "n_layers": 65,
+                       "n_ctx_train": 32768, "n_experts": 0, "n_nextn": 1}
+
+            def _cfg_spec(**kw):
+                return Config(model=Path("q.gguf"), llama_bench=Path("b"),
+                              llama_server=Path("s"), array="auto",
+                              ctx_floor=8192, driver="server", emit_mtp=True,
+                              hw=dict(_hw_two), **kw)
+
+            # a real GGUF is needed to read the head's architecture, so stub the
+            # reader rather than fabricate one
+            _real_meta = read_gguf_metadata
+            try:
+                globals()["read_gguf_metadata"] = \
+                    lambda _p: {"general.architecture": "dflash"}
+                cfg_two = _cfg_spec(draft_model=_dfl)
+                assert spec_type_levels(cfg_two) == ["none", "draft-mtp", "dflash"]
+                f_two = build_factors(cfg_two)
+                assert f_two["spec_type"] == ["none", "draft-mtp", "dflash"]
+                # and `mtp` steps aside -- two columns cannot both own --spec-type
+                assert "mtp" not in f_two, f_two
+
+                # each level emits its own thing, and only its own thing
+                def _args(lvl):
+                    return build_server_args(cfg_two, {"spec_type": lvl,
+                                                       "ngl": "99"}, 8080, 4096)
+                _none, _mtp, _dfl_a = _args("none"), _args("draft-mtp"), _args("dflash")
+                assert "--spec-type" not in _none and "-md" not in _none, _none
+                assert "-md" not in _mtp, _mtp        # the head is in the target
+                assert _mtp[_mtp.index("--spec-type") + 1] == "draft-mtp", _mtp
+                assert "-md" in _dfl_a, _dfl_a        # ...this one is a file
+                # ...and no --spec-type with it: llama.cpp reads the type off the
+                # draft, and dflash vs dspark is a tensor-level distinction we
+                # deliberately do not try to make
+                assert "--spec-type" not in _dfl_a, _dfl_a
+
+                # spec_off must not fire on the level that asked for nothing
+                assert speculation_requested(cfg_two, {"spec_type": "none"}) is False
+                assert speculation_requested(cfg_two, {"spec_type": "dflash"}) is True
+                assert draft_cols(cfg_two, {"spec_type": "none"}, {}) == {}
+                assert draft_cols(cfg_two, {"spec_type": "dflash"}, {}) == {"spec_off": 1}
+
+                # `--factor spec_type=...` by hand, with no draft model: the
+                # column still owns the axis, so the fixed-on MTP default must
+                # not fire underneath it and turn a `none` row into draft-mtp
+                _hand = build_server_args(_cfg_spec(), {"spec_type": "none",
+                                                        "ngl": "99"}, 8080, 4096)
+                assert "--spec-type" not in _hand, _hand
+
+                # one head only: nothing to choose between, so the older on/off
+                # factor still covers it and the design does not change shape
+                cfg_one = _cfg_spec()
+                assert spec_type_levels(cfg_one) == ["none", "draft-mtp"]
+                f_one = build_factors(cfg_one)
+                assert "spec_type" not in f_one and f_one["mtp"] == ["1", "0"]
+                # a draft head on a model with NO embedded MTP head is also just
+                # two levels, and keeps today's behaviour
+                cfg_dm = _cfg_spec(draft_model=_dfl)
+                cfg_dm.hw["n_nextn"] = 0
+                assert spec_type_levels(cfg_dm) == ["none", "dflash"]
+            finally:
+                globals()["read_gguf_metadata"] = _real_meta
 
         # --- a supplied draft model picks the spec type (issue #19) ---
         # llama.cpp reads the type off the draft GGUF (arch `dflash` -> dflash or

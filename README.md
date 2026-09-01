@@ -161,6 +161,7 @@ Swept by default (auto-scaled to your hardware and model):
 | ngram map params | `--spec-ngram-<variant>-size-n/m, -min-hits` | `4..24 / 8..64 / 1..5`  | **--ngram tuning stage**: lookup n-gram, draft m-gram, and min hit thresholds (ngram-simple / map-k / map-k4v) |
 | ngram mod params | `--spec-ngram-mod-n-match/min/max` | `8..48 / 16..96 / 32..128` | **--ngram tuning stage**: ngram-mod hasher lookup length and range |
 | MTP on/off    | `--spec-type draft-mtp` | `1, 0`                          | **MTP models, server driver**: measures what speculative decoding actually buys |
+| Speculative head | `--spec-type` / `-md` | `none, draft-mtp, <draft arch>` | **when more than one head is available** (an embedded MTP head *and* a `--draft-model`): sweeps *which* one, replacing the `mtp` on/off column. A supplied head is loaded only for its own level, and llama.cpp reads its type off the file |
 | MTP draft len | `--spec-draft-n-max` / `-min` | `1..6` / `1, 2`           | **MTP models, server driver**: speculative draft lengths |
 | MTP acceptance | `--spec-draft-p-min` / `-p-split` | `0.0..0.9` / `0.1..0.5` | **MTP models, server driver**: draft acceptance thresholds |
 

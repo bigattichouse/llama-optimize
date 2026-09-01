@@ -217,6 +217,21 @@ earlier.
 
 ### Added
 
+- **`spec_type` factor: sweep *which* speculative head, not MTP on/off.**
+  [Issue #19]. Reported from the field — "DFlash2 seems a lot better than MTP" —
+  on a model that has both, where the sweep could not put that question at all
+  because `mtp` is a binary projection of a categorical axis. When more than one
+  head is available the design now carries `spec_type` (`none`, `draft-mtp`, and
+  the supplied draft's own architecture, e.g. `dflash`) and `mtp` steps aside;
+  with only one head, nothing changes.
+
+  The levels do not share a flag, which is why they are emitted by the caller:
+  `draft-mtp` names a type (the head is inside the target model), a supplied
+  draft head is `-md` and *no* type — llama.cpp reads it off the file, and
+  telling dflash from dspark is a tensor-level distinction we deliberately do not
+  attempt — and `none` is silence. `-md` is loaded only for the level that asks
+  for it, so a row is not charged VRAM for a head it is not measuring.
+
 - **Crashes are read as boundary measurements, not discarded.** A `SIGNAL` row
   says a parameter set is out of bounds, and the array already visited that
   region beside different partners — so a level that failed in *every* one of its
