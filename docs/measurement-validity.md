@@ -223,14 +223,29 @@ So the report leads with the scope rather than leaving the reader to supply it:
 
 ```
 RESULTS: 47/125 configs succeeded
-For Mistral-Small-24B-Instruct-2501.Q8_0.gguf, on ROCm0 (32752 MiB),
-8 physical cores, server driver, single profile — we find:
+For Mistral-Small-24B-Instruct-2501.Q8_0.gguf, on AMD Instinct MI60 / MI50
+(ROCm 7.2.1, 32752 MiB), 8 physical cores, server driver, single profile — we find:
 ```
 
-The quant rides in the model filename, which is why it is printed whole rather
-than prettified. Rows already carry `tool_version` and `llama_build` for the same
-reason: a CSV outlives the terminal it was printed in, and the question it has to
-answer later is "what produced this, and on what".
+Each part of that is there because it changes the answer and is not implied by
+the others:
+
+- **The quant** rides in the model filename, which is why it is printed whole
+  rather than prettified.
+- **The card**, not the device slot. `ROCm0` says which index answered; it does
+  not say what ran.
+- **The backend and its version.** The same card under ROCm, Vulkan and CUDA is
+  three different sets of kernels, and they change between backend releases —
+  a CUDA reader should see at a glance that a number came from somewhere else,
+  and a ROCm 6 reader that it came from ROCm 7. Read best-effort per backend
+  (`/opt/rocm/.info/version`, `nvidia-smi`, `vulkaninfo`); an unreadable version
+  is omitted rather than guessed.
+- **The capacity.** An MI50 ships in 16 GB and 32 GB variants, so it is part of
+  the identity rather than a detail beside it.
+
+Rows already carry `tool_version` and `llama_build` for the same reason: a CSV
+outlives the terminal it was printed in, and the question it has to answer later
+is "what produced this, and on what".
 
 ## A crash is a measurement of a boundary
 

@@ -362,6 +362,77 @@ def list_devices(binary: Path | None) -> list[dict]:
     return parse_list_devices((out.stdout or "") + "\n" + (out.stderr or ""))
 
 
+_BACKEND_VERSION_CACHE: dict = {}
+
+
+def backend_version(backend: str) -> str | None:
+    """Version of the compute backend, or None when it cannot be read cheaply.
+
+    The kernels are the product here, and they change between backend releases —
+    the same card on ROCm 6 and ROCm 7 is not the same measurement. llama.cpp's
+    own `--version` reports its build and the compiler, not the backend it links,
+    so this asks each backend where it keeps that.
+
+    Best-effort by construction: an unreadable version yields None and the label
+    simply omits it. Guessing a version would be worse than not printing one."""
+    key = (backend or "").lower()
+    if key in _BACKEND_VERSION_CACHE:
+        return _BACKEND_VERSION_CACHE[key]
+    ver = None
+    try:
+        if key in ("rocm", "hip"):
+            # written by the ROCm installer; a plain file read, no subprocess
+            for path in ("/opt/rocm/.info/version", "/opt/rocm/.info/version-dev"):
+                if Path(path).exists():
+                    ver = Path(path).read_text().strip().split("-")[0] or None
+                    break
+        elif key == "cuda":
+            # nvidia-smi's header carries the CUDA runtime the driver supports,
+            # which is the number that governs which kernels can run
+            out = subprocess.run(["nvidia-smi"], capture_output=True, text=True,
+                                 timeout=15)
+            m = re.search(r"CUDA Version:\s*([0-9.]+)", out.stdout or "")
+            ver = m.group(1) if m else None
+        elif key == "vulkan":
+            out = subprocess.run(["vulkaninfo", "--summary"],
+                                 capture_output=True, text=True, timeout=20)
+            m = re.search(r"apiVersion\s*=\s*[^(]*\(?([0-9]+\.[0-9]+\.[0-9]+)",
+                          out.stdout or "")
+            ver = m.group(1) if m else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        ver = None
+    _BACKEND_VERSION_CACHE[key] = ver
+    return ver
+
+
+def device_label(devs: list[dict]) -> str:
+    """How to name the hardware a result is conditioned on.
+
+    Three things, because all three change the answer and none of them is
+    obvious from the others:
+
+    - **The card.** "ROCm0" is which slot answered, not what ran.
+    - **The backend, with its version.** The same card under ROCm, Vulkan and
+      CUDA is three different sets of kernels, and they change between backend
+      releases too — a CUDA reader needs to see at a glance that a number came
+      from somewhere else, and a ROCm 6 reader that it came from ROCm 7.
+    - **The capacity**, added by the caller. An MI50 ships in 16 GB and 32 GB
+      variants, so it is part of the identity rather than a detail beside it.
+
+    Renders as `AMD Instinct MI60 / MI50 (ROCm 7.2.1)`, dropping the version when
+    it cannot be read."""
+    out = []
+    for d in devs:
+        backend = re.sub(r"\d+$", "", str(d.get("id", ""))).strip()
+        name = str(d.get("name", "")).strip() or d.get("id", "?")
+        if backend:
+            ver = backend_version(backend)
+            out.append(f"{name} ({backend} {ver})" if ver else f"{name} ({backend})")
+        else:
+            out.append(name)
+    return ", ".join(out)
+
+
 def detect_vram_mib(*binaries: Path | None) -> tuple[int, str] | None:
     """Best-effort total usable VRAM in MiB across ALL devices, with the source
     it came from. None if nothing could be read.
@@ -391,12 +462,7 @@ def detect_vram_mib(*binaries: Path | None) -> tuple[int, str] | None:
         devs = list_devices(binary)
         total = sum(d["total_mib"] for d in devs)
         if total > 0:   # a device list that adds to zero is not an answer
-            # Name the CARD, not just the backend slot. "ROCm0" says which
-            # device index answered; "AMD Instinct MI60 / MI50" says what the
-            # result is conditioned on -- and an MI50 ships in 16 GB and 32 GB
-            # variants, so the capacity is part of the identity too.
-            return total, "llama.cpp: " + ", ".join(
-                f"{d['id']} {d['name']}".strip() for d in devs)
+            return total, "llama.cpp: " + device_label(devs)
     # AMD / ROCm
     try:
         out = subprocess.run(["rocm-smi", "--showmeminfo", "vram", "--json"],
@@ -4710,8 +4776,13 @@ def result_scope(cfg: Config) -> str:
     gfx906" (docs/constants-audit.md C-A)."""
     src = str(cfg.hw.get("vram_src") or "").replace("llama.cpp: ", "")
     vram = cfg.hw.get("vram")
-    where = (f"{src} ({vram} MiB)" if src and vram else
-             src or (f"{vram} MiB VRAM" if vram else "this machine"))
+    if src and vram:
+        # fold the capacity into the label's own parentheses rather than opening
+        # a second pair: "MI50 (ROCm 7.2.1, 32752 MiB)", not "... ) (... )"
+        where = (f"{src[:-1]}, {vram} MiB)" if src.endswith(")")
+                 else f"{src} ({vram} MiB)")
+    else:
+        where = src or (f"{vram} MiB VRAM" if vram else "this machine")
     return (f"For {cfg.model.name}, on {where}, "
             f"{cfg.hw.get('phys', '?')} physical cores, "
             f"{cfg.driver} driver, {cfg.profile} profile — we find:")
@@ -5614,14 +5685,37 @@ def selftest() -> bool:
                          llama_bench=Path("b"), llama_server=Path("s"),
                          array="auto", ctx_floor=8192, driver="server",
                          hw={"phys": 8, "logical": 16, "vram": 32752,
-                             "vram_src": "llama.cpp: ROCm0 AMD Instinct MI60 / MI50"})
+                             "vram_src": "llama.cpp: AMD Instinct MI60 / MI50 "
+                                         "(ROCm 7.2.1)"})
         _sc = result_scope(_cfg_sc)
         assert "Some-Model-Q4_K_M.gguf" in _sc, _sc     # the quant is in the name
         # the CARD, not just the backend slot -- an MI50 ships in 16 GB and
         # 32 GB variants, so the capacity is part of the identity
         assert "MI50" in _sc and "32752" in _sc, _sc
+        # ...folded into one set of parentheses, not two
+        assert ") (" not in _sc, _sc
+        assert "(ROCm 7.2.1, 32752 MiB)" in _sc, _sc
         assert "8 physical cores" in _sc, _sc
         assert "server" in _sc, _sc
+        # the label names card, backend AND backend version, because all three
+        # change the kernels and none is obvious from the others
+        _real_bv = backend_version
+        try:
+            globals()["backend_version"] = lambda b: {"rocm": "7.2.1"}.get(b.lower())
+            assert device_label([{"id": "ROCm0", "name": "AMD Instinct MI50"}]) \
+                == "AMD Instinct MI50 (ROCm 7.2.1)"
+            # a backend whose version cannot be read still names the backend
+            assert device_label([{"id": "CUDA0", "name": "NVIDIA RTX 3090"}]) \
+                == "NVIDIA RTX 3090 (CUDA)"
+            # multi-GPU keeps llama.cpp's order and labels each
+            assert device_label([{"id": "CUDA0", "name": "A"},
+                                 {"id": "CUDA1", "name": "B"}]) \
+                == "A (CUDA), B (CUDA)"
+            # a device with no parseable backend is still named, not dropped
+            assert device_label([{"id": "", "name": "Weird"}]) == "Weird"
+        finally:
+            globals()["backend_version"] = _real_bv
+
         # and the name reaches it from the device list rather than being lost:
         # "ROCm0" is which slot answered, "AMD Instinct MI60 / MI50" is what the
         # number is conditioned on
