@@ -136,6 +136,26 @@ earlier.
   columns shrinks nothing and a screen-plus-tune split would cost 150 runs
   instead of 125.
 
+- **The OOM pruner priced the wrong KV placement on every row.**
+  `_fit_params_flags` emitted `--no-kv-offload` for `nkvo=0`, but `nkvo=1` is the
+  level that puts the KV cache in system RAM — that is what both drivers emit for
+  it, and `--no-kv-offload` is the same flag by another name (llama.cpp:
+  `-kvo, --kv-offload, -nkvo, --no-kv-offload`). So the estimate was inverted
+  against the run. Measured on gemma-4-31B at `-ngl 60 -c 65536 -ctk f16`:
+  **32,666 MiB with the KV on the GPU against 26,513 with it in RAM** — a 6 GB
+  error, in whichever direction the row sat.
+
+  Consequences ran both ways: `nkvo=0` rows were under-priced and admitted, then
+  OOM'd at launch; `nkvo=1` rows were over-priced and deleted as `SKIP_PRED`. The
+  regression test asserted the inversion, so it locked the bug in. There is now a
+  test that whenever a *driver* emits the flag the *estimator* does too, which is
+  the invariant that was missing.
+
+  Found by asking why `full_offload_fits` reported that a model fitted when
+  `llama-fit-params` says it needs 32,666 MiB of a 32,240 budget — so the `ngl`
+  grid was also being collapsed toward full offload on models where the
+  layers-for-context trade is exactly what the sweep should be exploring.
+
 - **On hybrid SSM models, three of five `ngl` levels aborted the server.**
   [Issue #18]. Mapped on `qwen35moe`: `-ngl` 0, 1, 2 run; **3 through n_layers all
   segfault**; `n_layers + 1` and above run. Every death is the same one, right
@@ -390,6 +410,18 @@ earlier.
 ## [0.2.0] — 2026-08-26
 
 ### ⚠️ Affects existing results
+
+- **OOM-pruning decisions on any sweep that varied `nkvo` were made against the
+  wrong KV placement.** The estimator had the two levels the wrong way round, a
+  ~6 GB error on a large model. `SKIP_PRED` rows with `nkvo=1` were very likely
+  fine and should have run; `nkvo=0` rows recorded as `OOM` or `SIGNAL` at launch
+  were admitted on an estimate that ignored their KV cache. Rows that produced a
+  number are unaffected — this only ever decided whether a config was *attempted*.
+
+  **Re-run sweeps that show `SKIP_PRED` rows, or launch failures at high depth**,
+  if the pruner was on (it is by default). Sweeps that never varied `nkvo` used
+  its default level throughout and are internally consistent, though the pruner
+  was still pricing that level's opposite.
 
 - **Server-driver rows were measured shallower than their `n_depth` says.** The
   prompt is built in characters at an assumed 4 chars/token, and the measured

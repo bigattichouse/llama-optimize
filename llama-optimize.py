@@ -757,8 +757,18 @@ def _fit_params_flags(cfg: "Config", f: dict, driver: str) -> list[str]:
     # KV cache type
     if "kv_type" in f:
         flags += ["-ctk", f["kv_type"], "-ctv", f["kv_type"]]
-    # KV offload: fit-params follows server conventions (--no-kv-offload)
-    if f.get("nkvo", "1") == "0":
+    # KV offload. `nkvo=1` is the level that puts the KV cache in SYSTEM RAM --
+    # that is what the drivers emit for it (server: a bare `-nkvo`; bench:
+    # `-nkvo 1`), and `--no-kv-offload` is the same flag by another name
+    # (llama.cpp: `-kvo, --kv-offload, -nkvo, --no-kv-offload`). This was
+    # inverted, so the estimator priced the OPPOSITE placement from the one the
+    # row would run. Measured on gemma-4-31B at -ngl 60 -c 65536 -ctk f16:
+    # 32666 MiB with the KV on the GPU against 26513 with `--no-kv-offload`, a
+    # 6 GB error in whichever direction the row happened to sit — under-pricing
+    # nkvo=0 rows into an OOM at launch, and over-pricing nkvo=1 rows into
+    # SKIP_PRED. Found while asking why `full_offload_fits` said a model fitted
+    # that llama-fit-params says needs 32666 of a 32240 budget.
+    if f.get("nkvo", "0") == "1":
         flags.append("--no-kv-offload")
     # Tensor placement overrides (ot factor — only when present and not "none")
     if "ot" in f:
@@ -7483,20 +7493,38 @@ def selftest() -> bool:
         class _FC:                        # minimal Config stand-in
             model = Path("m.gguf")
             fit_params = Path("fp")
-        f = {"ngl": "32", "n_depth": "32768", "kv_type": "q4_0", "nkvo": "0"}
+        f = {"ngl": "32", "n_depth": "32768", "kv_type": "q4_0", "nkvo": "1"}
         bench_flags = _fit_params_flags(_FC, f, "bench")
         assert "-ngl" in bench_flags and "32" in bench_flags
         assert "-c" in bench_flags and "32768" in bench_flags
         assert "-ctk" in bench_flags and "q4_0" in bench_flags
-        assert "--no-kv-offload" in bench_flags  # nkvo=0 → --no-kv-offload
-
+        # nkvo=1 is the level that puts the KV in SYSTEM RAM, and
+        # --no-kv-offload is llama.cpp's other name for the flag the drivers
+        # emit for it. This assertion was the wrong way round, and with it the
+        # estimator priced the opposite placement from the one that would run:
+        # measured 32666 MiB vs 26513 on gemma-4-31B at -c 65536 -ctk f16.
+        assert "--no-kv-offload" in bench_flags
         server_flags = _fit_params_flags(_FC, f, "server")
         assert "--no-kv-offload" in server_flags  # same for both drivers
 
-        # nkvo=1 (default) → no offload flag
-        f2 = {"ngl": "32", "n_depth": "8192", "kv_type": "f16", "nkvo": "1"}
+        # nkvo=0 keeps the KV on the GPU, so nothing is emitted and the estimate
+        # carries the context buffer
+        f2 = {"ngl": "32", "n_depth": "8192", "kv_type": "f16", "nkvo": "0"}
         assert "--no-kv-offload" not in _fit_params_flags(_FC, f2, "bench")
         assert "-nkvo" not in _fit_params_flags(_FC, f2, "bench")
+        # the estimator and the drivers must agree about which level means what:
+        # whenever a driver emits the flag, so does the estimator
+        _CFG_NKVO = Config(model=Path("m.gguf"), llama_bench=Path("b"),
+                           llama_server=Path("s"), array="auto", ctx_floor=8192,
+                           driver="server",
+                           hw={"phys": 8, "logical": 16, "n_layers": 32,
+                               "n_ctx_train": 32768, "n_experts": 0,
+                               "n_nextn": 0})
+        for _lvl in ("0", "1"):
+            _row = {"nkvo": _lvl}
+            _drv = "-nkvo" in _flat(factor_flags(_CFG_NKVO, _row, "server"))
+            _est = "--no-kv-offload" in _fit_params_flags(_FC, _row, "server")
+            assert _drv == _est, (_lvl, _drv, _est)
 
         # ot factor — pattern must be passed literally (no shell quoting)
         f3 = {"ngl": "32", "n_depth": "8192", "ot": "ffn_cpu"}
