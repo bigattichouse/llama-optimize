@@ -255,6 +255,18 @@ execute. Three of five default levels would otherwise be recorded as `SIGNAL`,
 which is honest but useless, and on a first run it looks like the tool is broken
 rather than the placement being impossible.
 
+**Under `--run` the box is asked, not told.** `probe_loadable_ngl` launches each
+candidate level, checks whether the server stands up, and keeps the ones that do
+— so the collapse above is a *default* for plan-only, not a ceiling. Verified
+against the model it was measured on: given `0, 30, 33, 37, 40, 99` it returns
+`0, 99` and reports the four that died. On a backend where the fused op is fine,
+it returns all six and the layers-for-context axis survives intact.
+
+That matters because which levels load is a property of the model, the backend
+and the build, and none of those is knowable from the machine this was written
+on. The cost is one server launch per candidate, weights usually already in page
+cache, and only on models with recurrent memory.
+
 **The gate is broader than the evidence, deliberately.** `ssm_state > 0` also
 matches Mamba, Jamba, RWKV and Falcon-H1, none of which has been tested, and all
 of the evidence is one architecture family on one backend (ROCm). Partial offload

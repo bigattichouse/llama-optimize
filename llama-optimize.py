@@ -1354,10 +1354,11 @@ def ngl_levels(n_layers: int | None, levels: int = 5,
     # Always include 0 (pure CPU) and the top (all layers). 99 = "all" is safe
     # since llama.cpp clamps to the real layer count.
     if recurrent:
-        # Nothing between these two loads. The OOM pruner may drop the 99 row on
-        # a model too big for the card, which correctly leaves CPU-only as the
-        # one placement that runs -- a real and useful thing for the report to
-        # say, rather than a grid full of SIGNAL rows.
+        # A conservative DEFAULT, not a verdict: 0 and 99 are the two placements
+        # measured to work here, and under --run `probe_loadable_ngl` asks this
+        # box which levels actually load and widens the grid back if they do. The
+        # collapse only stands where the probe cannot run -- plan-only, or a
+        # driver without a server to launch.
         return [0, 99]
     if fits and levels >= 3 and top >= 4:
         # anchor + a span across the top quarter, widened when a quarter is too
@@ -1374,6 +1375,33 @@ def ngl_levels(n_layers: int | None, levels: int = 5,
         step = max(1, len(inner) // max(1, levels - 2))
         lv = sorted(keep | set(inner[::step]))[:levels]
     return lv
+
+
+def probe_loadable_ngl(cfg: "Config", candidates: list, n_ctx: int,
+                       timeout: int) -> tuple[list, list]:
+    """Which `-ngl` levels actually load on THIS box. Returns (loadable, dead).
+
+    Replaces a verdict with a measurement. The failure this exists for was found
+    on one architecture family and one backend — `qwen35`/`qwen35moe` on ROCm,
+    where `-ngl` in `[3, n_layers]` segfaults llama-server — and baking that in
+    would delete the layers-for-context axis on hardware where the fused op is
+    fine. Which levels load is a property of the model, the backend and the
+    build, so it is asked here rather than assumed (issue #18).
+
+    Each candidate is a server launch with a deliberately small context, so the
+    cost is dominated by reading the weights (usually already in page cache after
+    the first) and nothing is measured — this only asks whether the process
+    stands up. Levels that fail are reported, never silently dropped: if the
+    answer is surprising, that is the finding."""
+    loadable, dead = [], []
+    for lv in candidates:
+        session = ServerSession(cfg, {**{k: v[0] for k, v in cfg.factors.items()
+                                         if v}, "ngl": str(lv)}, n_ctx, timeout)
+        try:
+            (loadable if getattr(session, "ok", False) else dead).append(lv)
+        finally:
+            session.close()
+    return loadable, dead
 
 
 def full_offload_fits(cfg: "Config", depths: list, kv_levels: list,
@@ -1483,6 +1511,9 @@ class Config:
     # set by build_factors: the model has recurrent memory, so partial -ngl is
     # not a placement that runs (issue #18)
     ngl_recurrent: bool = False
+    # the un-collapsed ngl span, kept so a run-time probe can restore levels the
+    # conservative default dropped (issue #18)
+    ngl_candidates: list = field(default_factory=list)
     min_tgs: float = 0.0        # abandon a config generating slower than this
     min_pps: float = 0.0        # ...or prefilling slower than this
     slow_grace: int = 60        # never judge a config on less than this many seconds
@@ -1531,6 +1562,11 @@ def build_factors(cfg: Config):
     # Recurrent models crash on any partial offload, so the grid has two usable
     # points and there is no sense generating the three that abort (issue #18).
     cfg.ngl_recurrent = int(cfg.hw.get("ssm_state", 0) or 0) > 0
+    # What the grid WOULD be without that collapse. `probe_loadable_ngl` asks the
+    # box which of these actually load and restores the ones that do, so the
+    # conservative default never becomes a ceiling on hardware it was not
+    # measured on (issue #18).
+    cfg.ngl_candidates = [str(x) for x in ngl_levels(n_layers, nlv, fits)]
     factors = {
         "ngl": [str(x) for x in ngl_levels(n_layers, nlv, fits,
                                            recurrent=cfg.ngl_recurrent)],
@@ -5521,6 +5557,40 @@ def selftest() -> bool:
         # and it changes nothing for a model without recurrent memory
         assert ngl_levels(64, 5, recurrent=False) == ngl_levels(64, 5)
 
+        # the collapsed grid is a DEFAULT, not a verdict: under --run the box is
+        # asked which levels load, and the ones that do come back. Otherwise a
+        # crash measured on one architecture and one backend would delete the
+        # layers-for-context axis on hardware nobody here has seen.
+        _real_sess = ServerSession
+        try:
+            class _StubSession:
+                loads = set()
+
+                def __init__(self, cfg, f, n_ctx, timeout):
+                    self.ok = int(f["ngl"]) in self.loads
+
+                def close(self):
+                    pass
+
+            globals()["ServerSession"] = _StubSession
+            cfg_pr = Config(model=Path("q.gguf"), llama_bench=Path("b"),
+                            llama_server=Path("s"), array="auto", ctx_floor=8192,
+                            driver="server")
+            cfg_pr.factors = {"ngl": ["0", "99"], "threads": ["4"]}
+            # a box where the fused op is fine: everything comes back
+            _StubSession.loads = {0, 10, 20, 30, 40, 99}
+            assert probe_loadable_ngl(cfg_pr, [0, 10, 20, 30, 40, 99], 512, 5) \
+                == ([0, 10, 20, 30, 40, 99], [])
+            # this box: the measured dead band drops out, the rest stays
+            _StubSession.loads = {0, 99}
+            live, dead = probe_loadable_ngl(cfg_pr, [0, 10, 20, 30, 40, 99], 512, 5)
+            assert live == [0, 99] and dead == [10, 20, 30, 40], (live, dead)
+            # nothing loads at all: the caller must not be handed an empty grid
+            _StubSession.loads = set()
+            assert probe_loadable_ngl(cfg_pr, [0, 99], 512, 5) == ([], [0, 99])
+        finally:
+            globals()["ServerSession"] = _real_sess
+
         # WIRING: read off the model's own metadata, like swa_full
         _hw_rec = {"phys": 8, "logical": 16, "n_layers": 64,
                    "n_ctx_train": 32768, "n_experts": 0, "n_nextn": 0,
@@ -9163,6 +9233,31 @@ def main():
             ap.error("--iterate needs --run")
         run_iterations(args, cfg)
         return
+
+    # Ask the box which -ngl levels load, rather than trusting a verdict measured
+    # somewhere else. Only where there is reason to doubt (recurrent memory: see
+    # ngl_levels) and only under --run, so plan-only keeps its promise to touch no
+    # GPU. What loads is a property of the model, the backend and the build, and
+    # none of those is knowable from here (issue #18).
+    if (args.run and getattr(cfg, "ngl_recurrent", False)
+            and cfg.driver == "server" and cfg.factors.get("ngl")):
+        cands = sorted({int(x) for x in
+                        (getattr(cfg, "ngl_candidates", None) or cfg.factors["ngl"])}
+                       | {int(x) for x in cfg.factors["ngl"]})
+        probe_ctx = cfg.n_prompt + cfg.n_gen + 256
+        print(f"probing which of -ngl {', '.join(map(str, cands))} load on this "
+              f"box (recurrent model; {len(cands)} launches)...", flush=True)
+        live, dead = probe_loadable_ngl(cfg, cands, probe_ctx, args.timeout)
+        if live:
+            cfg.factors["ngl"] = [str(x) for x in live]
+            if dead:
+                print(f"  -ngl {', '.join(map(str, dead))} did not load and are "
+                      f"dropped; sweeping {', '.join(map(str, live))}")
+            else:
+                print(f"  all {len(live)} load — sweeping the full span")
+        else:
+            print("  none loaded; leaving the grid alone so the sweep records "
+                  "what happens rather than deciding for you")
 
     # resolve the array now that the factor set is final
     if str(cfg.array).lower() == "auto":
