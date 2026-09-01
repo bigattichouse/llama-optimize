@@ -31,6 +31,32 @@ Worst case on an L125 at `--n-gen 256 --reps 3`: **41.7h → 3.5h** with
 Remaining: nothing reports, after a sweep, how much time the floors actually
 saved — that number would be the honest way to tune the advice.
 
+## 0b. Shareable fingerprints — idea, not yet designed
+
+[Issue #21](https://github.com/bigattichouse/llama-optimize/issues/21). The
+report now prints what a result is conditioned on — quant, model, card, backend
+and version, capacity, cores. The idea is to make that **shareable and
+comparable**: a structured fingerprint plus the gzipped results CSV, collected
+somewhere the next person can search before spending four hours sweeping.
+
+*"See if the community posted sweeps"* would invert the tool's cost. Today every
+user pays a full sweep to learn what their hardware does; a corpus turns the
+first run into a lookup and the sweep into confirmation.
+
+It is also the only way several of this project's open questions get answered.
+Flash attention measured 33% *slower* on Mistral-Small-24B Q8_0 on an MI50
+(ROCm 7.2.1) while the same card gains from it on other models; partial `-ngl`
+segfaults on hybrid SSM models under ROCm and nobody knows about CUDA; the depth
+at which prefix reuse collapses moves with architecture. Three people with
+different cards would settle all of them in a week, and this box cannot settle
+any of them.
+
+The hard parts are matching and privacy, not collection: nobody's machine is
+identical, so the product is really "how close is this fingerprint to mine", and
+a fingerprint must carry hardware identity without carrying the user (model
+*paths* leak usernames; basename and quant are what matter). Opt-in, never
+automatic.
+
 ## 1. Noise-aware picks — partially done
 
 Landed: `--verify-picks` (default on, 2 extra reps; `--full`=3) re-measures the
