@@ -4693,10 +4693,30 @@ def show_discards(rows: list[dict]) -> None:
         print(f"  run {r.get('run_id', '?')}: {r['implausible']}")
 
 
+def result_scope(cfg: Config) -> str:
+    """The sentence every number below the header is conditioned on.
+
+    A measurement is never a general fact: the same knob flips answer across the
+    quant, the model and the box. Flash attention measured 33% SLOWER on
+    Mistral-Small-24B Q8_0 on an MI50 at 4k depth, and faster on other models on
+    that same card. A result printed without its scope reads as a property of
+    llama.cpp, gets adopted as a default, and ships to people whose hardware
+    disagrees — which is how `FIXED_FA = 1` came to be justified as "helps
+    gfx906" (docs/constants-audit.md C-A)."""
+    src = str(cfg.hw.get("vram_src") or "").replace("llama.cpp: ", "")
+    vram = cfg.hw.get("vram")
+    where = (f"{src} ({vram} MiB)" if src and vram else
+             src or (f"{vram} MiB VRAM" if vram else "this machine"))
+    return (f"For {cfg.model.name}, on {where}, "
+            f"{cfg.hw.get('phys', '?')} physical cores, "
+            f"{cfg.driver} driver, {cfg.profile} profile — we find:")
+
+
 def report(cfg: Config, rows: list[dict], probe: dict | None = None):
     ok = [r for r in rows if r["status"] == "OK"]
     print("\n" + "=" * 70)
     print(f"RESULTS: {len(ok)}/{len(rows)} configs succeeded")
+    print(result_scope(cfg))
     print("=" * 70)
     if not ok:
         bad = {}
@@ -5577,6 +5597,29 @@ def selftest() -> bool:
         # and the pasted command agrees with what was run
         assert "--spec-type draft-mtp" not in server_command(cfg_dm, {"ngl": "99"}, 4096)
         assert "--spec-type draft-mtp" in server_command(cfg_no, {"ngl": "99"}, 4096)
+
+        # --- a result is never a general fact ---
+        # The same knob flips answer across the quant, the model and the box:
+        # flash attention measured 33% SLOWER on Mistral-Small-24B Q8_0 on an
+        # MI50 at 4k depth, and faster on other models on that same card. A
+        # number printed without its scope reads as a property of llama.cpp and
+        # gets adopted as a default -- which is how FIXED_FA came to be justified
+        # as "helps gfx906".
+        _cfg_sc = Config(model=Path("Some-Model-Q4_K_M.gguf"),
+                         llama_bench=Path("b"), llama_server=Path("s"),
+                         array="auto", ctx_floor=8192, driver="server",
+                         hw={"phys": 8, "logical": 16, "vram": 32752,
+                             "vram_src": "llama.cpp: ROCm0"})
+        _sc = result_scope(_cfg_sc)
+        assert "Some-Model-Q4_K_M.gguf" in _sc, _sc     # the quant is in the name
+        assert "ROCm0" in _sc and "32752" in _sc, _sc   # and the box
+        assert "8 physical cores" in _sc, _sc
+        assert "server" in _sc, _sc
+        # a machine with no GPU still gets a scope rather than a bare claim
+        _cfg_cpu = Config(model=Path("m.gguf"), llama_bench=Path("b"),
+                          array="auto", ctx_floor=8192,
+                          hw={"phys": 4, "logical": 8})
+        assert "this machine" in result_scope(_cfg_cpu)
 
         # --- sweeping fa must not build rows that cannot launch (issue #20) ---
         # Measured: `llama-server -fa off -ctk q8_0 -ctv q8_0` fails with
@@ -9391,6 +9434,9 @@ def main():
         fit_params=fit_params,
         server_start_timeout=args.server_start_timeout,
         hw={**mhw, "phys": phys, "logical": logical, "vram": vram,
+            # the device string, so the report can say WHERE a number came from
+            # rather than leaving the reader to assume it generalises
+            "vram_src": vram_src,
             "numa_nodes": detect_numa_nodes()},
     )
     cfg.factors = build_factors(cfg)

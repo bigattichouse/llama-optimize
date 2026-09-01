@@ -205,6 +205,33 @@ sweep, the max-context probe, and pick verification alike. Validating in the
 report instead would let the probe and the verifier keep making decisions on
 numbers the report would later reject.
 
+## A result is never a general fact
+
+Every number this tool prints is conditioned on a quant, a model, a machine and
+an operating point, and the same knob flips answer across all four. Flash
+attention measured **33% slower** on Mistral-Small-24B **Q8_0** on an MI50 at 4k
+depth with an f16 KV cache — and the same card is known to gain from it on other
+models. Both are true.
+
+A finding printed without its scope reads as a property of llama.cpp. It then
+gets adopted as a default and shipped to people whose hardware disagrees, which
+is precisely the history of `FIXED_FA = 1`: measured once, justified in
+`DESIGN.md` as "helps gfx906", pinned for everyone
+([`constants-audit.md`](constants-audit.md) C-A).
+
+So the report leads with the scope rather than leaving the reader to supply it:
+
+```
+RESULTS: 47/125 configs succeeded
+For Mistral-Small-24B-Instruct-2501.Q8_0.gguf, on ROCm0 (32752 MiB),
+8 physical cores, server driver, single profile — we find:
+```
+
+The quant rides in the model filename, which is why it is printed whole rather
+than prettified. Rows already carry `tool_version` and `llama_build` for the same
+reason: a CSV outlives the terminal it was printed in, and the question it has to
+answer later is "what produced this, and on what".
+
 ## A crash is a measurement of a boundary
 
 A `SIGNAL` row is not a gap in the data. It says a parameter set is **out of
