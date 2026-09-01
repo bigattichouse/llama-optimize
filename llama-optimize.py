@@ -1183,10 +1183,33 @@ def thread_levels(phys: int, logical: int, levels: int = 5) -> list[int]:
     return lv
 
 
-def ngl_levels(n_layers: int | None, levels: int = 5) -> list[int]:
+def ngl_levels(n_layers: int | None, levels: int = 5,
+               fits: bool | None = None) -> list[int]:
+    """`levels` values for -ngl, spanning 0 (pure CPU) to all layers.
+
+    `fits=True` — the model provably fits in VRAM at the most demanding cell of
+    this design — biases the levels toward full offload: the reason to put layers
+    on the CPU is memory pressure, and the fit test says there is none, so an even
+    span spends its slowest rows where the answer cannot be (issue #14).
+
+    The bias is to the top QUARTER of the range, not to `top-1, top-2`: on a
+    40-layer model those differ by ~7% of the model's compute against a measured
+    run-to-run spread of 5-27%, so clustering would resolve a difference below the
+    noise floor — the same waste in a new place
+    (docs/sweep-cost-design.md).
+
+    `ngl=0` survives every level count and every verdict. It is not there for
+    information; it is there because the verdict can be WRONG, and it is then the
+    only row that can still produce a measurement instead of an OOM."""
     top = n_layers if n_layers else 99
     # Always include 0 (pure CPU) and the top (all layers). 99 = "all" is safe
     # since llama.cpp clamps to the real layer count.
+    if fits and levels >= 3 and top >= 4:
+        # anchor + a span across the top quarter, widened when a quarter is too
+        # narrow to hold `levels - 1` distinct values -- otherwise a small model
+        # would silently lose levels to deduplication
+        lo = max(0, top - max(levels - 1, top // 4))
+        return sorted({0} | set(n_levels_span(lo, top, levels - 1)))[:levels]
     mids = n_levels_span(0, top, levels)
     lv = sorted(set([0] + mids + [top]))
     # trim to `levels`, keeping endpoints
@@ -1196,6 +1219,31 @@ def ngl_levels(n_layers: int | None, levels: int = 5) -> list[int]:
         step = max(1, len(inner) // max(1, levels - 2))
         lv = sorted(keep | set(inner[::step]))[:levels]
     return lv
+
+
+def full_offload_fits(cfg: "Config", depths: list, kv_levels: list,
+                      n_layers: int | None) -> bool | None:
+    """Does every layer fit in VRAM at the most demanding cell of this design?
+
+    True / False / None, where None means "could not tell" and callers must keep
+    whatever they would have done anyway. Asked of `predict_fits`, so the grid and
+    the OOM pruner cannot disagree about what fits.
+
+    The probe row is deliberately the WORST case the design contains, not a
+    typical one: the deepest depth (levels are generated once for the whole design
+    while n_depth varies per row, so testing at depth 0 would be optimistic
+    exactly where OOM is likeliest), the largest KV type, KV resident on the GPU,
+    and no tensor offload. Biasing only when even that cell fits errs toward the
+    even span, which is the safe direction (issue #14)."""
+    if not cfg.oom_prune or not n_layers:
+        return None
+    probe = {"ngl": str(n_layers),
+             "n_depth": str(max(int(d) for d in depths) if depths else 0),
+             # kv_type levels are ordered best-quality first, and best quality is
+             # also the largest cache
+             "kv_type": str(kv_levels[0]) if kv_levels else "f16",
+             "nkvo": "0"}
+    return predict_fits(cfg, probe, cfg.driver)
 
 
 # Don't probe deeper than this by default, even if the model's native context is
@@ -1274,6 +1322,9 @@ class Config:
     draft_model: Path | None = None   # -md: a SECOND model, an input not a factor (D1)
     mmproj: Path | None = None        # --mmproj: a THIRD resident artifact, likewise an input
     levels: int = 5             # level count for auto-generated numeric factors
+    # set by build_factors: the ngl grid was biased toward full offload because
+    # the model provably fits. Recorded so the header can say so (issue #14).
+    ngl_biased: bool = False
     min_tgs: float = 0.0        # abandon a config generating slower than this
     min_pps: float = 0.0        # ...or prefilling slower than this
     slow_grace: int = 60        # never judge a config on less than this many seconds
@@ -1309,8 +1360,18 @@ def build_factors(cfg: Config):
     nlv = max(2, int(getattr(cfg, "levels", 5)))
     depths = depth_levels(cfg.hw.get("n_ctx_train"), cfg.max_depth,
                           floor=cfg.ctx_floor, levels=nlv)
+    kv_lv = list(DEFAULT_KV_LEVELS)[:nlv]
+    # Asked once, at the deepest depth and largest KV in this design: when every
+    # layer provably fits, an even 0..n_layers span spends its slowest rows where
+    # the answer cannot be (issue #14, docs/sweep-cost-design.md). `--min-kv` is
+    # applied to kv_type after this and only ever drops the LOSSIER levels, so
+    # f16 -- the largest cache here -- survives it. The one exception is
+    # `--min-kv f32`, whose cache is larger still and would make this probe
+    # optimistic; the ngl=0 anchor and the OOM pruner are what bound that.
+    fits = full_offload_fits(cfg, depths, kv_lv, n_layers)
+    cfg.ngl_biased = bool(fits)          # reported in the header, not inferred
     factors = {
-        "ngl": [str(x) for x in ngl_levels(n_layers, nlv)],
+        "ngl": [str(x) for x in ngl_levels(n_layers, nlv, fits)],
         "n_depth": [str(x) for x in depths],
         "threads": [str(x) for x in thread_levels(phys, logical, nlv)],
         "kv_type": list(DEFAULT_KV_LEVELS)[:nlv],
@@ -4847,6 +4908,95 @@ def selftest() -> bool:
         # factor-level generation
         assert five_levels_span(0, 64) == [0, 16, 32, 48, 64]
         assert ngl_levels(64)[0] == 0 and ngl_levels(64)[-1] == 64
+
+        # --- ngl grid knows about VRAM (issue #14) ---
+        # An even 0..n_layers span spends its slowest rows where the answer
+        # cannot be: on a model that fits entirely, every CPU-offload level is a
+        # near-certain loser, and ngl=0 is an order of magnitude slower than the
+        # rest of the design put together.
+        assert ngl_levels(40, 5) == [0, 10, 20, 30, 40]            # unchanged
+        assert ngl_levels(40, 5, fits=False) == [0, 10, 20, 30, 40]
+        assert ngl_levels(40, 5, fits=None) == [0, 10, 20, 30, 40]  # unknown
+        _biased = ngl_levels(40, 5, fits=True)
+        assert _biased == [0, 30, 33, 37, 40], _biased
+        # the two slowest rows are what it removes
+        assert 10 not in _biased and 20 not in _biased
+        # NOT clustered at top-1/top-2. Two reasons, and the second is the one
+        # that matters at any model size: on a 40-layer model those levels
+        # differ by ~7% of the model's compute against a 5-27% measured
+        # run-to-run spread; and if the fit verdict is WRONG, a design with
+        # nothing between 0 and the top has no level left where a partially
+        # offloaded optimum could show up.
+        _gaps = [b - a for a, b in zip(_biased[1:], _biased[2:])]
+        assert min(_gaps) >= 3, _biased
+        # the window widens when a quarter is too narrow to hold levels-1
+        # distinct values, so a small model keeps its level COUNT rather than
+        # silently losing levels to deduplication
+        assert ngl_levels(8, 5, fits=True) == [0, 4, 5, 7, 8]
+        assert len(ngl_levels(18, 5, fits=True)) == 5
+        # ...but a model with fewer layers than levels cannot, and does not
+        # pretend to: every ngl value that exists is already in the span
+        assert ngl_levels(4, 5, fits=True) == [0, 1, 3, 4]
+        # ngl=0 survives EVERY level count and every verdict -- not for
+        # information, but because the fit verdict can be wrong, and it is then
+        # the only row that can still produce a measurement instead of an OOM.
+        for _lv in (2, 3, 4, 5):
+            for _top in (4, 8, 32, 40, 65):
+                assert ngl_levels(_top, _lv, fits=True)[0] == 0
+                assert ngl_levels(_top, _lv, fits=True)[-1] == _top
+        # a model too small to carve a top quarter from keeps the even span
+        assert ngl_levels(3, 5, fits=True) == ngl_levels(3, 5)
+
+        # the fit probe asks about the WORST cell the design contains, since the
+        # levels are generated once while n_depth varies per row: a model that
+        # fits at depth 0 and not at 64k must not get an optimistic grid.
+        _asked = {}
+
+        def _fake_predict(cfg, f, driver):
+            _asked.update(f)
+            return True
+
+        _real_predict = predict_fits
+        try:
+            globals()["predict_fits"] = _fake_predict
+            cfg_fit = Config(model=Path("m.gguf"), llama_bench=Path("b"),
+                             array="auto", ctx_floor=8192)
+            assert full_offload_fits(cfg_fit, ["0", "8192", "65536"],
+                                     ["f16", "q8_0"], 40) is True
+            assert _asked["n_depth"] == "65536", _asked   # deepest, not first
+            assert _asked["ngl"] == "40", _asked          # all layers
+            assert _asked["kv_type"] == "f16", _asked     # largest cache
+            assert _asked["nkvo"] == "0", _asked          # KV resident on GPU
+            # no offload flags: the probe is the un-offloaded footprint, so a
+            # positive verdict means it fits without any of them
+            assert not ({"ot", "ncmoe", "ncffn", "ffn_place"} & set(_asked))
+            # --no-oom-prune means the estimator is not trusted to delete rows;
+            # it is not trusted to shape the grid either
+            cfg_fit.oom_prune = False
+            assert full_offload_fits(cfg_fit, ["65536"], ["f16"], 40) is None
+            # an unknown layer count is not a fit verdict
+            cfg_fit.oom_prune = True
+            assert full_offload_fits(cfg_fit, ["65536"], ["f16"], None) is None
+
+            # WIRING: a level generator that knows about VRAM is worthless if
+            # build_factors does not ask it. This is the connection that
+            # silently regresses -- the same lesson as the I4/I5 wiring tests.
+            _hw14 = {"phys": 8, "logical": 16, "n_layers": 40,
+                     "n_ctx_train": 32768, "n_experts": 0, "n_nextn": 0}
+            cfg_w = Config(model=Path("m.gguf"), llama_bench=Path("b"),
+                           llama_server=Path("s"), array="auto", ctx_floor=8192,
+                           hw=dict(_hw14))
+            globals()["predict_fits"] = lambda c, f, d: True
+            assert build_factors(cfg_w)["ngl"] == ["0", "30", "33", "37", "40"]
+            assert cfg_w.ngl_biased is True          # so the header can say so
+            globals()["predict_fits"] = lambda c, f, d: None
+            cfg_u = Config(model=Path("m.gguf"), llama_bench=Path("b"),
+                           llama_server=Path("s"), array="auto", ctx_floor=8192,
+                           hw=dict(_hw14))
+            assert build_factors(cfg_u)["ngl"] == ["0", "10", "20", "30", "40"]
+            assert cfg_u.ngl_biased is False
+        finally:
+            globals()["predict_fits"] = _real_predict
         assert len(thread_levels(8, 16)) >= 3
 
         # --- conditional-factor core (docs/CONDITIONAL-FACTORS.md) ---
@@ -8363,6 +8513,13 @@ def main():
     print("\nfactors:")
     for name, levels in cfg.factors.items():
         print(f"  {name:10s}: {', '.join(levels)}")
+    # Say when the ngl grid was reshaped, and why. A level set that silently
+    # depends on an estimate is one the reader cannot check (issue #14).
+    if getattr(cfg, "ngl_biased", False):
+        print(f"  note: ngl levels bias to full offload — every layer fits in "
+              f"VRAM at depth {max(int(d) for d in cfg.factors['n_depth'])}. "
+              f"ngl=0 is kept in case that verdict is wrong "
+              f"(--no-oom-prune restores an even span).")
     fixed_bits = [f"mmap {'on' if FIXED_MMAP else 'off'}"]
     if "fa" not in cfg.factors:
         fixed_bits.insert(0, f"flash-attn {'on' if FIXED_FA else 'off'}")

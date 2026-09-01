@@ -130,6 +130,101 @@ Design constraints, in the order they mattered:
   `_INTENT_FLAGS` list, so a flag added later without a matching guard fails the
   selftest instead of silently prompting.
 
+## The `ngl` grid spends its levels where the answer cannot be (issue #14)
+
+`ngl_levels` spans `0 .. n_layers` evenly and never asks whether the model fits.
+On a 40-layer model that fits entirely in VRAM the grid is `[0, 10, 20, 30, 40]`
+and four of five levels put layers on the CPU — every one of them a near-certain
+loser.
+
+### What it actually costs, which is not what it first looks like
+
+The tempting framing is "80% of a factor's levels wasted". That is wrong, and
+getting it right decides the shape of the fix.
+
+In an orthogonal array **every row informs every factor's main effect**. A row at
+`ngl=0` is still a legitimate observation of `kv_type`, `ubatch` and the rest. So
+those rows are not wasted in the information sense. The costs are different ones,
+and both are real:
+
+- **Wall clock, disproportionately.** `ngl=0` is CPU-only decode: on a 27B model
+  that is an order of magnitude slower than full offload. The low-`ngl` rows are
+  a minority of the design and a majority of its runtime. This is the big one,
+  and it is why this is a sweep-cost item and not only a correctness one.
+- **Additivity.** Main effects assume a factor's effect is roughly independent of
+  the others. `kv_type`'s effect at `ngl=0` (KV in system RAM, CPU attention) is
+  not the same phenomenon as at `ngl=40`, so averaging across both estimates an
+  effect for a regime nobody will deploy. Measuring the other factors in the
+  regime the user will actually run is worth more than the extra span.
+
+`choose_array` sizes on the widest factor, so the level *count* is what fixes the
+array at L25 or L125 — narrowing `ngl` alone buys nothing (SC1). This change
+moves where the levels sit; it does not remove any.
+
+### Why not cluster at the top
+
+The first sketch on the issue was `[0, top-2, top-1, top]`. Rejected for two
+reasons, and the second is the one that holds at every model size.
+
+**Below the noise floor.** On a 40-layer model those three levels differ by ~7%
+of the model's compute, against an observed run-to-run spread of 5–27% (thermal;
+the `--verify-picks` motivation). Three levels resolving a difference smaller
+than the noise is the same waste in a new place. This argument weakens on small
+models, where a quarter of the range *is* a couple of layers.
+
+**No fallback if the verdict is wrong.** A design with nothing between `0` and
+the top has no level left where a partially-offloaded optimum could appear. The
+anchor keeps the sweep producing *a* measurement; a spread keeps it able to find
+the *right* one. This is the argument that does not depend on model size.
+
+So: keep the CPU anchor, and span the remaining levels across the **top quarter**
+of the layer range rather than the whole of it. For 40 layers at `--levels 5`:
+`[0, 30, 33, 37, 40]` instead of `[0, 10, 20, 30, 40]` — the two slowest rows in
+the design are gone, the gradient and the anchor survive.
+
+The window widens when a quarter is too narrow to hold `levels - 1` distinct
+values, or a small model would silently lose levels to deduplication: an 18-layer
+model gets `[0, 14, 15, 17, 18]` and an 8-layer one `[0, 4, 5, 7, 8]`, both still
+five levels. A model with fewer layers than levels cannot be biased at all and is
+not pretended otherwise — every `ngl` value that exists is already in the span.
+
+### Why the anchor stays, always
+
+`ngl=0` is kept at every level count, including on MoE models where `ncmoe`
+already spans CPU offload and the pair is arguably redundant. It is not there for
+information, it is there because **the fit verdict can be wrong**. If the
+estimate says "fits" and it does not, every biased level OOMs and the anchor is
+the only row that can still produce a measurement. A grid that deletes its own
+rescue rows on the strength of an estimate is the failure mode the OOM pruner was
+already written to avoid (P3: a wrong estimate deletes rows, a missing one merely
+runs them).
+
+### What decides "fits"
+
+`predict_fits` — llama.cpp's own `llama-fit-params`, the same estimator the OOM
+pruner uses, so the two cannot disagree about what fits. It answers True / False /
+**None**, and None keeps the even span. Three conditions on the probe:
+
+- **The deepest depth in the design, not the shallowest.** `ngl` levels are
+  generated once for the whole design while `n_depth` varies per row, so a model
+  that fits at depth 0 and not at 64k would otherwise get a grid that is
+  optimistic exactly where OOM is likeliest.
+- **The most demanding cell otherwise:** highest-quality (largest) `kv_type` in
+  the design, KV on the GPU (`nkvo=0`), no tensor offload. Biasing only when even
+  the worst cell fits means the answer errs toward keeping the even span, which
+  is the safe direction.
+- **`--no-oom-prune` disables it.** A user who has told the tool not to trust the
+  estimator enough to delete rows has not asked it to trust it enough to shape
+  the grid either.
+
+### Not addressed here
+
+Whether `ngl` and `ncmoe` should both be arguing about what lives on the CPU on
+MoE models. The bias makes them agree more often — a fitting MoE model now gets
+its `ngl` levels near the top, leaving `ncmoe` as the offload axis — but nothing
+here stops them contradicting each other, and the fix for that is a constrained
+or conditional relation, not a level-set change.
+
 ## Invariants
 
 - **SC1 — a narrowing that changes nothing must not look like one that does.**
@@ -140,6 +235,10 @@ Design constraints, in the order they mattered:
   `status == "OK"` gates.
 - **SC3 — the derived command is always shown before it is run.**
 - **SC4 — non-interactive behaviour is byte-identical to before the interview.**
+- **SC5 — a cost heuristic that reads an estimate keeps the row that survives the
+  estimate being wrong.** The `ngl` grid biases toward full offload only on a
+  positive fit verdict, and keeps `ngl=0` regardless, because a wrong "fits"
+  would otherwise delete every row that could still have measured something.
 
 ## Open
 

@@ -84,6 +84,21 @@ earlier.
 - **The recommended `-c` could exceed the context the sweep ever loaded.** It was
   derived from the requested depth; it is now capped by the delivered one.
 
+- **The `ngl` grid spent its slowest rows where the answer could not be.**
+  [Issue #14]. `ngl_levels` spanned `0 .. n_layers` evenly and never asked
+  whether the model fits, so a 40-layer model that fits entirely in VRAM still
+  got `[0, 10, 20, 30, 40]` — four levels putting layers on the CPU, every one a
+  near-certain loser, and `ngl=0` an order of magnitude slower than the rest of
+  the design. When `llama-fit-params` says every layer fits at the *deepest*
+  depth and *largest* KV type in the design, the levels now bias to the top
+  quarter instead: `[0, 30, 33, 37, 40]`.
+
+  `ngl=0` is kept at every level count and every verdict. Not for information —
+  because the verdict can be wrong, and it is then the only row that can still
+  produce a measurement instead of an OOM. `--no-oom-prune` restores the even
+  span: an estimator not trusted to delete rows is not trusted to shape the grid.
+  The header says when the bias fired and why.
+
 ### Added
 
 - **`prompt_tok` column: the tokens the prompt actually became**, next to the
@@ -554,3 +569,4 @@ crash journal, `--resume`, `--iterate`, `--diff`, and a GPU-free `--selftest`.
 [issue #8]: https://github.com/bigattichouse/llama-optimize/issues/8
 [issue #3]: https://github.com/bigattichouse/llama-optimize/issues/3
 [issue #11]: https://github.com/bigattichouse/llama-optimize/issues/11
+[Issue #14]: https://github.com/bigattichouse/llama-optimize/issues/14
