@@ -233,6 +233,14 @@ earlier.
 
 ### Added
 
+- **`ngram-cache` is reachable at last**, via `--ngram-type ngram-cache` or
+  `--factor ngram=ngram-cache` — the last of llama.cpp's eleven `--spec-type`
+  values the tool could not express. Not in the default screen, and that is a
+  hard limit rather than a choice: the gate already holds five variants and five
+  levels is the ceiling for the orthogonal arrays here (the vendored library has
+  no six-level array, and run generation rejects one outright). Its context cache
+  builds as it goes, so it needs no `-lcs`/`-lcd` file.
+
 - **`repack`, `no_op_offload` and `no_host` are now swept** instead of silently
   inheriting llama.cpp's default on every run. Each is a documented behaviour
   switch whose answer depends on backend, CPU and model, and each was registered

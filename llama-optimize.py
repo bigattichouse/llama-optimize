@@ -1742,6 +1742,12 @@ def build_factors(cfg: Config):
             factors["ngram"] = [cfg.ngram_type]
             factors.update(ngram_child_levels(cfg.ngram_type))
         else:                                      # screen stage: variants only
+            # Five levels, because that is what the arrays hold: a six-level
+            # factor has no design here and `generate_runs` rejects it outright.
+            # `ngram-cache` is therefore reachable by `--ngram-type ngram-cache`
+            # or `--factor ngram=...` rather than screened by default — a real
+            # coverage limit, and a level set is not free just because a column
+            # is (docs/flag-coverage.md).
             factors["ngram"] = ["none", "ngram-simple", "ngram-mod",
                                 "ngram-map-k", "ngram-map-k4v"]
     lvl_errors = validate_factor_levels(factors)
@@ -2110,7 +2116,13 @@ FACTORS = {
                      "gated_by": ("mtp", {"1"})},
     "ngram":             {"bench": None, "server": ("--spec-type",), "kind": "cat", "server_only": True,
                           "translate": {"none": "", "ngram-simple": "ngram-simple", "ngram-mod": "ngram-mod",
-                                        "ngram-map-k": "ngram-map-k", "ngram-map-k4v": "ngram-map-k4v"}},
+                                        "ngram-map-k": "ngram-map-k", "ngram-map-k4v": "ngram-map-k4v",
+                                        # reachable by hand but NOT in the default
+                                        # screen: the arrays here are five-level
+                                        # and the gate already holds five (see
+                                        # build_factors). Its context cache builds
+                                        # as it goes, so it needs no -lcs/-lcd file.
+                                        "ngram-cache": "ngram-cache"}},
     # ngram tuning knobs are CONDITIONAL on the --spec-type variant (active_when):
     # emitted and scored only in rows whose `ngram` gate selects the owning
     # variant. The map/simple variants share one {size-n, size-m, min-hits}
@@ -5499,6 +5511,29 @@ def selftest() -> bool:
         # and the pasted command agrees with what was run
         assert "--spec-type draft-mtp" not in server_command(cfg_dm, {"ngl": "99"}, 4096)
         assert "--spec-type draft-mtp" in server_command(cfg_no, {"ngl": "99"}, 4096)
+
+        # --- ngram-cache is reachable, though not screened by default ---
+        # llama.cpp ships eleven --spec-type values; ngram-cache was the last one
+        # the tool could not express at all. It cannot join the screen: the gate
+        # already holds five levels and five is the ceiling for the arrays here
+        # (L25/L125 are 5-level; the library has no 6-level array, and
+        # generate_runs rejects one outright). So it is pinned rather than
+        # screened -- a real coverage limit, recorded rather than papered over.
+        _cfg_ng = Config(model=Path("m.gguf"), llama_bench=Path("b"),
+                         llama_server=Path("s"), array="auto", ctx_floor=8192,
+                         driver="server", ngram=True,
+                         hw={"phys": 8, "logical": 16, "n_layers": 32,
+                             "n_ctx_train": 32768, "n_experts": 0, "n_nextn": 0})
+        assert _flat(factor_flags(_cfg_ng, {"ngram": "ngram-cache"}, "server")) \
+            == ["--spec-type", "ngram-cache"]
+        assert _flat(factor_flags(_cfg_ng, {"ngram": "none"}, "server")) == []
+        # the default screen stays at five, because six has no design
+        _cfg_ng.ngram_type = None
+        assert len(build_factors(_cfg_ng)["ngram"]) == 5
+        assert choose_array({"a": list("12345"), "b": list("123456")}) is None
+        # ...and pinning it is how you measure it
+        _cfg_ng.ngram_type = "ngram-cache"
+        assert build_factors(_cfg_ng)["ngram"] == ["ngram-cache"]
 
         # --- inherited llama.cpp toggles are measured, not assumed ---
         # Each is a documented behaviour switch with no universal answer, and we
@@ -8944,9 +8979,12 @@ def main():
                          "get their parameters tuned (staged so the search stays "
                          "clean and affordable — see docs/CONDITIONAL-FACTORS.md)")
     ap.add_argument("--ngram-type", default=None,
-                    choices=["ngram-simple", "ngram-mod", "ngram-map-k", "ngram-map-k4v"],
+                    choices=["ngram-simple", "ngram-mod", "ngram-map-k",
+                             "ngram-map-k4v", "ngram-cache"],
                     help="pin the ngram variant and tune only its parameters in one "
-                         "pass (skips the variant screen)")
+                         "pass (skips the variant screen). ngram-cache is reachable "
+                         "only this way — the screen's gate is full at five levels, "
+                         "which is what the orthogonal arrays hold")
     ap.add_argument("--ngram-keep", type=int, default=2, metavar="K",
                     help="how many top variants from the screen to tune (default 2)")
     ap.add_argument("--ngram-fast", action="store_true",

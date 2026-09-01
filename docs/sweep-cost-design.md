@@ -309,6 +309,34 @@ full. `ngl=0 × any ncmoe` is the sharp case, where `ncmoe` cannot act yet still
 votes on its own main effect. The fix is a constrained or conditional relation,
 not a level-set change, and it wants a real MoE model to choose between them.
 
+## What the arrays can hold, and what that costs
+
+Checked against the vendored library (`robust/optimize/taguchi`) because a level
+set is not free just because a *column* is.
+
+**Arrays implemented:** L1–L5, L8, L9, L16, L18, L25, L27, L32, L64, L81, L125,
+L128, L243, L256, L512, L625, L729, L1024, L2187, L3125.
+
+**Five levels is the ceiling.** There is no six-level array in the library, and
+`generate_runs` rejects one outright — `No available array supports 6 levels
+(maximum available: 5)`. That is a property of orthogonal arrays, not a gap in
+the tool, and it is why the `ngram` gate screens five variants and reaches
+`ngram-cache` only through `--ngram-type ngram-cache` or `--factor ngram=`.
+
+**L18 is mixed-level (one 2-level column, seven 3-level) and is implemented**,
+but `choose_array` still skips it, and the reasoning it was skipped for still
+holds: L18 applies only when the widest factor has three levels *and* at most
+eight factors vary. At `--levels 3` the default set has thirteen varying factors,
+so L27 wins anyway. Wiring a second selection path would buy nothing until a real
+factor set wants it.
+
+**Where the headroom actually went.** Adding `repack`, `no_op_offload` and
+`no_host` costs zero runs at every `--levels` setting — L16 holds 15 factors, L27
+holds 13, L125 holds 31, and the default set fits all three. But at `--levels 3`
+the set is now **exactly** at L27's cap of thirteen. One more three-level factor
+tips it to L81: 27 runs to 81, a 3x jump for one column. "Free" is true today and
+should be re-checked before the next factor is added, not assumed.
+
 ## Invariants
 
 - **SC1 — a narrowing that changes nothing must not look like one that does.**
