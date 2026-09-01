@@ -4442,6 +4442,10 @@ def report(cfg: Config, rows: list[dict], probe: dict | None = None):
         for r in rows:
             bad[r["status"]] = bad.get(r["status"], 0) + 1
         print("No successful runs. Status breakdown:", bad)
+        _dead = show_dead_levels(cfg, rows)
+        if _dead:
+            print("\nOUT OF BOUNDS — levels where nothing ever ran:")
+            print("\n".join(_dead))
         show_discards(rows)
         return
 
@@ -4517,6 +4521,17 @@ def report(cfg: Config, rows: list[dict], probe: dict | None = None):
               f"{raw}ngl={r['ngl']:>3}  "
               f"kv={r['kv_type']:>4}  ub={r['ubatch']:>4}")
 
+    # A crash is a measurement of a boundary, not a gap in the data. Balanced
+    # designs make it readable: a level that failed in EVERY one of its rows,
+    # each beside different partners, is out of bounds rather than unlucky.
+    dead = show_dead_levels(cfg, rows)
+    if dead:
+        print("\n### OUT OF BOUNDS (no run at these levels produced a number)")
+        print("\n".join(dead))
+        print("  These are dropped from the next --iterate pass. If you expected "
+              "them to work,\n  that is the bug to chase — the sweep found the "
+              "edge, it did not create it.")
+
     show_discards(rows)
 
 
@@ -4560,6 +4575,57 @@ def refine_numeric(vals: list[int], best: int) -> list[str]:
     return [str(x) for x in five_levels_span(lo, hi)]
 
 
+# Statuses that mean "this configuration never produced a number", as opposed to
+# producing a bad one. SLOW and IMPLAUSIBLE are excluded deliberately: SLOW is a
+# real measurement below a floor the user set, and IMPLAUSIBLE is a number we
+# refused — both had a working launch, so neither is evidence about bounds.
+NO_RESULT_STATUS = {"SIGNAL", "OOM", "ERROR", "TIMEOUT", "CRASH"}
+
+
+def dead_levels(rows: list[dict], factor: str, min_rows: int = 2) -> dict:
+    """Levels of `factor` at which NOTHING ever ran, with why.
+
+    A segfault is not noise — it says a parameter set is out of bounds, and the
+    array already visited that region systematically. What makes it usable is the
+    design's balance: each level appears in several rows beside *different*
+    partners, so "every row at this level failed" is evidence about the level
+    rather than about one unlucky combination. One crash is not; that is the
+    generalisation this deliberately refuses to make, which is why `min_rows`
+    exists and why a level with a single observation is left alone.
+
+    Returns {level: status-counter}. Empty when every level produced something,
+    which is the normal case."""
+    out = {}
+    by_level: dict = {}
+    for r in rows:
+        if factor not in r:
+            continue
+        by_level.setdefault(str(r[factor]), []).append(str(r.get("status", "")))
+    for lvl, statuses in by_level.items():
+        if len(statuses) < min_rows:
+            continue                      # too few rows to tell level from luck
+        if all(st in NO_RESULT_STATUS for st in statuses):
+            tally: dict = {}
+            for st in statuses:
+                tally[st] = tally.get(st, 0) + 1
+            out[lvl] = tally
+    return out
+
+
+def show_dead_levels(cfg: Config, rows: list[dict]) -> list[str]:
+    """Lines naming every level that never produced a measurement, or []."""
+    lines = []
+    for name in cfg.factors:
+        dead = dead_levels(rows, name)
+        if not dead or len(dead) >= len(cfg.factors[name]):
+            # every level dead means the model or the box failed, not this knob
+            continue
+        for lvl, tally in sorted(dead.items()):
+            why = ", ".join(f"{n}x{st}" for st, n in sorted(tally.items()))
+            lines.append(f"  {name}={lvl}: no run produced a number ({why})")
+    return lines
+
+
 def refine_factors(cfg: Config, rows: list[dict]) -> dict:
     """Produce the next pass's factor levels: settle low-impact factors at their
     winning level, and refine high-impact factors onto a finer grid around their
@@ -4595,6 +4661,16 @@ def refine_factors(cfg: Config, rows: list[dict]) -> dict:
             means = factor_level_means(rows, name)
             ranked = sorted(means, key=means.get, reverse=True)
             new[name] = ranked[:3] if len(ranked) >= 3 else ranked
+        # Levels that never produced a number are out of bounds, not merely bad.
+        # Filtered from the OUTPUT rather than the input, because refine_numeric
+        # builds a fresh grid spanning the old endpoints and would put a known
+        # dead level straight back. Only the levels actually MEASURED dead are
+        # dropped — the new neighbours it invented are unknowns, and the next
+        # pass is what settles them. Inferring a whole dead band from one dead
+        # level is the generalisation this avoids on purpose.
+        dead = dead_levels(rows, name)
+        if dead and len(dead) < len(cur):
+            new[name] = [lv for lv in new[name] if str(lv) not in dead] or new[name]
     # A derived factor's refined grid must still honour its relation (C1). This
     # is the path a level-set-only fix could never have covered: refine_numeric
     # brackets the winner on a grid of its own, per pass, so a conflict-free pass
@@ -5235,6 +5311,48 @@ def selftest() -> bool:
                 assert ngl_levels(_top, _lv, fits=True)[-1] == _top
         # a model too small to carve a top quarter from keeps the even span
         assert ngl_levels(3, 5, fits=True) == ngl_levels(3, 5)
+
+        # --- a crash is a measurement of a boundary (segfaults are data) ---
+        # A Taguchi array visits each level beside DIFFERENT partners, so "every
+        # row at this level failed" is evidence about the level. One failure is
+        # not, and that is the generalisation this refuses to make.
+        _sig = ([{"ngl": "0", "status": "OK"}] * 2
+                + [{"ngl": "16", "status": "SIGNAL"}] * 3
+                + [{"ngl": "32", "status": "SIGNAL"},
+                   {"ngl": "32", "status": "OK"}])
+        _d = dead_levels(_sig, "ngl")
+        assert set(_d) == {"16"}, _d              # 32 produced a number once
+        assert _d["16"] == {"SIGNAL": 3}, _d      # and the tally says why
+        # one observation is never enough, however bad it looks
+        assert dead_levels([{"ngl": "8", "status": "SIGNAL"}], "ngl") == {}
+        # OOM/ERROR/TIMEOUT count too -- all of them mean "produced no number"
+        assert set(dead_levels([{"ngl": "9", "status": "OOM"},
+                                {"ngl": "9", "status": "TIMEOUT"}], "ngl")) == {"9"}
+        # ...but SLOW and IMPLAUSIBLE do NOT: both had a working launch, so
+        # neither says anything about bounds
+        assert dead_levels([{"ngl": "9", "status": "SLOW"},
+                            {"ngl": "9", "status": "SLOW"}], "ngl") == {}
+        assert dead_levels([{"ngl": "9", "status": "IMPLAUSIBLE"}] * 2, "ngl") == {}
+
+        # every level dead means the model or the box failed, not this knob --
+        # narrowing there would hide the real fault
+        _cfg_dead = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
+                           ctx_floor=8192)
+        _cfg_dead.factors = {"ngl": ["0", "16"]}
+        assert show_dead_levels(_cfg_dead, [{"ngl": "0", "status": "SIGNAL"}] * 2
+                                + [{"ngl": "16", "status": "SIGNAL"}] * 2) == []
+        _lines = show_dead_levels(_cfg_dead, [{"ngl": "0", "status": "OK"}] * 2
+                                  + [{"ngl": "16", "status": "SIGNAL"}] * 2)
+        assert len(_lines) == 1 and "ngl=16" in _lines[0], _lines
+
+        # and the next --iterate pass stops visiting them
+        _cfg_ref = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
+                          ctx_floor=8192)
+        _cfg_ref.factors = {"ngl": ["0", "16", "32"], "n_depth": ["0"]}
+        _rows_ref = ([{"ngl": "0", "n_depth": "0", "status": "OK", "eff_tps": 10.0}] * 2
+                     + [{"ngl": "16", "n_depth": "0", "status": "SIGNAL", "eff_tps": 0.0}] * 2
+                     + [{"ngl": "32", "n_depth": "0", "status": "OK", "eff_tps": 40.0}] * 2)
+        assert "16" not in refine_factors(_cfg_ref, _rows_ref)["ngl"]
 
         # --- recurrent models: only two -ngl values run at all (issue #18) ---
         # Measured on Qwen3.6-27B-Q5_K_M (qwen35): -ngl 5 and -ngl 40 both
@@ -7512,6 +7630,12 @@ def selftest() -> bool:
         f2 = {"ngl": "32", "n_depth": "8192", "kv_type": "f16", "nkvo": "0"}
         assert "--no-kv-offload" not in _fit_params_flags(_FC, f2, "bench")
         assert "-nkvo" not in _fit_params_flags(_FC, f2, "bench")
+        # a row with no nkvo column at all: the drivers emit nothing, so
+        # llama.cpp's default applies (KV offload ENABLED, cache on the GPU) and
+        # the estimator must price that, not its opposite
+        assert "--no-kv-offload" not in _fit_params_flags(
+            _FC, {"ngl": "32", "n_depth": "8192"}, "server")
+
         # the estimator and the drivers must agree about which level means what:
         # whenever a driver emits the flag, so does the estimator
         _CFG_NKVO = Config(model=Path("m.gguf"), llama_bench=Path("b"),

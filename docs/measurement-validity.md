@@ -205,6 +205,43 @@ sweep, the max-context probe, and pick verification alike. Validating in the
 report instead would let the probe and the verifier keep making decisions on
 numbers the report would later reject.
 
+## A crash is a measurement of a boundary
+
+A `SIGNAL` row is not a gap in the data. It says a parameter set is **out of
+bounds** — and the design already visited that region systematically, so the
+information is there to be read rather than thrown away.
+
+What makes it readable is the array's balance. Each level appears in several rows
+beside *different* partners, so "every row at this level failed" is evidence about
+the level. **One failure is not**, and inferring from it is exactly the
+generalisation to refuse: a single crash in a Taguchi row implicates the whole
+combination, not any one column. `dead_levels` therefore requires at least two
+rows at a level before it will call it dead, and the report says which statuses
+made up the verdict rather than only that there was one.
+
+Three boundaries on what counts:
+
+- **`SLOW` and `IMPLAUSIBLE` are excluded.** Both had a working launch. `SLOW` is
+  a real measurement below a floor the user set; `IMPLAUSIBLE` is a number we
+  refused. Neither says anything about whether the configuration *runs*.
+  `SIGNAL`, `OOM`, `ERROR`, `TIMEOUT` and `CRASH` do.
+- **A factor with every level dead is not reported.** That is the model or the box
+  failing, not the knob, and narrowing it would hide the real fault.
+- **Only levels actually measured dead are dropped** from the next `--iterate`
+  pass. `refine_numeric` invents new neighbours around the winner; those are
+  unknowns, and the next pass is what settles them. A dead level at `ngl=16` does
+  not license deleting `8` and `24` — even where the dead band turns out to be
+  contiguous, as it is on `qwen35` (issue #18).
+
+The filtering happens on the refined **output**, not the input, because
+`refine_numeric` spans the old endpoints and would otherwise put a known dead
+level straight back.
+
+This is the general form of the special case in `ngl_levels`: rather than knowing
+in advance which levels abort on which architecture, the sweep finds the edge and
+stops spending passes on it. Where a static rule and this disagree, the
+measurement should win.
+
 ## Layering
 
 I5 is causal and specific: it catches the defect at its source, with a real

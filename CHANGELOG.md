@@ -23,6 +23,39 @@ earlier.
 
 ## [Unreleased]
 
+### ⚠️ Affects existing results
+
+- **OOM-pruning decisions on any sweep that varied `nkvo` were made against the
+  wrong KV placement.** The estimator had the two levels the wrong way round, a
+  ~6 GB error on a large model. `SKIP_PRED` rows with `nkvo=1` were very likely
+  fine and should have run; `nkvo=0` rows recorded as `OOM` or `SIGNAL` at launch
+  were admitted on an estimate that ignored their KV cache. Rows that produced a
+  number are unaffected — this only ever decided whether a config was *attempted*.
+
+  **Re-run sweeps that show `SKIP_PRED` rows, or launch failures at high depth**,
+  if the pruner was on (it is by default). Sweeps that never varied `nkvo` used
+  its default level throughout and are internally consistent, though the pruner
+  was still pricing that level's opposite.
+
+- **Server-driver rows were measured shallower than their `n_depth` says.** The
+  prompt is built in characters at an assumed 4 chars/token, and the measured
+  ratio arrived too late to size it. Any model whose tokenizer is not close to 4
+  chars/token ran a different depth than the column records — on the model in
+  issue #11 (6.05 chars/token) a row labelled `n_depth=32768` ran ~27,000 tokens,
+  about two thirds of it. The error is systematic per model, so *rankings within
+  one sweep are largely intact*; what is wrong is the depth each row is labelled
+  with, and therefore any `-c` recommendation or Pareto point read off it.
+
+  **Re-run `--driver server` sweeps where the depth label matters** (max-context
+  picks, the `-c` to paste). Bench-driver rows are unaffected — llama-bench is
+  given token counts directly. New rows carry `prompt_tok`, so from now on the
+  gap is visible rather than inferred.
+
+- **`tg_tps` on server rows is now the median of the reps, not the mean.** Values
+  will move slightly on any config whose reps disagreed. This is the same change
+  `--verify-picks` already applied to its own re-measurements; no re-run is
+  needed for it alone.
+
 ### Fixed
 
 - **The wall-clock validity check (I5) rejected honest deep-context runs.**
@@ -183,6 +216,19 @@ earlier.
   The header says when the bias fired and why.
 
 ### Added
+
+- **Crashes are read as boundary measurements, not discarded.** A `SIGNAL` row
+  says a parameter set is out of bounds, and the array already visited that
+  region beside different partners — so a level that failed in *every* one of its
+  rows is out of bounds rather than unlucky. Those levels are now named in the
+  report (`OUT OF BOUNDS`, with the status tally that decided it) and dropped
+  from the next `--iterate` pass, so refinement narrows toward what actually
+  runs. Deliberately conservative: one failure is never enough, `SLOW` and
+  `IMPLAUSIBLE` do not count (both had a working launch), a factor with every
+  level dead is reported as nothing (that is the model failing, not the knob),
+  and only levels *measured* dead are dropped — the neighbours `refine_numeric`
+  invents are unknowns for the next pass to settle.
+
 
 - **`prompt_tok` column: the tokens the prompt actually became**, next to the
   `n_depth` that was asked for. Different numbers on any tokenizer that is not
@@ -410,37 +456,6 @@ earlier.
 ## [0.2.0] — 2026-08-26
 
 ### ⚠️ Affects existing results
-
-- **OOM-pruning decisions on any sweep that varied `nkvo` were made against the
-  wrong KV placement.** The estimator had the two levels the wrong way round, a
-  ~6 GB error on a large model. `SKIP_PRED` rows with `nkvo=1` were very likely
-  fine and should have run; `nkvo=0` rows recorded as `OOM` or `SIGNAL` at launch
-  were admitted on an estimate that ignored their KV cache. Rows that produced a
-  number are unaffected — this only ever decided whether a config was *attempted*.
-
-  **Re-run sweeps that show `SKIP_PRED` rows, or launch failures at high depth**,
-  if the pruner was on (it is by default). Sweeps that never varied `nkvo` used
-  its default level throughout and are internally consistent, though the pruner
-  was still pricing that level's opposite.
-
-- **Server-driver rows were measured shallower than their `n_depth` says.** The
-  prompt is built in characters at an assumed 4 chars/token, and the measured
-  ratio arrived too late to size it. Any model whose tokenizer is not close to 4
-  chars/token ran a different depth than the column records — on the model in
-  issue #11 (6.05 chars/token) a row labelled `n_depth=32768` ran ~27,000 tokens,
-  about two thirds of it. The error is systematic per model, so *rankings within
-  one sweep are largely intact*; what is wrong is the depth each row is labelled
-  with, and therefore any `-c` recommendation or Pareto point read off it.
-
-  **Re-run `--driver server` sweeps where the depth label matters** (max-context
-  picks, the `-c` to paste). Bench-driver rows are unaffected — llama-bench is
-  given token counts directly. New rows carry `prompt_tok`, so from now on the
-  gap is visible rather than inferred.
-
-- **`tg_tps` on server rows is now the median of the reps, not the mean.** Values
-  will move slightly on any config whose reps disagreed. This is the same change
-  `--verify-picks` already applied to its own re-measurements; no re-run is
-  needed for it alone.
 
 - **Server-driver rows discarded as `IMPLAUSIBLE` may have been honest.** The
   wall-clock check rejected real measurements wherever prefill was a large share
