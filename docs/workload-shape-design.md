@@ -376,11 +376,40 @@ to **measure**, so `swa_full` is now swept automatically whenever
 `{arch}.attention.sliding_window` is present in the GGUF (gemma3, gemma4,
 muse-glimmer here; absent on qwen35).
 
-**Hybrid/recurrent models have no such knob.** There is no `--swa-full` for a
-recurrent state: it cannot be rolled back to an arbitrary prefix at all, which is
-what the source says and what the reporter's 0%-at-every-depth shows. For that
-class, prefix reuse is genuinely unavailable, and the honest thing is to say so
-rather than sweep a knob that cannot help.
+### Correction: recurrent models do reuse, until they do not (measured)
+
+The paragraph this replaces said hybrid/recurrent models "cannot roll back to an
+arbitrary prefix at all", so prefix reuse was "genuinely unavailable" for that
+class. **That is wrong**, and it was wrong in the same way the SWA guess was wrong
+in the other direction: generalised from a single deep data point.
+
+Measured on `Qwen3.6-35B-A3B-UD-Q5_K_XL` (`qwen35moe`: 40 blocks, 256 experts /
+8 active, `ssm.state_size 128`, **no** SWA), at `-ngl 99 -ncmoe 40` — 3.1 GiB of
+VRAM, because the experts sit on the CPU — `-c 20480`, 90% requested reuse:
+
+| real prompt tokens | rep1 delivered reuse |
+|---|---|
+| 4,002 | **87.1%** |
+| 8,004 | 43.5% |
+| 16,352 | **0.0%** |
+
+Recurrent memory reuses a shared prefix perfectly well at shallow depth. It
+degrades with depth, and the middle point degrades *partially* rather than
+flipping off — which looks like context checkpoints restoring to a bounded point
+rather than an all-or-nothing reset, and is the opposite of the SWA behaviour
+where checkpoints did nothing at any count.
+
+So the reporter's 0% was real but not architectural: their prompt was 16,384
+tokens, past wherever this model's boundary sits. **Depth is the variable in both
+cases**; the architecture only decides which knob, if any, moves it.
+
+Two caveats on the numbers above, kept because they bound what can be concluded:
+the 4k and 8k points were taken on a server already warm from a deeper request
+(the battery shares its prefix across sizes, so caches carry between calls), which
+is why the 8k "warm" request itself shows 43.7%. The 16k point was a fresh server
+and is clean. The exact boundary is therefore **not pinned**, and whether
+`--ctx-checkpoints` moves it on this class is the open question — unlike SWA,
+where it demonstrably does not.
 
 Consequences:
 

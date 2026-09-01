@@ -125,8 +125,13 @@ but MTP is earning its keep on this model.
 **Spun out rather than left in this issue's tail**, so they do not die with it —
 same treatment as #14:
 
-- **Issue #15** — measured (`4cd1931`), and two thirds of what it claimed was
-  wrong. `--ctx-checkpoints` is *not* the lever (no effect at 0/32/128/512, nor
+- **Issue #15** — measured twice, and corrected twice. **The recurrent claim was
+  also wrong**: `qwen35moe` delivers 87% reuse at 4,002 tokens, 43.5% at 8,004 and
+  0% at 16,352, so recurrent memory reuses fine until some depth rather than never
+  ([`workload-shape-design.md`](workload-shape-design.md)). Depth is the variable
+  in both the SWA and the recurrent case; the architecture only decides which knob
+  moves it. Whether `--ctx-checkpoints` moves it here is open — unlike SWA, where
+  it demonstrably does not. Earlier correction, still standing: `--ctx-checkpoints` is *not* the lever (no effect at 0/32/128/512, nor
   `--cache-ram`); **`--swa-full` is**, and it is now swept automatically on models
   carrying `{arch}.attention.sliding_window`. The failure is also intermittent
   rather than total — rep1 reuses, rep2 does not, once the window has scrolled
@@ -247,7 +252,27 @@ reporter exactly:
 The MTP head is what makes it worth the extra 5 GiB: it is the only way to
 characterise issue #11's 333,362 t/s counter, and the smaller model cannot.
 
-### Step 1 — does full offload load at all? (#18)
+**Step 1 is already answered — see below. What remains of this run is step 2.**
+
+### Step 1 — does full offload load at all? (#18) — ANSWERED, cheaply
+
+`-ngl 99` **loads and runs** on a hybrid model. Established on
+`Qwen3.6-35B-A3B-UD-Q5_K_XL` (`qwen35moe`, hybrid SSM) at `-ngl 99 -ncmoe 40`,
+which costs **3.1 GiB** rather than 25 — because on an MoE the expert tensors are
+most of the weight and `-ncmoe` puts them on the CPU. `llama-fit-params` predicts
+the whole curve without loading anything:
+
+| `-ncmoe` | predicted VRAM |
+|---|---|
+| 0 | 25.0 GiB |
+| 10 | 19.3 GiB |
+| 20 | 13.9 GiB |
+| 40 | **2.7 GiB** (measured 3.1) |
+
+So partial `-ngl` is the fault, not GPU use, and #18's fix is a grid change. The
+original wording of this step (below) is kept for the record.
+
+<details><summary>original step 1</summary>
 
 ```
 llama-server -m Qwen3.8-27B-UD-Q6_K_XL.gguf -c 8192 -ngl 99 -fa 1 --fit off
@@ -260,6 +285,8 @@ on `Qwen3.6-27B-Q5_K_M`, `-ngl 0` is fine.
   `[0, 99]` on hybrid models. That is the fix for #18 and it needs no more GPU.
 - **Core-dumps** → hybrid models are not GPU-usable in this build at all. Much
   bigger, and an upstream report rather than a grid change.
+
+</details>
 
 ### Step 2 — everything else, in one sweep
 

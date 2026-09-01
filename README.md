@@ -144,7 +144,7 @@ Swept by default (auto-scaled to your hardware and model):
 
 | Factor        | Flag             | Levels (example, Qwen3.6-27B on MI50) | Notes |
 |---------------|------------------|----------------------------------------|-------|
-| GPU layers    | `-ngl`           | `0, 16, 32, 48, 64`                    | biggest lever; top = model's real layer count |
+| GPU layers    | `-ngl`           | `0, 16, 32, 48, 64` — or `0, 48, 54, 60, 64` when the model fits | biggest lever; top = model's real layer count. When `llama-fit-params` says every layer fits at the deepest depth in the sweep, the levels bias to the top quarter instead of spanning evenly: the reason to offload is memory pressure, and there is none. `ngl=0` is always kept, in case that verdict is wrong. `--no-oom-prune` restores the even span |
 | Context depth | `-d` (n-depth)   | 5 levels `0..min(native ctx, 65536)`   | KV pre-fill; the speed-vs-context axis, adaptive to the model's native context |
 | CPU threads   | `-t`             | `4, 6, 8, 12, 16`                      | auto-derived around the physical-core count |
 | KV cache type | `-ctk`/`-ctv`    | `f16, q8_0` (default)                  | KV precision; **floored to near-lossless** by `--min-kv q8_0` |
@@ -154,6 +154,7 @@ Swept by default (auto-scaled to your hardware and model):
 | Logical batch | `-b`             | `1x, 4x, 16x` the `-ub` of the same row | prompt chunking (swept as a *multiple* of `-ub`, so `b≥ub` holds by construction — see [constrained factors](docs/CONSTRAINED-FACTORS.md)) |
 | MoE expert offload | `-ncmoe`   | `0 .. n_layers` (5 levels)             | **MoE models** (replaces `-ot`): how many layers keep experts on CPU |
 | Dense FFN placement | `-ot` / `-ncffn` | `none, ffn_up_cpu, first_N, first_M, ffn_cpu` | **dense models**: where the FFN weights live. One column over two mechanisms — `ffn_up_cpu` moves the up-projection across *all* layers, `first_N` moves the whole FFN for the first N (needs `-ncffn`, llama.cpp b10645+; older builds get the three `-ot` levels) |
+| SWA cache     | `--swa-full`     | `0, 1`                                 | **sliding-window models** (gemma3/gemma4/…), server driver: full-size KV for the SWA layers. Past the window a shared-prefix workload otherwise loses its prompt cache entirely — measured 0% vs 90% reuse on the second rep of a 15.7k-token prompt. Not free: attention loses the sliding-window shortcut, so which side wins is a measurement |
 | NUMA policy   | `--numa`         | `distribute, isolate`                  | **multi-NUMA-node boxes only** (inert on one node) |
 | Prefill threads | `-tb`          | same levels as `-t`                    | **server driver**: decode vs prefill thread split |
 | ngram variant  | `--spec-type <variant>` | `none, ng-simple, ng-mod, ng-map-k, ng-map-k4v` | **server driver, --ngram**: which pattern-matching variant — *screened* first (see [ngram staging](#ngram-staged-search)) |
@@ -254,7 +255,31 @@ as they are discarded. A driver can exit cleanly and still report an impossible
 speed — a decode that returns without decoding is divided by a near-zero elapsed
 time and comes back as a spectacular result. Repeating the measurement does not
 help, because the fault is deterministic; the checks are about physical
-possibility instead. See [`docs/measurement-validity.md`](docs/measurement-validity.md).
+possibility instead.
+
+Each **rep is screened against its own request's duration**, not the average
+against the kindest one, so a single request with a broken server counter costs
+that rep rather than the whole configuration. The survivors decide the number by
+median, `rejected_reps` counts what was dropped, and a row is `IMPLAUSIBLE` only
+when nothing survived. See [`docs/measurement-validity.md`](docs/measurement-validity.md).
+
+### What was asked for vs what happened
+
+Three server-driver columns record the *delivered* version of something the sweep
+requested, because they are routinely different numbers and only the delivered one
+explains a result:
+
+- **`reuse` vs `cache_hit`** — the shared-prefix fraction the prompt battery
+  *asked for*, against what the server actually reused. llama.cpp can decline a
+  prefix the client believes it shares: past a sliding window, on a
+  hybrid/recurrent model, or when the context cannot hold prompt plus generation.
+  A rep the tool believes is pure decode then pays a full prefill instead. A large
+  gap is warned about, not rejected — the numbers are real, they just answer a
+  colder workload than the one being tuned for.
+- **`n_depth` vs `prompt_tok`** — the depth requested, against the tokens the
+  prompt actually became. Prompts are sized in *characters*, so on a tokenizer far
+  from 4 chars/token these differ; the ratio is now measured by a probe at session
+  open rather than assumed, and the recommended `-c` rides on the delivered number.
 
 ---
 
@@ -946,7 +971,12 @@ python3 llama-optimize.py model-UD.gguf --run --driver server \
   prefix shared across requests (0–100). It is an input, not a tuned knob: an
   agent stack with a fixed system prompt sits near 90, independent requests at 0.
   Defaults to 0, or 90 for `--use-case agents`. Each row records the reuse it
-  *actually* achieved, not the one requested.
+  *actually* achieved (`reuse`) **and what the server actually delivered**
+  (`cache_hit`) — read the second one. Asking for 90% does not make the server
+  able to give it: past a sliding window, or on a hybrid/recurrent model at
+  depth, llama.cpp reprocesses the whole prompt and the reps measure a much
+  colder workload than the one you asked to tune for. On SWA models `swa_full`
+  is swept for exactly this reason.
 - **Known caveat — ngram results are upper bounds.** n-gram speculation keeps
   state across requests, so sweeps run before 0.2.0 — which sent one identical
   prompt per rep — inflated it by ~1.46x on throughput (846 vs 579 t/s) and
