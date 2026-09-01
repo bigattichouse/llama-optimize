@@ -391,7 +391,12 @@ def detect_vram_mib(*binaries: Path | None) -> tuple[int, str] | None:
         devs = list_devices(binary)
         total = sum(d["total_mib"] for d in devs)
         if total > 0:   # a device list that adds to zero is not an answer
-            return total, "llama.cpp: " + ", ".join(d["id"] for d in devs)
+            # Name the CARD, not just the backend slot. "ROCm0" says which
+            # device index answered; "AMD Instinct MI60 / MI50" says what the
+            # result is conditioned on -- and an MI50 ships in 16 GB and 32 GB
+            # variants, so the capacity is part of the identity too.
+            return total, "llama.cpp: " + ", ".join(
+                f"{d['id']} {d['name']}".strip() for d in devs)
     # AMD / ROCm
     try:
         out = subprocess.run(["rocm-smi", "--showmeminfo", "vram", "--json"],
@@ -5609,12 +5614,22 @@ def selftest() -> bool:
                          llama_bench=Path("b"), llama_server=Path("s"),
                          array="auto", ctx_floor=8192, driver="server",
                          hw={"phys": 8, "logical": 16, "vram": 32752,
-                             "vram_src": "llama.cpp: ROCm0"})
+                             "vram_src": "llama.cpp: ROCm0 AMD Instinct MI60 / MI50"})
         _sc = result_scope(_cfg_sc)
         assert "Some-Model-Q4_K_M.gguf" in _sc, _sc     # the quant is in the name
-        assert "ROCm0" in _sc and "32752" in _sc, _sc   # and the box
+        # the CARD, not just the backend slot -- an MI50 ships in 16 GB and
+        # 32 GB variants, so the capacity is part of the identity
+        assert "MI50" in _sc and "32752" in _sc, _sc
         assert "8 physical cores" in _sc, _sc
         assert "server" in _sc, _sc
+        # and the name reaches it from the device list rather than being lost:
+        # "ROCm0" is which slot answered, "AMD Instinct MI60 / MI50" is what the
+        # number is conditioned on
+        _devs = parse_list_devices(
+            "Available devices:\n"
+            "  ROCm0: AMD Instinct MI60 / MI50 (32752 MiB, 4606 MiB free)\n")
+        assert _devs and _devs[0]["name"] == "AMD Instinct MI60 / MI50", _devs
+
         # a machine with no GPU still gets a scope rather than a bare claim
         _cfg_cpu = Config(model=Path("m.gguf"), llama_bench=Path("b"),
                           array="auto", ctx_floor=8192,
