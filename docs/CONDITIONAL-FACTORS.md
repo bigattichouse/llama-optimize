@@ -36,6 +36,43 @@ llama.cpp: `--rope-scaling yarn` gates the `--yarn-*` family; `-sm row` gates
 The design below is written against the general pattern, with ngram as the
 worked example, precisely so those later cases need only *data*, not code.
 
+## A weaker relation: inert, but legal
+
+`active_when` covers knobs whose flag would be *wrong* to emit outside the gate —
+`--spec-ngram-simple-size-n` while `--spec-type ngram-mod` is running. There is a
+weaker relation worth naming separately, because it needs less machinery:
+a knob whose flag is perfectly legal outside the gate and simply **does nothing**.
+
+`gated_by: (gate, live)` marks those. It prunes the **design** — a factor whose
+gate is pinned to a value outside `live` is dropped before the array is sized —
+and leaves emission alone, so nothing that legitimately sets the flag by another
+route loses it.
+
+The instance, from issue #11: `mtp` gates `spec_n_max`, `spec_n_min_frac`,
+`spec_p_min` and `spec_p_split`. A reporter ran `--factor mtp=0` — speculation
+off — and got **25 runs**, because the four tuning columns kept their full level
+sets and the array was sized on factors that could no longer move anything. Two
+costs, and the second is the worse one:
+
+1. 24 runs of a configuration that could not differ from the first.
+2. `factor_level_means` then reports a main effect for each of those knobs,
+   computed entirely from run-to-run noise — a knob that did nothing, credited
+   with an effect, in the table the user reads to decide what matters.
+
+Why not `active_when` here? Because the gate is really "speculation is on", and
+MTP is not the only way to turn it on: `--draft-model` speculates with no `mtp`
+column in the design at all. `active_when` treats an absent gate as *inactive*
+(deliberately — see I1), so using it would silently stop emitting
+`--spec-draft-n-max` on every draft-model run. `gated_by` only fires when the
+gate is present **and** none of its levels is live, which is exactly the case
+that is provably inert.
+
+**Still open:** when `mtp` is swept rather than pinned, the four knobs share one
+flat array with it — the F2/F3 dilution below, unfixed. The correct shape is the
+staged one: screen `mtp` on/off, then a `tune:mtp=1` stage for its knobs. That is
+a change to what every MTP sweep does, so it is sequenced separately rather than
+folded into a bug fix.
+
 ## Why a flat orthogonal array is wrong here
 
 The tool's core is a Taguchi orthogonal array (OA): pick balanced level

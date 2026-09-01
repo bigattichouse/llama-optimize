@@ -1507,6 +1507,36 @@ def _active_when(name: str):
     return FACTORS.get(name, {}).get("active_when")
 
 
+def prune_gated_factors(factors: dict) -> tuple[dict, list[str]]:
+    """Drop factors whose gate is pinned to a value that makes them inert.
+
+    `gated_by: (gate, live)` says this knob only does something when `gate`
+    resolves into `live`. It is weaker than `active_when`: an inert level here is
+    *legal*, it simply has no effect, so emission is left alone and only the
+    DESIGN is pruned. (`active_when` governs flags that would be wrong to emit at
+    all, and needs the staged decomposition `plan_stages` builds.)
+
+    Reported on issue #11: `--factor mtp=0` turns speculative decoding off, but
+    `spec_n_max`, `spec_n_min_frac`, `spec_p_min` and `spec_p_split` kept their
+    full level sets, so the sweep generated 25 runs of a configuration that could
+    not differ — the array was sized on four columns that no longer moved
+    anything. That costs the time of 24 runs, and it is worse than the time: the
+    main-effects table then reports an effect for each of those knobs, computed
+    entirely from noise.
+
+    Only prunes when the gate is present AND no level of it is live, so a gate
+    that is still being swept keeps its children. Returns (factors, dropped)."""
+    dropped = []
+    for name, spec in FACTORS.items():
+        gate_live = spec.get("gated_by")
+        if not gate_live or name not in factors:
+            continue
+        gate, live = gate_live
+        if gate in factors and not any(v in live for v in factors[gate]):
+            dropped.append(name)
+    return ({n: v for n, v in factors.items() if n not in dropped}, dropped)
+
+
 def plan_stages(factors: dict) -> list[dict]:
     """Ordered list of staged flat designs for `factors` (name → levels). Each
     stage is {name, factors, pin, gate, value}: `factors` is that stage's OA
@@ -1712,7 +1742,8 @@ FACTORS = {
     # --- speculative decoding / MTP (server only) ---
     "mtp":          {"bench": None, "server": ("--spec-type",), "kind": "cat", "server_only": True,
                      "translate": {"1": "draft-mtp", "0": ""}},   # on/off: "" omits the flag
-    "spec_n_max":   {"bench": None, "server": ("--spec-draft-n-max",), "kind": "num", "server_only": True},
+    "spec_n_max":   {"bench": None, "server": ("--spec-draft-n-max",), "kind": "num", "server_only": True,
+                     "gated_by": ("mtp", {"1"})},
     # Draft-model placement. Both are inert without -md (llama.cpp consumes them
     # only inside `if (has_draft)`), so build_factors omits them entirely rather
     # than gating them — an inert column reads as "placement doesn't matter"
@@ -1735,9 +1766,11 @@ FACTORS = {
     "spec_n_min_frac": {"bench": None, "server": ("--spec-draft-n-min",), "kind": "float",
                         "server_only": True,
                         "derived_from": ("spec_n_max", "scale"), "relation": "at_most",
-                        "abs_name": "spec_n_min"},
-    "spec_p_min":   {"bench": None, "server": ("--spec-draft-p-min",), "kind": "float", "server_only": True},
-    "spec_p_split": {"bench": None, "server": ("--spec-draft-p-split",), "kind": "float", "server_only": True},
+                        "abs_name": "spec_n_min", "gated_by": ("mtp", {"1"})},
+    "spec_p_min":   {"bench": None, "server": ("--spec-draft-p-min",), "kind": "float", "server_only": True,
+                     "gated_by": ("mtp", {"1"})},
+    "spec_p_split": {"bench": None, "server": ("--spec-draft-p-split",), "kind": "float", "server_only": True,
+                     "gated_by": ("mtp", {"1"})},
     "ngram":             {"bench": None, "server": ("--spec-type",), "kind": "cat", "server_only": True,
                           "translate": {"none": "", "ngram-simple": "ngram-simple", "ngram-mod": "ngram-mod",
                                         "ngram-map-k": "ngram-map-k", "ngram-map-k4v": "ngram-map-k4v"}},
@@ -2374,8 +2407,11 @@ def server_command(cfg: Config, f: dict, ctx: int) -> str:
     if cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0:
         if "mtp" not in f:                    # MTP fixed on unless swept
             parts.append("--spec-type draft-mtp")
-        # (skipped when factor_flags already pinned it for a derived sibling)
-        if "spec_n_max" not in f and "spec_n_max" not in derived_base_pins(f):
+        # (skipped when factor_flags already pinned it for a derived sibling, and
+        # when mtp is explicitly OFF -- there is no drafter for it to bound, and
+        # a pasted command should not carry a flag that does nothing)
+        if (f.get("mtp") != "0" and "spec_n_max" not in f
+                and "spec_n_max" not in derived_base_pins(f)):
             parts.append(f"--spec-draft-n-max {cfg.spec_draft_n_max}")
     # ngram self-speculation: pattern-matching decoding that needs no draft model.
     # When enabled but not swept, activate a sensible default variant (ngram-mod);
@@ -2902,8 +2938,10 @@ def build_server_args(cfg: Config, f: dict, port: int, n_ctx: int) -> list[str]:
     if cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0:
         if "mtp" not in f:                         # MTP fixed on unless swept
             args += ["--spec-type", "draft-mtp"]
-        # default n_max if not swept (and not already pinned for a derived sibling)
-        if "spec_n_max" not in f and "spec_n_max" not in derived_base_pins(f):
+        # default n_max if not swept (and not already pinned for a derived
+        # sibling); nothing to bound when mtp is explicitly off
+        if (f.get("mtp") != "0" and "spec_n_max" not in f
+                and "spec_n_max" not in derived_base_pins(f)):
             args += ["--spec-draft-n-max", str(cfg.spec_draft_n_max)]
     # ngram self-speculation: enable ngram-mod by default when ngram is on but not
     # swept. ngram's draft length is ngram-mod's own default, not --spec-draft-n-max
@@ -5560,6 +5598,44 @@ def selftest() -> bool:
         assert max(cond_means, key=cond_means.get) == "24", cond_means   # true best
         assert "90.0" not in [f"{v}" for v in cond_means.values()]        # decoy row excluded
 
+        # --- gated factors: a pinned-inert gate must not size the array ---
+        # Reported on issue #11: `--factor mtp=0` turns speculation off, but the
+        # four speculative-tuning knobs kept their full level sets, so the sweep
+        # generated 25 runs of a configuration that could not differ -- and the
+        # main-effects table then reported an effect for each of them, computed
+        # from nothing but noise.
+        _spec = {"spec_n_max": ["1", "2", "3", "4", "6"],
+                 "spec_n_min_frac": ["0.0", "0.5", "1.0"],
+                 "spec_p_min": ["0.0", "0.25", "0.5", "0.75", "0.9"],
+                 "spec_p_split": ["0.1", "0.3", "0.5"]}
+        _off, _gone = prune_gated_factors({"ngl": ["99"], "mtp": ["0"], **_spec})
+        assert sorted(_gone) == sorted(_spec), _gone
+        assert set(_off) == {"ngl", "mtp"}, _off
+        # a gate pinned to a LIVE value keeps them -- that is the run being tuned
+        _on, _gone_on = prune_gated_factors({"mtp": ["1"], **_spec})
+        assert _gone_on == [] and set(_on) == {"mtp", *_spec}
+        # ...and a gate still being SWEPT keeps them: one of its levels is live
+        _both, _gone_both = prune_gated_factors({"mtp": ["1", "0"], **_spec})
+        assert _gone_both == [], _gone_both
+        # no gate in the design at all is not evidence of inertness -- a draft
+        # model speculates with no `mtp` column, and its knobs must survive
+        _nogate, _gone_ng = prune_gated_factors(dict(_spec))
+        assert _gone_ng == [] and set(_nogate) == set(_spec)
+        # unrelated factors are never touched
+        assert prune_gated_factors({"ngl": ["1", "2"]}) == ({"ngl": ["1", "2"]}, [])
+        # and with mtp explicitly off, the inert default flag is not pasted either
+        cfg_mtp_off = Config(model=Path("m.gguf"), llama_bench=Path("b"),
+                             llama_server=Path("s"), array="auto", ctx_floor=8192,
+                             driver="server", emit_mtp=True,
+                             hw={"phys": 8, "logical": 16, "n_layers": 32,
+                                 "n_ctx_train": 32768, "n_experts": 0,
+                                 "n_nextn": 1})
+        _a_off = build_server_args(cfg_mtp_off, {"mtp": "0", "ngl": "99"}, 8080, 4096)
+        assert "--spec-draft-n-max" not in _a_off, _a_off
+        assert "--spec-type" not in _a_off, _a_off
+        _a_on = build_server_args(cfg_mtp_off, {"mtp": "1", "ngl": "99"}, 8080, 4096)
+        assert "--spec-draft-n-max" in _a_on, _a_on
+
         # --- stage planner (docs/CONDITIONAL-FACTORS.md) ---
         # feed the planner the FULL factor set (screen gate + every child) it would
         # decompose; build_factors only ever emits one stage's worth at a time.
@@ -8077,6 +8153,15 @@ def main():
         if lvl_errors:
             ap.error("--factor " + "; ".join(lvl_errors))
         cfg.factors[name] = levels
+
+    # Overrides can pin a gate to a value that makes its knobs inert -- most of
+    # all `--factor mtp=0`, which turns speculation off while leaving four
+    # speculative-tuning columns sweeping full level sets (issue #11).
+    cfg.factors, _inert = prune_gated_factors(cfg.factors)
+    if _inert:
+        _gates = sorted({FACTORS[n]["gated_by"][0] for n in _inert})
+        print(f"not swept: {', '.join(_inert)} — inert at the pinned "
+              f"{', '.join(_gates)}")
 
     # apply --env: each becomes an orthogonal factor that sets a process env var
     for spec in args.env:

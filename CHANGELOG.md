@@ -46,6 +46,18 @@ earlier.
   for. Capped, a broken server can loosen its own ceiling by at most 10×, against
   a defect ([issue #3]) that overshot by ~1500×.
 
+- **`--factor mtp=0` still swept the four speculative-tuning knobs.** Reported on
+  [issue #11]: turning speculation off left `spec_n_max`, `spec_n_min_frac`,
+  `spec_p_min` and `spec_p_split` at full level sets, so the array was sized on
+  four columns that could no longer change anything — 25 runs of one
+  configuration. The wasted time is the smaller half: the main-effects table then
+  credited each of those knobs with an effect computed from run-to-run noise. A
+  factor whose gate is pinned to a value that makes it inert is now dropped from
+  the design (and said so on stdout), and the inert `--spec-draft-n-max` default
+  is no longer pasted into a command that has no drafter. Emission is untouched,
+  so `--draft-model` runs — which speculate with no `mtp` column at all — keep
+  every flag they had.
+
 - **One bad rep no longer discards the whole configuration.** Follow-up on
   [issue #11]: I5 compared the **mean** rate across reps against the **kindest**
   rep's ceiling, so a single request with a broken server counter (the reporter's
