@@ -1116,6 +1116,25 @@ def model_hw(meta: dict) -> dict:
             "ssm_state": model_ssm_state(meta)}
 
 
+def draft_decides_spec_type(cfg: "Config") -> bool:
+    """Whether an explicitly supplied draft model should pick the speculative
+    type, rather than the target model's own MTP metadata.
+
+    llama.cpp already infers the type from the draft
+    (`common_speculative_types_from_gguf`): architecture `dflash` means
+    draft-dflash, or draft-dspark when the Markov head is present; an ordinary
+    architecture carrying `blk.N.nextn.eh_proj.weight` means draft-mtp. We do not
+    reproduce that inference and must not pre-empt it.
+
+    Before this, a target shipping its own MTP head got `--spec-type draft-mtp`
+    unconditionally — so pointing `--draft-model` at a DFlash2 head produced
+    `-md dflash.gguf --spec-type draft-mtp`, which loaded the draft and then ran
+    MTP anyway, silently measuring the wrong thing (issue #19). A draft model the
+    user named on the command line is better evidence of intent than metadata the
+    target happens to carry."""
+    return bool(getattr(cfg, "draft_model", None))
+
+
 def model_ssm_state(meta: dict) -> int:
     """SSM state size for a hybrid/recurrent model; 0 for a plain transformer.
 
@@ -2536,7 +2555,9 @@ def server_command(cfg: Config, f: dict, ctx: int) -> str:
     # server driver this speedup IS measured; with llama-bench it is NOT (bench
     # can't do speculative decoding) and stacks on top of the reported t/s.
     if cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0:
-        if "mtp" not in f:                    # MTP fixed on unless swept
+        # MTP fixed on unless swept -- or unless a draft model was supplied, which
+        # carries its own type and must not be overridden (issue #19)
+        if "mtp" not in f and not draft_decides_spec_type(cfg):
             parts.append("--spec-type draft-mtp")
         # (skipped when factor_flags already pinned it for a derived sibling, and
         # when mtp is explicitly OFF -- there is no drafter for it to bound, and
@@ -3067,7 +3088,9 @@ def build_server_args(cfg: Config, f: dict, port: int, n_ctx: int) -> list[str]:
     elif "parallel" not in f and cfg.parallel > 1:  # concurrency (fixed) if not swept
         args += ["--parallel", str(cfg.parallel)]
     if cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0:
-        if "mtp" not in f:                         # MTP fixed on unless swept
+        # ...unless a draft model was supplied: llama.cpp reads its type off the
+        # draft, and forcing draft-mtp here ran MTP instead of what was loaded
+        if "mtp" not in f and not draft_decides_spec_type(cfg):
             args += ["--spec-type", "draft-mtp"]
         # default n_max if not swept (and not already pinned for a derived
         # sibling); nothing to bound when mtp is explicitly off
@@ -5028,6 +5051,31 @@ def selftest() -> bool:
         # factor-level generation
         assert five_levels_span(0, 64) == [0, 16, 32, 48, 64]
         assert ngl_levels(64)[0] == 0 and ngl_levels(64)[-1] == 64
+
+        # --- a supplied draft model picks the spec type (issue #19) ---
+        # llama.cpp reads the type off the draft GGUF (arch `dflash` -> dflash or
+        # dspark; an nextn.eh_proj tensor -> mtp). The tool used to emit
+        # `--spec-type draft-mtp` whenever the TARGET carried an MTP head, so
+        # `--draft-model dflash.gguf` loaded the DFlash2 head and then ran MTP
+        # anyway -- measuring the wrong thing without saying so.
+        _hw_mtp = {"phys": 8, "logical": 16, "n_layers": 65,
+                   "n_ctx_train": 262144, "n_experts": 0, "n_nextn": 1}
+        cfg_dm = Config(model=Path("q.gguf"), llama_bench=Path("b"),
+                        llama_server=Path("s"), array="auto", ctx_floor=8192,
+                        driver="server", emit_mtp=True,
+                        draft_model=Path("dflash.gguf"), hw=dict(_hw_mtp))
+        _a_dm = build_server_args(cfg_dm, {"ngl": "99"}, 8080, 4096)
+        assert "-md" in _a_dm, _a_dm                     # the draft is loaded...
+        assert "--spec-type" not in _a_dm, _a_dm         # ...and decides the type
+        # with no draft model the target's own MTP head still switches it on
+        cfg_no = Config(model=Path("q.gguf"), llama_bench=Path("b"),
+                        llama_server=Path("s"), array="auto", ctx_floor=8192,
+                        driver="server", emit_mtp=True, hw=dict(_hw_mtp))
+        _a_no = build_server_args(cfg_no, {"ngl": "99"}, 8080, 4096)
+        assert "--spec-type" in _a_no and "draft-mtp" in _a_no, _a_no
+        # and the pasted command agrees with what was run
+        assert "--spec-type draft-mtp" not in server_command(cfg_dm, {"ngl": "99"}, 4096)
+        assert "--spec-type draft-mtp" in server_command(cfg_no, {"ngl": "99"}, 4096)
 
         # --- swa_full is swept when the model has SWA (issue #15) ---
         # Measured on gemma-3-270m, 15.7k-token prompt, 90% shared prefix: the

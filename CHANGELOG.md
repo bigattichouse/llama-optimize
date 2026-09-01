@@ -84,6 +84,15 @@ earlier.
 - **The recommended `-c` could exceed the context the sweep ever loaded.** It was
   derived from the requested depth; it is now capped by the delivered one.
 
+- **A supplied `--draft-model` was loaded and then ignored.** [Issue #19]. On a
+  target carrying its own MTP head the tool emitted `--spec-type draft-mtp`
+  unconditionally, so pointing `--draft-model` at a DFlash2 head produced
+  `-md dflash.gguf --spec-type draft-mtp` — the draft loaded, MTP ran instead,
+  and nothing said so. llama.cpp infers the type from the draft GGUF itself
+  (`common_speculative_types_from_gguf`: architecture `dflash` → draft-dflash or
+  draft-dspark, an `nextn.eh_proj` tensor → draft-mtp), so the fix is to stop
+  pre-empting that inference: a draft model named on the command line decides.
+
 - **The prompt-cache miss warning now says something measured, and something
   different per architecture.** [Issue #15]. Both earlier versions were wrong, in
   opposite directions: the first blamed an undersized context, the second claimed
