@@ -51,11 +51,29 @@ at which prefix reuse collapses moves with architecture. Three people with
 different cards would settle all of them in a week, and this box cannot settle
 any of them.
 
-The hard parts are matching and privacy, not collection: nobody's machine is
-identical, so the product is really "how close is this fingerprint to mine", and
-a fingerprint must carry hardware identity without carrying the user (model
-*paths* leak usernames; basename and quant are what matter). Opt-in, never
-automatic.
+Submission shape: **"Share your results with the community?"** after the report,
+never a default, pushing `fingerprint.json` + `results.csv.gz` to an orphan branch
+(`community-sweeps`) or a companion repo — the corpus will outgrow the source and
+nobody cloning the tool should pay for it.
+
+The hard parts are not the plumbing:
+
+- **Matching, not equality.** Nobody's machine is identical, so the product is
+  really "how close is this fingerprint to mine". That ranking needs the
+  fingerprint structured, not a printed sentence.
+- **Privacy, harder once automated.** Model *paths* leak usernames and directory
+  layout; basename and quant are what matter. Build the redaction into the
+  fingerprint so there is no "sanitise before sending" step to forget. Consent is
+  per-submission and shows exactly what will be sent — this is publishing.
+- **Auth decides adoption.** `gh` already authenticated is a big assumption and a
+  token is a bigger one. An issue with the payload attached needs no repo
+  permissions; a PR is cleaner to index and higher friction.
+- **Provenance is what makes it worth anything.** A hand-edited CSV is
+  indistinguishable from a measured one. `tool_version`/`llama_build` catch
+  accidents, not intent — so the corpus should say "community-reported" rather
+  than imply verified. The tool's own validity rules (`IMPLAUSIBLE`, out-of-bounds,
+  `rejected_reps`) could gate most submissions automatically, and one that fails
+  them is itself interesting.
 
 ## 1. Noise-aware picks — partially done
 
