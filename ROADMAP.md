@@ -60,7 +60,11 @@ The hard parts are not the plumbing:
 
 - **Matching, not equality.** Nobody's machine is identical, so the product is
   really "how close is this fingerprint to mine". That ranking needs the
-  fingerprint structured, not a printed sentence.
+  fingerprint *structured* — a printed sentence cannot be compared field by
+  field. **JSON**, specifically: `--selftest` promises stdlib-only, `json` is in
+  the stdlib and `yaml` is not, and a dependency for a file format would be a
+  poor trade. A schema version in the file from day one, for the same reason rows
+  carry `tool_version`: these will outlive several releases of the tool.
 - **Privacy, harder once automated.** Model *paths* leak usernames and directory
   layout; basename and quant are what matter. Build the redaction into the
   fingerprint so there is no "sanitise before sending" step to forget. Consent is
