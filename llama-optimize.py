@@ -1284,25 +1284,48 @@ def spec_type_note(level: str) -> str | None:
     return None
 
 
-def draft_self_describes(path) -> bool:
-    """Whether llama.cpp can work out this draft's speculative type on its own.
+# Draft architectures that llama.cpp CANNOT infer a type from, mapped to the type
+# they need named. `eagle3` is the case: llama.cpp implements EAGLE3 in full
+# (`common/speculative.cpp` — encoder, decoder, target-layer hidden-state
+# extraction) but `common_speculative_types_from_gguf` still only recognises
+# `dflash` and the MTP tensor, which is its own outstanding TODO in
+# `common/preset.cpp`. So a head reporting `general.architecture = eagle3` would
+# otherwise be handed `draft-simple` and quietly run as the wrong kind of drafter.
+DRAFT_ARCH_SPEC_TYPE = {"eagle3": "draft-eagle3"}
 
-    `common_speculative_types_from_gguf` recognises two things: architecture
-    `dflash` (DFlash2, or DSpark when the Markov head is there), and an ordinary
-    architecture carrying `blk.N.nextn.eh_proj.weight` — an MTP head. The second
-    is a tensor and this reader parses key/values only, but the standalone MTP
-    sidecars carry `{arch}.nextn_predict_layers` in their KV as well, which is the
-    same signal one layer up.
 
-    Anything else is an ordinary model, and llama.cpp infers NOTHING from it —
-    which is the whole reason this function exists."""
+def draft_spec_type_for(path) -> str | None:
+    """The `--spec-type` a draft GGUF needs named, or None to leave it to
+    llama.cpp.
+
+    None means llama.cpp works it out itself — `common_speculative_types_from_gguf`
+    recognises architecture `dflash` (DFlash2, or DSpark when the Markov head is
+    there) and an ordinary architecture carrying `blk.N.nextn.eh_proj.weight`, an
+    MTP head. The MTP tensor is not visible to a key/value reader, but the
+    standalone sidecars carry `{arch}.nextn_predict_layers` in their KV, which is
+    the same signal one layer up.
+
+    A name means llama.cpp cannot: an architecture in `DRAFT_ARCH_SPEC_TYPE`, or
+    an ordinary model, which tells it nothing at all and would otherwise load and
+    never speculate."""
     if not path:
-        return False
+        return None
     meta = read_gguf_metadata(Path(path))
     if not meta:
-        return False
-    return (str(meta.get("general.architecture", "")) == "dflash"
-            or model_nextn_layers(meta) > 0)
+        # unreadable, or sharded — llama.cpp reads only the first split and says
+        # such drafts need an explicit type, so name the general one
+        return "draft-simple"
+    arch = str(meta.get("general.architecture", ""))
+    if arch in DRAFT_ARCH_SPEC_TYPE:
+        return DRAFT_ARCH_SPEC_TYPE[arch]
+    if arch == "dflash" or model_nextn_layers(meta) > 0:
+        return None
+    return "draft-simple"
+
+
+def draft_self_describes(path) -> bool:
+    """Whether llama.cpp can work out this draft's speculative type on its own."""
+    return draft_spec_type_for(path) is None
 
 
 def draft_model_args(cfg: "Config") -> list[str]:
@@ -1323,8 +1346,9 @@ def draft_model_args(cfg: "Config") -> list[str]:
     if not dm:
         return []
     args = ["-md", str(dm)]
-    if not draft_self_describes(dm):
-        args += ["--spec-type", "draft-simple"]
+    needed = draft_spec_type_for(dm)
+    if needed:
+        args += ["--spec-type", needed]
     return args
 
 
@@ -5623,6 +5647,7 @@ def selftest() -> bool:
             # a head that names its own kind: llama.cpp infers, we stay quiet
             globals()["read_gguf_metadata"] = \
                 lambda _p: {"general.architecture": "dflash"}
+            assert draft_spec_type_for(Path("x")) is None   # llama.cpp infers it
             _a_dm = build_server_args(cfg_dm, {"ngl": "99"}, 8080, 4096)
             assert "-md" in _a_dm, _a_dm                 # the draft is loaded...
             assert "--spec-type" not in _a_dm, _a_dm     # ...and decides the type
@@ -5640,9 +5665,22 @@ def selftest() -> bool:
             # default of `none`, and the draft is loaded, charged to VRAM and
             # never used. Nothing said so, because on a target with no MTP head
             # nothing had requested speculation to begin with.
+            # An EAGLE3 head reports its own architecture, but llama.cpp cannot
+            # infer a type from it -- the implementation is complete
+            # (common/speculative.cpp) while the GGUF inference is not
+            # (common/preset.cpp TODO). Without the mapping it would be handed
+            # draft-simple and run as the wrong kind of drafter entirely.
+            globals()["read_gguf_metadata"] = \
+                lambda _p: {"general.architecture": "eagle3"}
+            assert draft_spec_type_for(Path("x")) == "draft-eagle3"
+            _a_e3 = build_server_args(cfg_dm, {"ngl": "99"}, 8080, 4096)
+            assert _a_e3[_a_e3.index("--spec-type") + 1] == "draft-eagle3", _a_e3
+            assert "-md" in _a_e3, _a_e3
+
             globals()["read_gguf_metadata"] = \
                 lambda _p: {"general.architecture": "qwen3"}
             assert draft_self_describes(Path("x")) is False
+            assert draft_spec_type_for(Path("x")) == "draft-simple"
             # A draft we cannot read counts as NOT self-describing, on purpose.
             # llama.cpp reads only the first split, so a sharded draft needs an
             # explicit type by its own account (common/arg.cpp) -- and naming a

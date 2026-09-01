@@ -117,6 +117,15 @@ earlier.
 - **The recommended `-c` could exceed the context the sweep ever loaded.** It was
   derived from the requested depth; it is now capped by the delivered one.
 
+- **An EAGLE3 draft head would have run as the wrong kind of drafter.** llama.cpp
+  implements EAGLE3 in full — encoder, decoder, target-layer hidden-state
+  extraction — but `common_speculative_types_from_gguf` still recognises only
+  `dflash` and the MTP tensor, its own outstanding TODO. A head reporting
+  `general.architecture = eagle3` therefore names no type llama.cpp can infer,
+  and the fix below for plain drafts would have handed it `draft-simple`. Draft
+  architectures now map to the type they need named, so eagle3 gets
+  `--spec-type draft-eagle3`.
+
 - **A plain `--draft-model` never speculated at all.** Found while closing the
   rest of [issue #19]. llama.cpp infers the speculative type from the draft GGUF,
   but only for heads that name themselves — architecture `dflash`, or an MTP
