@@ -235,95 +235,64 @@ real MoE model before choosing between `gated_by`, a constrained pair, or lettin
 Step 8 (multi-GPU) is next on its own merits, and still needs hardware this
 project does not have.
 
-## Queued: one GPU run, waiting on the card (#18, #15, #11)
+## The queued GPU run — done, and it closed three things
 
-**Not yet run — deliberately.** Needs ~25.6 GiB and the card currently has 22.1
-free (another project holds 9.8 of 32.0). **Precondition: the other process down
-to ≤ 6.4 GiB.** Check with `rocm-smi --showmeminfo vram`.
+Ran on `Qwen3.8-27B-UD-Q6_K_XL` (hybrid + MTP head), `--profile agents`,
+`n_depth=8192`, `ngl=99`, `--factor mtp=0,1`, reps 3:
 
-**Model: `Qwen3.8-27B-UD-Q6_K_XL.gguf`** (23.6 GiB). Chosen over the smaller
-`Qwen3.6-27B-Q5_K_M` (18.2 GiB, would fit today) because it is the only local
-model that is hybrid-SSM **and** carries an MTP head — matching issue #11's
-reporter exactly:
+| `mtp` | pp t/s | **tg t/s** | draft_acc | cache_hit | prompt_tok | rejected_reps |
+|---|---|---|---|---|---|---|
+| 0 | 118.4 | **7.13** | — | 0.0 | 16,435 | 0 |
+| 1 | 93.7 | **15.12** | 0.699 | 0.0 | 16,435 | 0 |
 
-| | size | arch | blocks | MTP | hybrid |
-|---|---|---|---|---|---|
-| Qwen3.8-27B-UD-Q6_K_XL | 23.6 GiB | qwen35 | 65 | **yes** | yes |
-| Qwen3.6-27B-UD-Q6_K_XL | 24.2 GiB | qwen35 | 65 | yes | yes |
-| Qwen3.6-27B-Q5_K_M | 18.2 GiB | qwen35 | 64 | **no** | yes |
+**MTP is worth 2.12x on decode here**, at a cost in prefill (118 -> 94 t/s) — the
+trade a draft head makes, now measured rather than assumed. `pp` is low in
+absolute terms because the reporter's config pins `-tb 1`, single-threaded
+prefill; each run took ~13 minutes for that reason.
 
-The MTP head is what makes it worth the extra 5 GiB: it is the only way to
-characterise issue #11's 333,362 t/s counter, and the smaller model cannot.
+Three things it settled, two of them claims made without checking:
 
-**Step 1 is already answered — see below. What remains of this run is step 2.**
+- **Issue #11's 333,362 t/s counter did not reproduce.** `rejected_reps=0` at both
+  levels, no discard. So it is not inherent to MTP on this architecture — the
+  trigger is something else in that reporter's setup. The per-rep screening
+  handles it either way, which is why this was never a blocker.
+- **`cache_hit=0.0` at BOTH `mtp` levels**, so speculation was never involved in
+  their cache miss. That was asserted to the reporter; now verified on their
+  architecture with MTP actually present.
+- **`prompt_tok=16435` against 16,384 requested** (+0.3%) — the calibration fix
+  confirmed on the exact model that motivated it.
 
-### Step 1 — does full offload load at all? (#18) — ANSWERED, cheaply
-
-`-ngl 99` **loads and runs** on a hybrid model. Established on
-`Qwen3.6-35B-A3B-UD-Q5_K_XL` (`qwen35moe`, hybrid SSM) at `-ngl 99 -ncmoe 40`,
-which costs **3.1 GiB** rather than 25 — because on an MoE the expert tensors are
-most of the weight and `-ncmoe` puts them on the CPU. `llama-fit-params` predicts
-the whole curve without loading anything:
+Step 1 of this run (does `-ngl 99` load on a hybrid model?) had already been
+answered for 3.1 GiB via the MoE, using `-ncmoe 40` to keep the experts on CPU.
+`llama-fit-params` gives the whole VRAM curve without loading anything, which is
+the cheap way to plan any of these:
 
 | `-ncmoe` | predicted VRAM |
 |---|---|
 | 0 | 25.0 GiB |
-| 10 | 19.3 GiB |
 | 20 | 13.9 GiB |
 | 40 | **2.7 GiB** (measured 3.1) |
 
-So partial `-ngl` is the fault, not GPU use, and #18's fix is a grid change. The
-original wording of this step (below) is kept for the record.
+## Also in flight## Also in flight
 
-<details><summary>original step 1</summary>
+- **Issue #19 — speculative type coverage.** Narrow half fixed (`d9d0d4b`): a
+  supplied `--draft-model` used to be loaded and then ignored, because the tool
+  forced `--spec-type draft-mtp` whenever the *target* carried a NextN head. So
+  `--draft-model dflash.gguf` ran MTP anyway — anyone checking the DFlash2 claim
+  through this tool would have measured MTP twice. llama.cpp infers the type from
+  the draft GGUF itself, and we now let it.
 
-```
-llama-server -m Qwen3.8-27B-UD-Q6_K_XL.gguf -c 8192 -ngl 99 -fa 1 --fit off
-```
+  **The DFlash2 head is downloaded** —
+  `/home/bigattichouse/workspace/gguf/Qwen3.8-27B-DFlash2-Q4_K_M.gguf`, 1.1 GB,
+  from `z-lab/Qwen3.8-27B-DFlash2-GGUF`. It reports `general.architecture =
+  dflash`, `dflash.block_count = 5`, `dflash.target_layers = [6, 20, 34, 48, 62]`.
+  Note these ship as standalone GGUFs in their own repo, NOT as `dflash-` siblings
+  of the model — that convention is llama.cpp's `-hf` auto-download path and does
+  not apply here.
 
-Load-only; kill it once healthy. Known already: `-ngl 5` and `-ngl 40` core-dump
-on `Qwen3.6-27B-Q5_K_M`, `-ngl 0` is fine.
-
-- **Loads** → partial offload is the fault, and the `ngl` grid should collapse to
-  `[0, 99]` on hybrid models. That is the fix for #18 and it needs no more GPU.
-- **Core-dumps** → hybrid models are not GPU-usable in this build at all. Much
-  bigger, and an upstream report rather than a grid change.
-
-</details>
-
-### Step 2 — everything else, in one sweep
-
-Only if step 1 loads. Uses the tool itself rather than a bespoke probe, since
-`cache_hit`, `prompt_tok` and `rejected_reps` are now columns:
-
-```
-python3 llama-optimize.py <model> --run --driver server --no-probe \
-  --profile agents --factor ngl=99 --factor n_depth=8192 \
-  --factor mtp=0,1 --reps 3 --results qwen38.csv
-```
-
-Three answers off one CSV:
-
-- **`cache_hit`** — #15's recurrent half. Expected 0.0 at both `mtp` levels; that
-  confirms speculation was never the cause and the architecture is. If it is
-  non-zero at `mtp=0`, the recurrent claim is wrong and #15 reopens wider.
-- **`tg_tps` / `rejected_reps`** — issue #11's 333,362 t/s counter. If reps get
-  rejected at `mtp=1` and not at `mtp=0`, that characterises the llama.cpp
-  speculative-timing bug well enough to report upstream, which is the one thing
-  still owed to that reporter's data.
-- **`prompt_tok`** — should land within ~1% of `n_prompt + n_depth` = 16,384.
-  Confirms the calibration probe on the exact model that motivated it; measured
-  6.05 chars/token there via `llama-tokenize`.
-
-Budget: ~10 minutes once the card is free, most of it loading 23.6 GiB.
-
-## Also in flight
-
-- **Issue #19 — speculative type coverage.** The #11 reporter says DFlash2 beats
-  MTP on their model; the tool can only offer `draft-mtp` or nothing, so five of
-  llama.cpp's eleven `--spec-type` values are unreachable. Asked them for numbers
-  and for how they invoke it, since no draft sidecar exists locally to build
-  against.
+  Remaining: a `spec_type` factor (levels `none` / `draft-mtp` / `draft-dflash`,
+  with `-md` emitted only for the levels that need it) so one sweep can compare
+  them. The MTP baseline to beat is **15.12 t/s** from the run above, same config.
 - **`Qwen3.6-35B-A3B` downloading** — the MoE test subject for #17, and the only
   MoE anywhere on this box (checked: every local GGUF reports `expert_count = 0`,
   and of the safetensors in `../model/` only this one is `qwen3_5_moe`). Expect it
