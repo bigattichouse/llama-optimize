@@ -142,11 +142,12 @@ needs two non-identical GPUs and by construction cannot be tested here.
   measures a workload those users cannot get
   ([`workload-shape-design.md`](workload-shape-design.md)). Needs a hybrid or SWA
   model on a GPU, so it is opportunistic rather than scheduled.
-- **Issue #16 — stage the MTP knobs behind their gate.** `gated_by` handles the
-  pinned case (`--factor mtp=0`); when `mtp` is *swept* the four knobs still
-  share one flat array with it. Needs no hardware, and is the same shape as the
-  draft-model staging in step 6 — worth doing as one piece of work
-  ([`CONDITIONAL-FACTORS.md`](CONDITIONAL-FACTORS.md)).
+- **Issue #17 — `ngl` and `ncmoe` both decide what lives on the CPU on MoE
+  models.** `ngl=0 x any ncmoe` is a cell where `ncmoe` cannot act; `is_inert`
+  now stops such a cell voting once the relation is declared, but the relation
+  between these two is not `gated_by` — it is graded, not on/off, and picking
+  between a constrained pair and letting `ncmoe` own the axis wants measurement
+  on a real MoE model.
 
 ## What this plan assumes
 

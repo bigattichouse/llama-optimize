@@ -2011,6 +2011,25 @@ def is_active(name: str, assignment: dict) -> bool:
     return assignment.get(gate) in live
 
 
+def is_inert(name: str, assignment: dict) -> bool:
+    """Whether `name` provably could not have acted in this row.
+
+    The `gated_by` counterpart to `is_active`, and it differs from it in the case
+    that matters: an ABSENT gate is not evidence. `is_active` treats a missing
+    gate as inactive, deliberately (I1) — a conditional flag must not leak into a
+    row that never established its gate. Here the question is the opposite one,
+    "can this row tell us anything about this knob", and a row with no `mtp`
+    column has not said that speculation is off. `--draft-model` speculates with
+    no `mtp` column at all, so treating its absence as inertness would delete
+    every draft-model row from `--spec-draft-n-max`'s effect and stop emitting
+    the flag (issue #16)."""
+    gate_live = FACTORS.get(name, {}).get("gated_by")
+    if not gate_live:
+        return False
+    gate, live = gate_live
+    return gate in assignment and assignment.get(gate) not in live
+
+
 def active_factors(names, assignment: dict) -> list:
     """The subset of `names` active under `assignment` (a gate value map)."""
     return [n for n in names if is_active(n, assignment)]
@@ -2304,6 +2323,8 @@ def factor_flags(cfg: Config, f: dict, driver: str) -> list[list[str]]:
             continue
         if not is_active(name, f):                 # conditional factor inactive here
             continue
+        if is_inert(name, f):     # gate switched the feature off: the flag is
+            continue              # legal but does nothing, so do not paste it
         if spec.get("emit") is not None:
             # The LEVEL picks the flag, not just the value. Emitted only where
             # the driver has some mapping at all, so a driver that cannot
@@ -4336,10 +4357,18 @@ def report(cfg: Config, rows: list[dict], probe: dict | None = None):
 
 def factor_level_means(rows: list[dict], factor: str) -> dict:
     """Mean objective score per level of a factor (OK runs only) — the Taguchi
-    main effect for a balanced design. A conditional factor (active_when) is
-    scored only over rows where it was active (I3): rows where its gate selected
-    a different variant are inert and carry no information about its effect."""
-    ok = [r for r in rows if r["status"] == "OK" and is_active(factor, r)]
+    main effect for a balanced design. A conditional factor is scored only over
+    rows where it could act (I3): rows where its gate selected a different
+    variant (`active_when`) or switched the feature off entirely (`gated_by`)
+    are inert and carry no information about its effect.
+
+    Without this, a knob that did nothing is credited with an effect computed
+    from run-to-run noise, in the table the user reads to decide what matters —
+    which is worse than the wasted runs, because the runs are at least honest
+    about the other factors (issue #16)."""
+    ok = [r for r in rows
+          if r["status"] == "OK" and is_active(factor, r)
+          and not is_inert(factor, r)]
     means = {}
     levels = sorted(set(str(r[factor]) for r in ok if factor in r),
                     key=lambda x: (len(x), x))
@@ -5785,6 +5814,56 @@ def selftest() -> bool:
         assert "--spec-type" not in _a_off, _a_off
         _a_on = build_server_args(cfg_mtp_off, {"mtp": "1", "ngl": "99"}, 8080, 4096)
         assert "--spec-draft-n-max" in _a_on, _a_on
+
+        # --- a gated knob that could not act does not vote (issue #16) ---
+        # `gated_by` pruned the DESIGN when the gate is pinned off (#11). When
+        # the gate is SWEPT, half the rows still carry the knob at a level that
+        # cannot do anything, and those rows were being averaged into its main
+        # effect -- crediting a knob that did nothing with an effect computed
+        # from run-to-run noise.
+        assert is_inert("spec_n_max", {"mtp": "0"}) is True
+        assert is_inert("spec_n_max", {"mtp": "1"}) is False
+        # an ABSENT gate is not evidence, and this is where is_inert must differ
+        # from is_active: --draft-model speculates with no mtp column at all, so
+        # treating absence as inertness would delete every draft-model row from
+        # the effect and stop emitting the flag.
+        assert is_inert("spec_n_max", {}) is False
+        assert is_active("spec_n_max", {}) is True      # no active_when on it
+        assert is_inert("ngl", {"mtp": "0"}) is False   # ungated, never inert
+
+        # the effect is computed over the rows that could show it
+        _mrows = ([{"status": "OK", "mtp": "1", "spec_n_max": str(n),
+                    "eff_tps": v} for n, v in ((1, 20.0), (2, 30.0),
+                                               (4, 40.0), (6, 50.0))]
+                  + [{"status": "OK", "mtp": "0", "spec_n_max": str(n),
+                      "eff_tps": 15.0} for n in (1, 2, 4, 6)])
+        _eff = factor_level_means(_mrows, "spec_n_max")
+        assert _eff == {"1": 20.0, "2": 30.0, "4": 40.0, "6": 50.0}, _eff
+        # ...which is the point: averaging the inert rows in halves the apparent
+        # range (17.5..32.5 instead of 20..50) and understates the knob
+        assert max(_eff.values()) - min(_eff.values()) == 30.0
+        # the GATE itself is unconditional and keeps every row -- mtp=0 rows are
+        # exactly what its own effect is measured against
+        assert factor_level_means(_mrows, "mtp") == {"0": 15.0, "1": 35.0}
+
+        # and the flag is not pasted into a row where it does nothing
+        cfg_in = Config(model=Path("m.gguf"), llama_bench=Path("b"),
+                        llama_server=Path("s"), array="auto", ctx_floor=8192,
+                        driver="server", emit_mtp=True,
+                        hw={"phys": 8, "logical": 16, "n_layers": 32,
+                            "n_ctx_train": 32768, "n_experts": 0, "n_nextn": 1})
+        _off = build_server_args(cfg_in, {"mtp": "0", "spec_n_max": "6",
+                                          "spec_p_min": "0.9", "ngl": "99"},
+                                 8080, 4096)
+        assert not [a for a in _off if a.startswith("--spec-")], _off
+        _on = build_server_args(cfg_in, {"mtp": "1", "spec_n_max": "6",
+                                         "spec_p_min": "0.9", "ngl": "99"},
+                                8080, 4096)
+        assert "--spec-draft-n-max" in _on and "--spec-draft-p-min" in _on, _on
+        # a row with no mtp column keeps its flags: that is the draft-model shape
+        _dm = build_server_args(cfg_in, {"spec_n_max": "4", "ngl": "99"},
+                                8080, 4096)
+        assert "--spec-draft-n-max" in _dm, _dm
 
         # --- stage planner (docs/CONDITIONAL-FACTORS.md) ---
         # feed the planner the FULL factor set (screen gate + every child) it would

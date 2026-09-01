@@ -67,11 +67,52 @@ column in the design at all. `active_when` treats an absent gate as *inactive*
 gate is present **and** none of its levels is live, which is exactly the case
 that is provably inert.
 
-**Still open (issue #16):** when `mtp` is swept rather than pinned, the four knobs
-share one flat array with it — the F2/F3 dilution below, unfixed. The correct
-shape is the staged one: screen `mtp` on/off, then a `tune:mtp=1` stage for its
-knobs. That is a change to what every MTP sweep does, so it is sequenced
-separately rather than folded into a bug fix.
+### The swept-gate case, and why staging is the wrong fix for it (issue #16)
+
+When `mtp` is *swept* rather than pinned, `gated_by` prunes nothing: one of its
+levels is live, so the four knobs stay in the design, and half the rows carry them
+at levels that cannot do anything. The obvious answer was to stage it the way the
+ngram gate is staged — screen `mtp` on/off, then a `tune:mtp=1` stage. **Measured
+before building it, and the premise does not hold.**
+
+F2 (array inflation) is the argument for staging, and it does not apply here. On a
+typical MTP design:
+
+```
+flat design (today)         : L125
+screen without spec columns : L125     <- unchanged
+tuning stage (mtp=1 + knobs): L25
+```
+
+Eleven other factors, several at five levels, already force L125. Removing the
+four spec columns shrinks nothing, so staging would cost **150 runs instead of
+125** and buy no size at all. The ngram gate is different in the way that matters:
+its children are *variant-specific*, so a flat design carries six columns of which
+four are inert in any given row, and the gate has five values rather than two.
+
+What remains real is F1 and F3, and neither needs staging:
+
+- **F3 — dilution.** A knob averaged over rows where it could not act is credited
+  with an effect computed from noise. `factor_level_means` already excluded
+  `active_when` rows (I3); it now excludes `gated_by` ones too. On a synthetic
+  20/30/40/50 gradient against flat inert rows, including them halves the apparent
+  range to 17.5–32.5 and understates the knob by half.
+- **F1 — inert flags.** `--spec-draft-n-max 6` on an `mtp=0` row is legal and does
+  nothing. It is no longer emitted.
+
+Both ride on `is_inert`, which differs from `is_active` in exactly one case and it
+is the case that matters: **an absent gate is not evidence.** `is_active` treats a
+missing gate as inactive, deliberately (I1) — a conditional flag must not leak into
+a row that never established its gate. `is_inert` asks the opposite question,
+"could this row have told us anything", and a row with no `mtp` column has not said
+that speculation is off. `--draft-model` speculates with no `mtp` column at all, so
+treating absence as inertness would delete every draft-model row from
+`--spec-draft-n-max`'s effect and stop emitting the flag.
+
+**Transferable:** F2 is a claim about a specific design, not a property of the
+conditional-factor shape. Check it against `choose_array` before paying for a
+staged executor — an array already saturated by unconditional factors cannot be
+shrunk by removing conditional ones.
 
 ## Why a flat orthogonal array is wrong here
 

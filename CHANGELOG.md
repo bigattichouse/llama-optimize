@@ -84,6 +84,20 @@ earlier.
 - **The recommended `-c` could exceed the context the sweep ever loaded.** It was
   derived from the requested depth; it is now capped by the delivered one.
 
+- **A speculative knob that could not act still voted on its own main effect.**
+  [Issue #16]. With `mtp` swept, half the rows carry `spec_n_max` and friends at
+  levels that do nothing, and those rows were averaged into their effects — a
+  knob credited with an effect computed from run-to-run noise, in the table the
+  user reads to decide what matters. On a 20/30/40/50 gradient the inert rows
+  halve the apparent range. `factor_level_means` already excluded `active_when`
+  rows; it now excludes `gated_by` ones too, and the inert `--spec-draft-*` flags
+  are no longer pasted into an `mtp=0` command.
+
+  Staging the gate — the fix the issue proposed — was measured and rejected: the
+  array is already L125 on the unconditional factors, so removing the four
+  columns shrinks nothing and a screen-plus-tune split would cost 150 runs
+  instead of 125.
+
 - **The `ngl` grid spent its slowest rows where the answer could not be.**
   [Issue #14]. `ngl_levels` spanned `0 .. n_layers` evenly and never asked
   whether the model fits, so a 40-layer model that fits entirely in VRAM still
@@ -570,3 +584,4 @@ crash journal, `--resume`, `--iterate`, `--diff`, and a GPU-free `--selftest`.
 [issue #3]: https://github.com/bigattichouse/llama-optimize/issues/3
 [issue #11]: https://github.com/bigattichouse/llama-optimize/issues/11
 [Issue #14]: https://github.com/bigattichouse/llama-optimize/issues/14
+[Issue #16]: https://github.com/bigattichouse/llama-optimize/issues/16
