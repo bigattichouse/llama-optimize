@@ -166,6 +166,33 @@ Three things follow, and all three are now done:
   rather than rejected: the measurement is real, it just answers a colder
   workload than the one being tuned for.
 
+- `prompt_tok` records the tokens the prompt **became**, next to the `n_depth`
+  it was **asked for**. The server driver sizes prompts in characters, so those
+  are different numbers on any tokenizer that is not 4 chars/token, and the
+  recommended `-c` used to ride on the requested one — emitting a context deeper
+  than anything the sweep had actually loaded (see `docs/constants-audit.md`
+  C-B).
+
+## A rejection should be as narrow as the fault
+
+I5 originally compared the **mean** rate across reps against the **kindest**
+rep's ceiling. Both halves of that are wrong for the same reason: they mix reps
+together. Issue #11 ended on a config whose three reps reported ~600, 333,362 and
+~620 t/s. The mean carried the outlier into the verdict, the entire row was
+zeroed, and the surviving reason — built from an aggregate and one rep's clock —
+could not say whether one rep had gone bad or all three had.
+
+A server counter that breaks on one request has produced one bad rep. The other
+reps are still a measurement, and throwing them away costs a configuration that
+was measured fine.
+
+So each rep is now screened against **its own** request's duration
+(`screen_reps`), the survivors decide the number by **median** rather than mean,
+and the row is IMPLAUSIBLE only when nothing survived. A partial rejection keeps
+its numbers and is therefore not allowed to be silent: `rejected_reps` is a
+column and the count is printed when it fires. This is also what the roadmap's
+"keep per-rep samples" item was for.
+
 Alongside it, a completion carrying an `error` object is raised rather than
 returned. llama-server answers some failures with HTTP 200 and an error body,
 and reading timings off a non-result is how zero elapsed time becomes an

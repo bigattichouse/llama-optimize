@@ -3248,6 +3248,58 @@ def exceeds_wall_clock(tg: float, reps: list) -> str | None:
             f"{best.n_dec} tokens in {spent})")
 
 
+@dataclass(frozen=True)
+class RepSample:
+    """One rep's reported decode rate together with the clock that can bound it.
+
+    `clock` is None when the rep returned nothing the bound can be built from
+    (no wall, no decoded tokens); such a rep is unvalidatable, not innocent, so
+    it is kept but can never be the evidence that clears the others."""
+    tg: float
+    clock: RepClock | None = None
+
+
+def screen_reps(samples: list) -> tuple[list, list]:
+    """Split reps into those their OWN request duration can support, and those
+    it cannot. Returns (kept, dropped).
+
+    Checking each rep against its own clock rather than an aggregate against the
+    kindest one is the difference between rejecting a measurement and rejecting
+    a rep. Issue #11 ended on a config where one rep came back at 333,362 t/s
+    and the others at ~45: the mean carried the outlier into the verdict, the
+    whole row was zeroed, and the surviving reason could not say whether one rep
+    had gone bad or all three had. A broken counter on one request is a fault in
+    that request, and the other reps remain a measurement."""
+    kept, dropped = [], []
+    for s in samples:
+        if s.clock is not None and exceeds_wall_clock(s.tg, [s.clock]):
+            dropped.append(s)
+        else:
+            kept.append(s)
+    return kept, dropped
+
+
+def _rejected_reason(dropped: list) -> str | None:
+    """The verdict for a config where no rep survived its own clock.
+
+    Reported against the median of the rejected rates and the kindest rejected
+    rep, so the sentence describes the measurement that would have been recorded
+    had the check not fired."""
+    clocks = [s.clock for s in dropped if s.clock is not None]
+    if not clocks:
+        return None
+    return exceeds_wall_clock(statistics.median([s.tg for s in dropped]), clocks)
+
+
+def prompt_tokens_of(timings: dict) -> int:
+    """Tokens the prompt actually became: the ones the model ran plus the ones
+    the cache spared it. The delivered counterpart to the requested depth."""
+    try:
+        return int(timings.get("prompt_n") or 0) + int(timings.get("cache_n") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def delivered_cache_hit(timings: list) -> float | None:
     """Fraction of prompt tokens the server actually served from its cache.
 
@@ -3466,6 +3518,43 @@ class ServerSession:
                             "server exited during load" if died else
                             f"server not healthy within {cfg.server_start_timeout}s")
 
+    # Characters in the calibration probe. Big enough that the ratio is not
+    # dominated by the first few tokens, small enough that prefilling it costs
+    # nothing next to the measurement it is protecting.
+    CALIBRATION_CHARS = 4096
+
+    def calibrate(self, timeout):
+        """Measure this model's chars-per-token BEFORE any prompt is sized.
+
+        `CHARS_PER_TOKEN = 4` is a bootstrap for English prose; real tokenizers
+        wander a long way from it. Measured on the reporter's model in issue #11
+        (`qwen35`, via `llama-tokenize`): 32,000 characters of the battery's own
+        prose became 5,290 tokens — **6.05** chars/token. Every server prompt was
+        therefore built two thirds as deep as it claimed, and a row labelled
+        `n_depth=32768` had measured about 27,000 tokens of context.
+
+        The ratio was already being measured — from the warm request — but the
+        prompts were built before that response existed, so on a single-config
+        run the calibration never sized anything, and in a sweep only the first
+        config in each session ran uncalibrated. That is worse than a constant
+        error: it makes one row per session measure a different depth from its
+        siblings, in a design that randomizes execution order specifically so
+        that per-row differences do not correlate with anything.
+
+        One short request, at session open, costs a prefill of a few hundred
+        tokens and makes the depth honest for every config that follows."""
+        if getattr(self, "_calibrated", False):
+            return getattr(self, "cpt", None)
+        self._calibrated = True   # one probe per session, hit or miss
+        probe = _fill(self.CALIBRATION_CHARS, random.Random(7))
+        try:
+            r = _completion(self.port, probe, 1, timeout)
+        except (urllib.error.URLError, OSError, json.JSONDecodeError):
+            return None      # not fatal: the bootstrap constant still applies
+        self.cpt = calibrate_chars_per_token(
+            probe, r.get("timings", {}).get("prompt_n"))
+        return self.cpt
+
     def measure(self, prompt_len, n_gen, par, reps, timeout, deadline=None):
         """Measure one config. Returns a dict:
 
@@ -3487,9 +3576,11 @@ class ServerSession:
         # and below it the requests genuinely differ (W-D1/W-D3).
         reuse = float(getattr(self.cfg, "prefix_reuse", 1.0))
         n_req = (max(1, reps) + 1) if par == 1 else par
-        # cpt is learned from the first response this session sees and reused
-        # after, so a model whose tokenizer is nothing like 4 chars/token still
-        # gets prompts of the requested SIZE (docs/constants-audit.md C-B)
+        # cpt is measured once per session, by `calibrate`, BEFORE the first
+        # prompt is sized — a model whose tokenizer is nothing like 4 chars/token
+        # then gets prompts of the requested SIZE from the very first config
+        # rather than from the second (docs/constants-audit.md C-B, issue #11).
+        self.calibrate(_left(timeout, deadline))
         prompts = prompt_battery(prompt_len, n_req, reuse,
                                  chars_per_token=getattr(self, "cpt", None))
         self.last_reuse = achieved_reuse(prompts)
@@ -3502,16 +3593,28 @@ class ServerSession:
             # a full cache hit; below 1.0 they deliberately are not, and the rep
             # re-prefills the differing suffix. `wall` below therefore covers
             # prefill as well as decode at any reuse < 1.0 — see issue #11.
+            prompt_tok = 0
             try:
                 warm = _completion(self.port, prompt, n_gen,
                                    _left(timeout, deadline), cache=True)
                 wt = warm.get("timings", {})
                 pp = wt.get("prompt_per_second", 0.0) or 0.0
-                self.cpt = (calibrate_chars_per_token(prompt, wt.get("prompt_n"))
-                            or getattr(self, "cpt", None))
+                # What the prompt ACTUALLY became. `n_depth` records what was
+                # asked for, and the two are not the same number whenever the
+                # tokenizer is not 4 chars/token — the row should carry the one
+                # that was measured (issue #11).
+                prompt_tok = prompt_tokens_of(wt)
+                # Only as a fallback for a session whose probe failed: once a
+                # ratio is in hand it is held for the whole session, so two
+                # configs measured against one server are measured at the same
+                # depth. Re-deriving it here is what used to make the first
+                # config in every session the odd one out (issue #11).
+                self.cpt = (getattr(self, "cpt", None)
+                            or calibrate_chars_per_token(prompt,
+                                                         wt.get("prompt_n")))
             except (urllib.error.URLError, OSError, json.JSONDecodeError):
                 pp, n_err = 0.0, n_err + 1
-            tps, clocks, timings = [], [], []
+            samples, timings = [], []
             # Prefill the rep cannot avoid, priced client-side, for servers that
             # report no `prompt_ms`. Deliberately a LOWER bound on the credit:
             # `pp` is measured on the warm request's uncontended full prefill, so
@@ -3527,6 +3630,7 @@ class ServerSession:
             if _min_pps > 0 and 0 < pp < _min_pps:
                 return {"pp": pp, "tg": 0.0, "problem": None, "draft": {},
                         "err_rate": 0.0, "reuse": self.last_reuse,
+                        "prompt_tok": prompt_tok,
                         "too_slow": (f"pp={pp:.1f} t/s is below --min-pps "
                                      f"{_min_pps:.1f}; decode not measured")}
             for i in range(max(1, reps)):
@@ -3542,7 +3646,7 @@ class ServerSession:
                 wall = time.time() - w0
                 t = r.get("timings", {})
                 timings.append(t)   # draft counters live here too (F1)
-                tps.append(t.get("predicted_per_second", 0.0) or 0.0)
+                rate = t.get("predicted_per_second", 0.0) or 0.0
                 # Independent clock. The server derives its rate as
                 # 1e3 / t_token_generation * n_decoded from its own counter
                 # (server_slot stats, `n_gen_tps()`); when that counter is wrong nothing
@@ -3554,21 +3658,35 @@ class ServerSession:
                 # prefill, which the server did not claim that rate for and which
                 # at reuse < 1.0 is most of the wall (issue #11).
                 n_dec = t.get("predicted_n", 0) or 0
+                clock = None
                 if wall > 0 and n_dec > 0:
                     try:
                         reported = float(t.get("prompt_ms") or 0.0)
                     except (TypeError, ValueError):
                         reported = 0.0     # unparseable is not a credit
                     prefill = reported / 1000.0 if reported > 0 else prefill_est
-                    clocks.append(RepClock(n_dec, wall, prefill))
-            tg = sum(tps) / len(tps) if tps else 0.0
-            # the warm request is excluded from `tps` (it primes the cache and is
-            # not a measured rep) but IS counted in err_rate: a config that
+                    clock = RepClock(n_dec, wall, prefill)
+                samples.append(RepSample(rate, clock))
+            # Each rep is judged against its own request's duration, then the
+            # survivors decide the number. One rep with a broken counter is a
+            # broken rep, not a broken configuration (issue #11).
+            kept, dropped = screen_reps(samples)
+            # Median, not mean: the aggregate should not move with the worst rep
+            # it contains — the same reasoning --verify-picks already applies.
+            tg = statistics.median([s.tg for s in kept]) if kept else 0.0
+            # the warm request is excluded from the reps (it primes the cache and
+            # is not a measured rep) but IS counted in err_rate: a config that
             # cannot serve the first request has failed a request.
             hit = delivered_cache_hit(timings)
             self._warn_cache_miss(hit)
+            self._warn_rejected_reps(kept, dropped)
             return {"pp": pp, "tg": tg,
-                    "problem": exceeds_wall_clock(tg, clocks),
+                    # Only when NOTHING survived is the configuration itself
+                    # unmeasurable; the reason is then built from the reps that
+                    # failed, so the row still says what was rejected.
+                    "problem": (None if kept else _rejected_reason(dropped)),
+                    "rejected_reps": len(dropped),
+                    "prompt_tok": prompt_tok,
                     "draft": _draft_totals(timings),
                     "err_rate": n_err / (max(1, reps) + 1),
                     "reuse": self.last_reuse,
@@ -3580,9 +3698,8 @@ class ServerSession:
         warm_res, _, _ = _measure_round(self.port, prompts, n_gen, par,
                                         _left(timeout, deadline))
         if warm_res:                            # warmup discarded, ratio kept
-            self.cpt = (calibrate_chars_per_token(
-                prompts[0], warm_res[0].get("timings", {}).get("prompt_n"))
-                or getattr(self, "cpt", None))
+            self.cpt = (getattr(self, "cpt", None) or calibrate_chars_per_token(
+                prompts[0], warm_res[0].get("timings", {}).get("prompt_n")))
         pps, tps, timings = [], [], []
         n_sent = 0
         for _ in range(max(1, reps)):
@@ -3604,6 +3721,8 @@ class ServerSession:
                 "problem": None, "draft": _draft_totals(timings),
                 "err_rate": n_err / n_sent if n_sent else 0.0,
                 "reuse": self.last_reuse,
+                "prompt_tok": (prompt_tokens_of(warm_res[0].get("timings", {}))
+                               if warm_res else 0),
                 "cache_hit": delivered_cache_hit(timings)}
 
     def _warn_cache_miss(self, hit):
@@ -3622,8 +3741,28 @@ class ServerSession:
               f"workload asked for {want * 100:.0f}%.")
         print("!! Reps are re-prefilling instead of decoding off a cache hit, so")
         print("!! this measures a colder workload than the one being tuned for.")
-        print("!! Usual cause: the context cannot hold prompt + generation, so")
-        print("!! the slot is reset between requests. Try a smaller --n-depth.\n")
+        print("!! Causes, most likely first:")
+        print("!!  - a hybrid/recurrent (SSM) or SWA model. llama.cpp cannot roll")
+        print("!!    a recurrent state back to an arbitrary prefix, so it forces")
+        print("!!    full re-processing unless a context checkpoint covers it")
+        print("!!    (llama-server -ctxcp / --ctx-checkpoints). Prefix reuse is")
+        print("!!    then a property the model does not have, not a setting.")
+        print("!!  - a context too small to hold prompt + generation, which")
+        print("!!    resets the slot between requests: try a smaller --n-depth.\n")
+
+    def _warn_rejected_reps(self, kept, dropped):
+        """Say so when some — but not all — reps failed their own wall clock.
+
+        A dropped rep is not free to hide: the row keeps its numbers because the
+        survivors are a real measurement, which is exactly the situation where a
+        silently discarded sample would be invisible."""
+        if not dropped or not kept:
+            return          # nothing dropped, or the row is IMPLAUSIBLE anyway
+        worst = max(dropped, key=lambda s: s.tg)
+        print(f"\n!! {len(dropped)} of {len(kept) + len(dropped)} reps reported a "
+              f"decode rate their own request duration cannot support "
+              f"(worst: {worst.tg:.1f} t/s).")
+        print("!! Those reps were dropped; the result is the median of the rest.\n")
 
     def close(self):
         if self.proc and self.proc.poll() is None:
@@ -3715,6 +3854,13 @@ def measure_in_session(cfg: Config, f: dict, session, timeout: int) -> dict:
            # and what the SERVER actually reused of it, which is a different
            # number and the one that decides whether a rep was decode (#11)
            "cache_hit": "" if m.get("cache_hit") is None else m["cache_hit"],
+           # the depth that was MEASURED, not the depth that was asked for: the
+           # prompt is sized in characters, so `n_depth` is only the request
+           # until a tokenizer has had its say (#11)
+           "prompt_tok": m.get("prompt_tok", "") or "",
+           # reps whose own request duration could not support the rate they
+           # reported, and were therefore left out of tg_tps
+           "rejected_reps": int(m.get("rejected_reps", 0) or 0),
            # derivable from the emitted flags, so recorded rather than left to
            # be re-derived by whoever reads the CSV later (KV2)
            "kv_unified": 1 if kv_unified_for(cfg, f) else 0,
@@ -3817,7 +3963,8 @@ def verified_depth_of(cfg: Config, rows: list[dict], r: dict) -> int:
     return max(ds, default=int(r["n_depth"]))
 
 
-def recommended_ctx(cfg: Config, r: dict, verified_depth: int | None = None) -> int:
+def recommended_ctx(cfg: Config, r: dict, verified_depth: int | None = None,
+                    rows: list[dict] | None = None) -> int:
     """Context (`-c`) to emit for a winning row.
 
     Base: the footprint the sweep actually verified for this row — the server
@@ -3842,7 +3989,55 @@ def recommended_ctx(cfg: Config, r: dict, verified_depth: int | None = None) -> 
     d = int(r["n_depth"])
     want = max(footprint(d), cfg.ctx_floor * par)
     cap = footprint(d if verified_depth is None else max(d, verified_depth))
+    # A row's depth is what was ASKED for. The server driver builds its prompt in
+    # characters, so when the tokenizer is not 4 chars/token the prompt that ran
+    # was a different size — and `-c` must ride on the context the run actually
+    # occupied, never on the one it was named after. Issue #11: a row labelled
+    # n_depth=32768 measured about 27,000 tokens, and this emitted -c 41472 on
+    # the strength of it. Taken across the same siblings `verified_depth` rides
+    # on, since it is their evidence the cap is spending.
+    if rows is not None:
+        measured = verified_footprint(cfg, rows, r, par)
+        if measured:
+            cap = min(cap, measured)
     return max(256, (min(want, cap) // 256) * 256)
+
+
+def verified_footprint(cfg: Config, rows: list[dict], r: dict, par: int) -> int:
+    """Largest context an OK sibling of `r` is known to have actually occupied.
+
+    Falls back, per sibling, to the footprint its requested depth implies — rows
+    written before `prompt_tok` existed, and bench rows, are unknowns and must
+    not tighten anything. 0 when there is no evidence at all, which leaves the
+    caller's cap alone."""
+    def key(row):
+        return tuple(str(row.get(k)) for k in cfg.factors if k != "n_depth")
+
+    mine, best = key(r), 0
+    for o in rows:
+        if o.get("status") != "OK" or key(o) != mine:
+            continue
+        v = cfg.n_prompt + int(o["n_depth"]) + cfg.n_gen + 256
+        best = max(best, measured_footprint(cfg, o, par)
+                   or (v * par if par > 1 else v))
+    return best
+
+
+def measured_footprint(cfg: Config, r: dict, par: int) -> int:
+    """Context the row's own request actually occupied, or 0 when unrecorded.
+
+    `prompt_tok` is the delivered prompt; the generation and the same 256-token
+    margin the session sized itself with sit on top of it. Rows written before
+    the column existed, and every bench row, return 0 — an unknown, which leaves
+    the recommendation exactly where it was."""
+    try:
+        tok = int(float(r.get("prompt_tok") or 0))
+    except (TypeError, ValueError):
+        return 0
+    if tok <= 0:
+        return 0
+    v = tok + cfg.n_gen + 256
+    return v * par if par > 1 else v
 
 
 def ctx_floor_note(cfg: Config, r: dict, ctx: int) -> str | None:
@@ -3871,7 +4066,7 @@ def pick_recommendations(cfg: Config, rows: list[dict]):
         return None, None, None
 
     def holds_floor(r):
-        ctx = recommended_ctx(cfg, r, verified_depth_of(cfg, rows, r))
+        ctx = recommended_ctx(cfg, r, verified_depth_of(cfg, rows, r), rows)
         return ctx_floor_note(cfg, r, ctx) is None
 
     pool = [r for r in ok if holds_floor(r)]
@@ -4000,7 +4195,7 @@ def report(cfg: Config, rows: list[dict], probe: dict | None = None):
         # size context to what the sweep verified for this config, floored at
         # the usable floor where evidence allows (see recommended_ctx); a
         # bigger -c can OOM at launch.
-        ctx = recommended_ctx(cfg, r, verified_depth_of(cfg, rows, r))
+        ctx = recommended_ctx(cfg, r, verified_depth_of(cfg, rows, r), rows)
         print("  suggested llama-server command:")
         print("    " + server_command(cfg, r, ctx))
         for extra in (error_note(r), kv_downgrade_hint(r),
@@ -4233,7 +4428,7 @@ def write_html_report(cfg: Config, rows: list[dict], path: Path,
     def card(title, r):
         if not r:
             return f"<div class=card><h3>{esc(title)}</h3><p class=muted>none met the constraint</p></div>"
-        ctx = recommended_ctx(cfg, r, verified_depth_of(cfg, rows, r))
+        ctx = recommended_ctx(cfg, r, verified_depth_of(cfg, rows, r), rows)
         cmd = esc(server_command(cfg, r, ctx))
         ver = (f"verified: median of {r['verify_n']} measurements "
                f"(spread {r['spread_pct']:.0f}%)" if r.get("verify_n") else None)
@@ -5074,6 +5269,30 @@ def selftest() -> bool:
         assert recommended_ctx(cfg_lo, {"n_depth": "0"}, verified_depth=49152) == 2048
         assert ctx_floor_note(cfgc, {"n_depth": "0"}, 1024)           # capped => note
         assert ctx_floor_note(cfgc, {"n_depth": "0"}, 8192) is None   # floor met
+
+        # ...and never exceeds the context the run actually OCCUPIED. The server
+        # driver sizes its prompt in characters against an assumed 4
+        # chars/token; the reporter's model tokenized the battery's prose at
+        # 6.05, so a row labelled n_depth=32768 ran ~27,000 tokens and this
+        # emitted -c 41472 on the strength of it (issue #11).
+        cfg_m = Config(model=Path("m.gguf"), llama_bench=Path("lb"), array="L25",
+                       n_prompt=8192, n_gen=256, ctx_floor=8192,
+                       factors={"ngl": ["99"], "n_depth": ["32768"]})
+        _short = {"n_depth": "32768", "ngl": "99", "status": "OK",
+                  "prompt_tok": "27100"}
+        assert measured_footprint(cfg_m, _short, 1) == 27100 + 256 + 256
+        assert recommended_ctx(cfg_m, _short, 32768, [_short]) == 27392
+        # unrecorded is an unknown, not a zero: bench rows and CSVs written
+        # before the column existed keep the behaviour they had
+        _blind = {"n_depth": "32768", "ngl": "99", "status": "OK"}
+        assert measured_footprint(cfg_m, _blind, 1) == 0
+        assert (recommended_ctx(cfg_m, _blind, 32768, [_blind])
+                == recommended_ctx(cfg_m, _blind, 32768))
+        # the cap spends the same siblings verified_depth does, so a deeper row
+        # that DID reach its depth still lifts a shallow one
+        _deep = {"n_depth": "49152", "ngl": "99", "status": "OK",
+                 "prompt_tok": "57600"}
+        assert recommended_ctx(cfg_m, _short, 49152, [_short, _deep]) > 27392
 
         # verified_depth_of: deepest OK sibling sharing the launch factors
         cfg_v = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
@@ -5984,6 +6203,29 @@ def selftest() -> bool:
         assert decode_wall(5.0, -100.0) == 5.0
         assert decode_wall(0.0, 1.0) == 0.0
 
+        # per-rep screening: a rep is judged against its OWN request, so one
+        # broken counter costs one rep rather than the configuration (#11)
+        _good = RepSample(45.0, _rc(256, 23.5, 17.6))
+        _liar_rep = RepSample(333_362.1, _rc(256, 23.5, 17.6))
+        _kept, _gone = screen_reps([_good, _liar_rep, RepSample(46.0,
+                                                               _rc(256, 23.5, 17.6))])
+        assert [r.tg for r in _kept] == [45.0, 46.0], _kept
+        assert [r.tg for r in _gone] == [333_362.1], _gone
+        # a rep with no clock cannot be rejected, but it is kept rather than
+        # treated as evidence: nothing about it has been checked
+        _kept, _gone = screen_reps([RepSample(1_000_000.0, None)])
+        assert _kept and not _gone
+        # nothing survives -> the reason is built from what failed
+        assert _rejected_reason([_liar_rep]) is not None
+        assert "wall clock" in _rejected_reason([_liar_rep])
+        assert _rejected_reason([RepSample(1e6, None)]) is None
+
+        # what the prompt actually became: run through the model plus spared by
+        # the cache. `n_depth` is only ever the request (#11).
+        assert prompt_tokens_of({"prompt_n": 819, "cache_n": 7373}) == 8192
+        assert prompt_tokens_of({"prompt_n": 8192}) == 8192
+        assert prompt_tokens_of({}) == 0
+
         # delivered cache hit: what the server reused, not what we asked for
         assert delivered_cache_hit([{"cache_n": 7373, "prompt_n": 819}]) == 0.9
         assert delivered_cache_hit([{"cache_n": 0, "prompt_n": 8192}]) == 0.0
@@ -6185,6 +6427,101 @@ def selftest() -> bool:
                                                       pps=27306.0)
             assert measure_in_session(fake_cfg, {"n_depth": "8192"},
                                       sess, 30)["status"] == "IMPLAUSIBLE"
+
+            # --- one bad rep is a bad rep, not a bad configuration (#11) ---
+            # The reporter's last run: three reps, one of them reporting
+            # 333,362 t/s and the others ~45. Averaged, the outlier decided the
+            # verdict and the whole row was zeroed; and because the reason was
+            # built from the mean and the kindest rep, the surviving text could
+            # not say whether one rep had gone bad or all three had.
+            _seq = {"i": 0}
+
+            def _per_rep(rates):
+                def f(port, prompt, n_gen, timeout, cache=False):
+                    time.sleep(0.05)
+                    i = _seq["i"]
+                    _seq["i"] += 1
+                    # index 0 is the warm request; the reps follow it
+                    rate = 600.0 if i == 0 else rates[(i - 1) % len(rates)]
+                    return {"content": "x",
+                            "timings": {"prompt_per_second": 444.1,
+                                        "predicted_per_second": rate,
+                                        "predicted_n": 128, "prompt_n": 8192,
+                                        "cache_n": 0, "prompt_ms": 1.0}}
+                return f
+
+            rep_cfg = SimpleNamespace(n_prompt=0, n_gen=128, parallel=1, reps=3,
+                                      measure_vram=False, factors={},
+                                      emit_mtp=False, ngram=False, hw={})
+            _seq["i"] = 0
+            globals()["_completion"] = _per_rep([600.0, 333_362.1, 620.0])
+            _rbuf = io.StringIO()
+            with contextlib.redirect_stdout(_rbuf):
+                r_one = measure_in_session(rep_cfg, {"n_depth": "8192"}, sess, 30)
+            assert r_one["status"] == "OK", r_one       # was IMPLAUSIBLE
+            assert r_one["rejected_reps"] == 1, r_one
+            # ...and the survivors decide the number: the median of 600 and 620,
+            # with the impossible rep contributing nothing to it
+            assert r_one["tg_tps"] == 610.0, r_one
+
+            # every rep impossible is still a rejected configuration, and the
+            # reason still travels with it
+            _seq["i"] = 0
+            globals()["_completion"] = _per_rep([1_000_000.0])
+            _abuf = io.StringIO()
+            with contextlib.redirect_stdout(_abuf):
+                r_all = measure_in_session(rep_cfg, {"n_depth": "8192"}, sess, 30)
+            assert r_all["status"] == "IMPLAUSIBLE", r_all
+            assert r_all["rejected_reps"] == 3, r_all
+            assert "wall clock" in r_all["implausible"], r_all
+
+            # a partial rejection is not allowed to be silent: the row keeps its
+            # numbers, which is exactly when a discarded sample would vanish
+            assert "1 of 3 reps" in _rbuf.getvalue(), _rbuf.getvalue()
+            # a wholly rejected row says so as IMPLAUSIBLE instead; the per-rep
+            # notice is for the case where numbers were kept
+            assert "reps reported" not in _abuf.getvalue(), _abuf.getvalue()
+
+            # --- the depth that was measured, not the depth that was asked for
+            # (#11). The prompt is sized in characters against an assumed 4
+            # chars/token; on the reporter's model the real ratio was 6.05, so a
+            # row labelled n_depth=32768 had run about 27,000 tokens.
+            assert r_one["prompt_tok"] == 8192, r_one
+
+            # and the ratio is measured BEFORE the first prompt is built, not
+            # after — on a single-config run the warm request's calibration
+            # arrived too late to size anything at all.
+            _sizes = []
+
+            def _tokenizer(chars_per_token):
+                def f(port, prompt, n_gen, timeout, cache=False):
+                    _sizes.append(len(prompt))
+                    time.sleep(0.01)
+                    return {"content": "x",
+                            "timings": {"prompt_per_second": 444.1,
+                                        "predicted_per_second": 600.0,
+                                        "predicted_n": 128, "cache_n": 0,
+                                        "prompt_n": int(len(prompt)
+                                                        / chars_per_token)}}
+                return f
+
+            fresh = ServerSession.__new__(ServerSession)  # never calibrated
+            fresh.port, fresh.ok, fresh.err = 1, True, ""
+            # reuse 0.0: a 0% cache hit is the correct outcome for this shape,
+            # so the miss warning stays out of the way of what is being tested
+            fresh.cfg = SimpleNamespace(prefix_reuse=0.0)
+            globals()["_completion"] = _tokenizer(6.05)
+            r_cal = measure_in_session(fake_cfg, {"n_depth": "8192"}, fresh, 30)
+            assert abs(fresh.cpt - 6.05) < 0.05, fresh.cpt
+            # probe first, then a battery sized at the MEASURED ratio: 8192
+            # tokens of prompt is ~49.6k characters, not 32.8k
+            assert _sizes[0] == ServerSession.CALIBRATION_CHARS, _sizes
+            assert abs(_sizes[1] - 8192 * 6.05) < 8192, _sizes
+            assert abs(r_cal["prompt_tok"] - 8192) < 100, r_cal
+            # one probe per session, whatever it returned
+            _sizes.clear()
+            measure_in_session(fake_cfg, {"n_depth": "8192"}, fresh, 30)
+            assert _sizes[0] != ServerSession.CALIBRATION_CHARS, _sizes
 
             # The warning, which is the other half of the fix: a rep that was
             # supposed to decode off a cache hit and instead re-prefilled is a
@@ -6715,7 +7052,8 @@ def load_results_csv(path: Path, factors: dict) -> list[dict]:
 RESULT_COLS = {"run_id", "pp_tps", "tg_tps", "eff_tps", "status", "secs",
                "temp_c", "vram_mib", "implausible", "draft_acc", "spec_off",
                "tool_version", "llama_build", "backend", "err_rate", "reuse",
-               "draft_cov", "kv_unified", "too_slow", "cache_hit"}
+               "draft_cov", "kv_unified", "too_slow", "cache_hit",
+               "prompt_tok", "rejected_reps"}
 
 
 def merge_result_rows(cfg: Config, rows: list[dict],
@@ -8010,7 +8348,8 @@ def main():
             + (["draft_acc", "draft_cov", "spec_off"]
                if spec_cols_wanted(cfg) else [])
             + (["backend"] if cfg.driver == "bench"
-               else ["err_rate", "reuse", "cache_hit", "kv_unified"])
+               else ["err_rate", "reuse", "cache_hit", "prompt_tok",
+                     "rejected_reps", "kv_unified"])
             # only when floors are in play, so ordinary sweeps keep their shape
             + (["too_slow"] if (cfg.min_tgs > 0 or cfg.min_pps > 0) else [])
             # why a row was rejected, on the row. It costs one mostly-empty

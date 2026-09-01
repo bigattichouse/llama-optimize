@@ -89,6 +89,28 @@ chars-per-token for *this* model, and subsequent prompts can be sized with it.
 This is the `draft_acc` pattern again — replace an assumption with the number the
 server is already handing us. **Fixed below.**
 
+**The first fix measured the ratio but arrived too late to spend it** (issue #11).
+Prompts are built *before* the warm request exists, so the calibration only ever
+sized the *next* config's prompts. On a single-config run — which is what a bug
+reporter runs — nothing was ever sized with it. In a sweep it was worse than a
+constant error: only the first config in each session ran uncalibrated, so exactly
+one row per session measured a different depth from its siblings, in a design that
+randomizes execution order specifically so that per-row differences cannot
+correlate with anything.
+
+Measured on the reporter's model (`qwen35`, via `llama-tokenize` on the battery's
+own prose): **32,000 characters became 5,290 tokens — 6.05 chars/token.** Every
+server prompt was therefore two thirds of the depth it claimed, and their row
+labelled `n_depth=32768` had run about 27,000 tokens. It reconciles their CSV
+exactly: four requests × (27k prefill at 1184 t/s + 256 tokens at 45.6 t/s) =
+113.3 s against a recorded `secs` of 113.36.
+
+Now: `ServerSession.calibrate` issues one short probe at session open, before any
+prompt is sized, and the ratio it returns is held for the whole session rather than
+re-derived per config. The delivered token count is recorded per row as
+`prompt_tok`, because a depth that was asked for and a depth that was measured are
+different facts and the row should carry the one that happened.
+
 ### C-C. `THERMAL_BAND_C = 5.0`, `THERMAL_CAP_S = 120.0` — MI50 thermal policy
 
 The settle-between-runs policy: wait until the GPU is within 5 °C of idle, giving
@@ -125,7 +147,10 @@ start a multi-hour sweep from this number. **Fixed below.**
 
 - **C-B**: chars-per-token is now measured from llama.cpp's own `prompt_n` and
   used to size subsequent prompts (`calibrate_chars_per_token`). The constant
-  remains only as the bootstrap value for the first request.
+  remains only as the bootstrap value for the first request. Since issue #11 the
+  measurement happens in a probe at session open rather than on the warm request,
+  so it sizes the prompts of the config that measured it, and `prompt_tok` records
+  what the prompt actually became.
 - **C-F**: the estimate now scales with model size and driver, and says which
   inputs it is a guess from.
 

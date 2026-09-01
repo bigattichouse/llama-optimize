@@ -314,6 +314,41 @@ when slots are evicted and restored, which needs *rotating distinct
 conversations*, not one prefix with varying tails. That is a second shape
 dimension and should not be smuggled into the first one.
 
+## Prefix reuse is a property of the model, not only of the request
+
+The battery can shape the request. It cannot make the server able to reuse the
+result. Issue #11's reporter measured 0% delivered reuse against a requested 90%,
+at every depth, and with `--prefix-reuse 100` — which should have made all four
+requests byte-identical — it changed nothing.
+
+The cause is the model. Their GGUF reports `general.architecture = qwen35` with
+`qwen35.ssm.*` metadata: a **hybrid SSM/attention** model. llama.cpp cannot roll a
+recurrent state back to an arbitrary prefix, so `cache_prompt` falls through to
+context checkpoints, and when none covers the prefix the server does this
+(`tools/server/server-context.cpp`, "forcing full prompt re-processing due to lack
+of cache data (likely due to SWA or hybrid/recurrent memory)"):
+
+```
+pos_next = 0; n_past = 0;
+```
+
+Every rep then pays a full prefill. That is not a defect in the tool or in
+llama.cpp — it is what the architecture costs — but it means the `agents` profile
+measures a workload nobody asked for whenever the model is hybrid/recurrent or
+SWA, and it does so silently unless `cache_hit` is being read.
+
+Consequences:
+
+- The miss warning names this cause first. Its previous advice ("try a smaller
+  `--n-depth`") is the *second* cause, and was wrong here: reuse was 0% at depth
+  8192 with ~6k tokens of `n_ctx` to spare.
+- `-ctxcp` / `--ctx-checkpoints` (and `--cache-ram`) are the only llama.cpp knobs
+  that can restore any reuse on these models, and we do not sweep or set either.
+  That is a coverage gap worth its own entry, not a fix to be guessed at here.
+- It also explains the reporter's earlier result that `--prefix-reuse 100` did not
+  clear the rejection. It was never going to: the delivered reuse was 0 either
+  way, so the reps re-prefilled and the wall clock stayed mostly prefill.
+
 ## Open questions
 
 1. Is `--prefix-reuse` per-request-shape enough, or does arrival pattern (bursty

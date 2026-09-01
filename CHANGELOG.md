@@ -46,7 +46,37 @@ earlier.
   for. Capped, a broken server can loosen its own ceiling by at most 10×, against
   a defect ([issue #3]) that overshot by ~1500×.
 
+- **One bad rep no longer discards the whole configuration.** Follow-up on
+  [issue #11]: I5 compared the **mean** rate across reps against the **kindest**
+  rep's ceiling, so a single request with a broken server counter (the reporter's
+  last run: three reps at ~600, 333,362 and ~620 t/s) carried the outlier into
+  the verdict and zeroed a row that had two perfectly good measurements in it —
+  and the surviving reason could not say whether one rep had failed or all of
+  them had. Each rep is now screened against its own request's duration, the
+  survivors decide the number by median rather than mean, and the row is
+  IMPLAUSIBLE only when nothing survived. Partial rejections are counted in a new
+  `rejected_reps` column and printed, since a row that keeps its numbers is
+  exactly where a silently dropped sample would go unnoticed.
+
+- **Server prompts were built two thirds as deep as they claimed.** The prompt is
+  sized in characters from an assumed 4 chars/token; the ratio was measured from
+  the warm request, but the prompts had already been built by then, so on a
+  single-config run it sized nothing at all, and in a sweep only the first config
+  in each session ran uncalibrated — one row per session measuring a different
+  depth from its siblings, in a design that randomizes execution order precisely
+  so that cannot happen. Measured on the reporter's model with `llama-tokenize`:
+  6.05 chars/token, so a row labelled `n_depth=32768` had run about 27,000
+  tokens. A short calibration probe now runs at session open, before any prompt
+  is sized, and the ratio is held for the whole session.
+
+- **The recommended `-c` could exceed the context the sweep ever loaded.** It was
+  derived from the requested depth; it is now capped by the delivered one.
+
 ### Added
+
+- **`prompt_tok` column: the tokens the prompt actually became**, next to the
+  `n_depth` that was asked for. Different numbers on any tokenizer that is not
+  4 chars/token, and the recommendation now rides on the measured one.
 
 - **A rejected row now carries the evidence for its own appeal.** [Issue #11]
   took five round trips with a reporter because I5 zeroes `pp_tps` and `tg_tps`
@@ -59,12 +89,19 @@ earlier.
 
 - **`cache_hit` column: the prefix reuse the server actually delivered.** `reuse`
   records only what the prompt battery asked for. llama.cpp matches on tokens and
-  can decline to reuse a prefix the client believes it shares — a context too
-  small to hold prompt plus generation, a slot reset, an eviction — and when it
-  does, a rep the tool believes is pure decode pays a full prefill instead.
-  Nothing in the row could tell those apart. A large gap between requested and
-  delivered is now warned about rather than rejected: the numbers are real, they
-  just measure a colder workload than the one being tuned for.
+  can decline to reuse a prefix the client believes it shares — and when it does,
+  a rep the tool believes is pure decode pays a full prefill instead. Nothing in
+  the row could tell those apart. A large gap between requested and delivered is
+  warned about rather than rejected: the numbers are real, they just measure a
+  colder workload than the one being tuned for.
+
+  The leading cause turned out not to be the one first guessed. On the reporter's
+  model — `general.architecture = qwen35`, a **hybrid SSM/attention** model —
+  llama.cpp cannot roll a recurrent state back to an arbitrary prefix, so it
+  forces full prompt re-processing unless a context checkpoint covers the prefix.
+  Delivered reuse was 0% at every depth and `--prefix-reuse 100` changed nothing.
+  Prefix reuse is a property the model either has or does not; the warning now
+  says so, and names an undersized context second rather than first.
 
 - **`concurrency` factor, and `kv_unified` recorded per row.** llama.cpp couples
   slot count and the unified KV cache, so they cannot ride an orthogonal array as
@@ -263,6 +300,25 @@ earlier.
 ## [0.2.0] — 2026-08-26
 
 ### ⚠️ Affects existing results
+
+- **Server-driver rows were measured shallower than their `n_depth` says.** The
+  prompt is built in characters at an assumed 4 chars/token, and the measured
+  ratio arrived too late to size it. Any model whose tokenizer is not close to 4
+  chars/token ran a different depth than the column records — on the model in
+  issue #11 (6.05 chars/token) a row labelled `n_depth=32768` ran ~27,000 tokens,
+  about two thirds of it. The error is systematic per model, so *rankings within
+  one sweep are largely intact*; what is wrong is the depth each row is labelled
+  with, and therefore any `-c` recommendation or Pareto point read off it.
+
+  **Re-run `--driver server` sweeps where the depth label matters** (max-context
+  picks, the `-c` to paste). Bench-driver rows are unaffected — llama-bench is
+  given token counts directly. New rows carry `prompt_tok`, so from now on the
+  gap is visible rather than inferred.
+
+- **`tg_tps` on server rows is now the median of the reps, not the mean.** Values
+  will move slightly on any config whose reps disagreed. This is the same change
+  `--verify-picks` already applied to its own re-measurements; no re-run is
+  needed for it alone.
 
 - **Server-driver rows discarded as `IMPLAUSIBLE` may have been honest.** The
   wall-clock check rejected real measurements wherever prefill was a large share
