@@ -141,14 +141,8 @@ needs two non-identical GPUs and by construction cannot be tested here.
   past the window and `--ctx-checkpoints` measurably is not
   ([`workload-shape-design.md`](workload-shape-design.md)). What remains needs a
   hybrid model resident on the GPU, so it is opportunistic.
-- **Issue #18 — hybrid models core-dump at partial `-ngl`.** Three of five default
-  levels abort on `qwen35`. Blocked on one run to learn whether `-ngl 99` works;
-  if it does, the grid should collapse to `[0, 99]` on that class. Queued against
-  `Qwen3.8-27B-UD-Q6_K_XL` (23.6 GiB, hybrid **and** MTP, so it settles #15's
-  recurrent half and #11's speculative-timing counter in the same sitting) —
-  procedure and pass/fail meanings in
-  [`NEXT-SESSION.md`](NEXT-SESSION.md#queued-one-gpu-run-waiting-on-the-card-18-15-11).
-  Needs ~25.6 GiB free on a card that currently has 22.1.
+- **~~Issue #18~~ — done** (`7b4b052`). The `ngl` grid is `[0, 99]` on recurrent
+  models, since every partial offload aborts the server.
 - **Issue #19 — five of llama.cpp's eleven `--spec-type` values are
   unreachable.** `mtp` is a binary on/off factor, so the sweep asks "MTP or
   nothing" when the axis is categorical and `--spec-type` takes a list. Reported

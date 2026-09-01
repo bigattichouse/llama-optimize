@@ -143,12 +143,16 @@ same treatment as #14:
   open** for the recurrent half: hybrid models have no equivalent knob, and
   whether `--swa-full` helps a hybrid's *attention* layers is untested because the
   smallest such model here is 18 GB.
-- **Issue #18** — new, and found while measuring #15: `llama-server` core-dumps at
-  any *partial* `-ngl` on a hybrid SSM model (`-ngl 5` and `-ngl 40` both; `-ngl 0`
-  is fine), so three of five default `ngl` levels abort. The open question is
-  whether `-ngl 99` works, which decides whether the grid should collapse to
-  `[0, 99]` on that model class — it needs ~18 GB on a shared card and was
-  deliberately not spent.
+- **~~Issue #18~~** — done (`7b4b052`). `-ngl 99` loads on a hybrid model, so it
+  is the split that aborts, not GPU use; the grid is now `[0, 99]` when
+  `ssm_state > 0`. Answered for **3.1 GiB** rather than the ~18 predicted, by
+  running the MoE at `-ngl 99 -ncmoe 40` — on an MoE the experts are most of the
+  weight, and `llama-fit-params` prices the whole `-ncmoe` curve without loading
+  anything. Worth reusing: that is the cheap way to plan any large-model run here.
+
+  Side effect: on a hybrid MoE, `ngl` (now `0, 99`) stops competing with `ncmoe`
+  for the offload axis, which removes the confound **#17** was blocked on for that
+  model class.
 - **~~Issue #16~~** — done (`866e9e3`), and the fix is not the one the issue
   proposed. Staging the `mtp` gate was measured first and rejected: eleven other
   factors already force L125, so removing the four spec columns shrinks nothing
