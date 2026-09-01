@@ -84,6 +84,17 @@ earlier.
 - **The recommended `-c` could exceed the context the sweep ever loaded.** It was
   derived from the requested depth; it is now capped by the delivered one.
 
+- **The prompt-cache miss warning now says something measured, and something
+  different per architecture.** [Issue #15]. Both earlier versions were wrong, in
+  opposite directions: the first blamed an undersized context, the second claimed
+  prefix reuse was "a property the model does not have". Measured: SWA models lose
+  reuse past the window and `--swa-full` restores it; hybrid/recurrent models keep
+  87% reuse at 4k tokens, 43% at 8k and 0% at 16k, unchanged by
+  `--ctx-checkpoints` at 32 or 512. Depth is the variable in both cases and the
+  architecture only decides whether a knob exists — so the warning branches on
+  `{arch}.attention.sliding_window` vs `{arch}.ssm.state_size` and gives the lever
+  that actually applies.
+
 - **`swa_full` is now swept automatically on sliding-window models.** [Issue #15].
   Past the sliding window, a shared-prefix workload loses its prompt cache: on
   gemma-3-270m with a 15.7k-token prompt at 90% requested reuse, the *second* rep

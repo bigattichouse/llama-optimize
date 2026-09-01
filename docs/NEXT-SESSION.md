@@ -130,8 +130,11 @@ same treatment as #14:
   0% at 16,352, so recurrent memory reuses fine until some depth rather than never
   ([`workload-shape-design.md`](workload-shape-design.md)). Depth is the variable
   in both the SWA and the recurrent case; the architecture only decides which knob
-  moves it. Whether `--ctx-checkpoints` moves it here is open — unlike SWA, where
-  it demonstrably does not. Earlier correction, still standing: `--ctx-checkpoints` is *not* the lever (no effect at 0/32/128/512, nor
+  moves it. **`--ctx-checkpoints` does not move it here either** — 0% at both 32
+  and 512, fresh server per variant — so SWA has `--swa-full` and recurrent has
+  nothing, and depth is the only lever. `cache_miss_advice` now branches on the
+  model's metadata and says the measured thing for each class. Earlier
+  correction, still standing: `--ctx-checkpoints` is *not* the lever (no effect at 0/32/128/512, nor
   `--cache-ram`); **`--swa-full` is**, and it is now swept automatically on models
   carrying `{arch}.attention.sliding_window`. The failure is also intermittent
   rather than total — rep1 reuses, rep2 does not, once the window has scrolled

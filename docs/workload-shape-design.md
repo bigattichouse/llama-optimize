@@ -407,9 +407,28 @@ Two caveats on the numbers above, kept because they bound what can be concluded:
 the 4k and 8k points were taken on a server already warm from a deeper request
 (the battery shares its prefix across sizes, so caches carry between calls), which
 is why the 8k "warm" request itself shows 43.7%. The 16k point was a fresh server
-and is clean. The exact boundary is therefore **not pinned**, and whether
-`--ctx-checkpoints` moves it on this class is the open question — unlike SWA,
-where it demonstrably does not.
+and is clean. The exact boundary is therefore **not pinned**.
+
+**Checkpoints do not move it either.** Fresh server per variant, 16,352 tokens:
+
+| flags | warm | rep1 | rep2 |
+|---|---|---|---|
+| `-ncmoe 40 -ctxcp 32` | 0% | 0% | 0% |
+| `-ncmoe 40 -ctxcp 512` | 0% | 0% | 0% |
+
+So the partial 43.5% at 8k is not checkpoints rescuing a deep prefix; whatever it
+is, `--ctx-checkpoints` is not the dial. That closes the last hope for a knob on
+this class: **SWA has `--swa-full`, recurrent has nothing**, and the only lever is
+depth.
+
+### What the tool does with that
+
+`cache_miss_advice` branches on the model's own metadata — `{arch}.attention.
+sliding_window` for SWA, `{arch}.ssm.state_size` for recurrent — and says the
+measured thing for each: `--swa-full` (swept, so compare the levels) for SWA, and
+"no flag moves this, reduce `--n-depth`" for recurrent. Both earlier versions of
+this advice were wrong, in opposite directions, which is why every line of it now
+cites a measurement.
 
 Consequences:
 

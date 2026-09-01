@@ -1112,7 +1112,18 @@ def model_hw(meta: dict) -> dict:
             "n_experts": model_expert_count(meta),
             "n_ctx_train": model_context_length(meta),
             "n_nextn": model_nextn_layers(meta),
-            "n_swa": model_swa_window(meta)}
+            "n_swa": model_swa_window(meta),
+            "ssm_state": model_ssm_state(meta)}
+
+
+def model_ssm_state(meta: dict) -> int:
+    """SSM state size for a hybrid/recurrent model; 0 for a plain transformer.
+
+    `{arch}.ssm.state_size` — present on `qwen35`/`qwen35moe`, absent on gemma3
+    and ordinary transformers. Recurrent memory cannot be rolled back to an
+    arbitrary prefix past a certain depth, and unlike SWA there is no flag that
+    changes that, so the only honest advice is about depth (issue #15)."""
+    return _meta_int(meta, ".ssm.state_size") or 0
 
 
 def model_swa_window(meta: dict) -> int:
@@ -3458,6 +3469,50 @@ def prompt_tokens_of(timings: dict) -> int:
         return 0
 
 
+def cache_miss_advice(hw: dict) -> list[str]:
+    """What to actually do about a prompt cache that is not hitting, given the
+    architecture of the model being measured.
+
+    Every line here is measured rather than reasoned (issue #15,
+    docs/workload-shape-design.md), because the first two versions of this advice
+    were wrong in opposite directions:
+
+    - **SWA** (`gemma3`, window 512): 90% reuse at a 1,960-token prompt, 0% on the
+      SECOND rep at 15,700. `--swa-full` restores it to 90%. `--ctx-checkpoints`
+      at 0/32/128/512 and `--cache-ram` all change nothing.
+    - **Hybrid/recurrent** (`qwen35moe`): 87% at 4,002 tokens, 43% at 8,004, 0% at
+      16,352 — and 0% at both `-ctxcp 32` and `-ctxcp 512`. So reuse is not
+      unavailable on these models, as this advice once claimed; it is available
+      until some depth and then it is not, and no flag moves the boundary.
+
+    The common variable is DEPTH, in both classes. The architecture only decides
+    whether a knob exists."""
+    out = ["Reps are re-prefilling instead of decoding off a cache hit, so",
+           "this measures a colder workload than the one being tuned for."]
+    if int(hw.get("n_swa") or 0) > 0:
+        out += [
+            "This model uses sliding-window attention, and past the window a",
+            "shared prefix stops being reusable. `--swa-full` restores it, at the",
+            "cost of the sliding-window shortcut in attention -- which is why",
+            "`swa_full` is swept rather than switched on. Compare the two levels",
+            "in the results rather than assuming either way.",
+        ]
+    elif int(hw.get("ssm_state") or 0) > 0:
+        out += [
+            "This model has recurrent (SSM) memory, which cannot be rolled back",
+            "to an arbitrary prefix past a certain depth. Measured on qwen35moe:",
+            "87% reuse at 4k tokens, 43% at 8k, 0% at 16k -- and unchanged by",
+            "--ctx-checkpoints. No flag moves that boundary, so the only lever is",
+            "depth: a smaller --n-depth measures the workload you asked for.",
+        ]
+    else:
+        out += [
+            "Most likely the context cannot hold prompt + generation, so the slot",
+            "is reset between requests: try a smaller --n-depth.",
+        ]
+    return out
+
+
 def delivered_cache_hit(timings: list) -> float | None:
     """Fraction of prompt tokens the server actually served from its cache.
 
@@ -3899,14 +3954,12 @@ class ServerSession:
               f"workload asked for {want * 100:.0f}%.")
         print("!! Reps are re-prefilling instead of decoding off a cache hit, so")
         print("!! this measures a colder workload than the one being tuned for.")
-        print("!! Causes, most likely first:")
-        print("!!  - a hybrid/recurrent (SSM) or SWA model. llama.cpp cannot roll")
-        print("!!    a recurrent state back to an arbitrary prefix, so it forces")
-        print("!!    full re-processing unless a context checkpoint covers it")
-        print("!!    (llama-server -ctxcp / --ctx-checkpoints). Prefix reuse is")
-        print("!!    then a property the model does not have, not a setting.")
-        print("!!  - a context too small to hold prompt + generation, which")
-        print("!!    resets the slot between requests: try a smaller --n-depth.\n")
+        for line in cache_miss_advice(getattr(self.cfg, "hw", {}) or {}):
+            print(f"!! {line}")
+        print()
+
+    def _warn_cache_miss_lines(self):
+        return cache_miss_advice(getattr(self.cfg, "hw", {}) or {})
 
     def _warn_rejected_reps(self, kept, dropped):
         """Say so when some — but not all — reps failed their own wall clock.
@@ -4998,12 +5051,27 @@ def selftest() -> bool:
                         "gemma3.context_length": 32768,
                         "gemma3.attention.sliding_window": 512})
         assert _g3 == {"n_layers": 18, "n_experts": 0, "n_ctx_train": 32768,
-                       "n_nextn": 0, "n_swa": 512}, _g3
+                       "n_nextn": 0, "n_swa": 512, "ssm_state": 0}, _g3
         _q = model_hw({"qwen35.block_count": 64,
                        "qwen35.context_length": 262144,
-                       "qwen35.nextn_predict_layers": 1})
+                       "qwen35.nextn_predict_layers": 1,
+                       "qwen35.ssm.state_size": 128})
         assert _q == {"n_layers": 64, "n_experts": 0, "n_ctx_train": 262144,
-                      "n_nextn": 1, "n_swa": 0}, _q
+                      "n_nextn": 1, "n_swa": 0, "ssm_state": 128}, _q
+
+        # the cache-miss advice is architecture-specific, and every line of it is
+        # measured -- the first two versions were wrong in opposite directions
+        _swa_adv = " ".join(cache_miss_advice({"n_swa": 512}))
+        assert "--swa-full" in _swa_adv and "swept" in _swa_adv, _swa_adv
+        _rec_adv = " ".join(cache_miss_advice({"ssm_state": 128}))
+        assert "recurrent" in _rec_adv and "--n-depth" in _rec_adv, _rec_adv
+        # it must NOT send a recurrent user to --ctx-checkpoints: measured, that
+        # changes nothing at 32 or 512
+        assert "ctx-checkpoints" not in _rec_adv or "unchanged" in _rec_adv
+        # ...nor claim reuse is unavailable outright, which was the old error
+        assert "does not have" not in _rec_adv, _rec_adv
+        _plain_adv = " ".join(cache_miss_advice({}))
+        assert "--n-depth" in _plain_adv and "swa-full" not in _plain_adv
         # and it reaches the design: metadata in, factor out
         assert "swa_full" in build_factors(Config(
             model=Path("g.gguf"), llama_bench=Path("b"), llama_server=Path("s"),
