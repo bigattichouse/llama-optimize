@@ -287,6 +287,19 @@ Three answers off one CSV:
 
 Budget: ~10 minutes once the card is free, most of it loading 23.6 GiB.
 
+## Also in flight
+
+- **Issue #19 — speculative type coverage.** The #11 reporter says DFlash2 beats
+  MTP on their model; the tool can only offer `draft-mtp` or nothing, so five of
+  llama.cpp's eleven `--spec-type` values are unreachable. Asked them for numbers
+  and for how they invoke it, since no draft sidecar exists locally to build
+  against.
+- **`Qwen3.6-35B-A3B` downloading** — the MoE test subject for #17, and the only
+  MoE anywhere on this box (checked: every local GGUF reports `expert_count = 0`,
+  and of the safetensors in `../model/` only this one is `qwen3_5_moe`). Expect it
+  to be hybrid SSM too, so #18 should be settled first or its partial-`ngl` crash
+  will confound the `ngl` x `ncmoe` question #17 is about.
+
 ## Then
 
 - **Draft-model staging (F2 continued).** The staged screen from

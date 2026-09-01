@@ -149,8 +149,21 @@ needs two non-identical GPUs and by construction cannot be tested here.
   procedure and pass/fail meanings in
   [`NEXT-SESSION.md`](NEXT-SESSION.md#queued-one-gpu-run-waiting-on-the-card-18-15-11).
   Needs ~25.6 GiB free on a card that currently has 22.1.
+- **Issue #19 — five of llama.cpp's eleven `--spec-type` values are
+  unreachable.** `mtp` is a binary on/off factor, so the sweep asks "MTP or
+  nothing" when the axis is categorical and `--spec-type` takes a list. Reported
+  from the field (issue #11: "DFlash2 seems to perform a lot better than MTP") on
+  exactly a model where the winner is a value the tool cannot express. Supersedes
+  the `draft-simple`/`draft-eagle3`/`draft-dflash` line in
+  [`draft-model-design.md`](draft-model-design.md). Needs a draft sidecar to test
+  against; none exists locally.
 - **Issue #17 — `ngl` and `ncmoe` both decide what lives on the CPU on MoE
-  models.** `ngl=0 x any ncmoe` is a cell where `ncmoe` cannot act; `is_inert`
+  models.** Test subject arriving: `Qwen3.6-35B-A3B` (`qwen3_5_moe`, 256
+  experts) is being downloaded. Caveat to plan around — it is the MoE sibling of
+  `qwen35`, so it is very likely hybrid SSM as well and will carry issue #18's
+  partial-`ngl` crash. Since #17 is precisely about the `ngl` x `ncmoe`
+  interaction, the partial-`ngl` cells may abort rather than measure; settle #18
+  first, or the confound eats the experiment. `ngl=0 x any ncmoe` is a cell where `ncmoe` cannot act; `is_inert`
   now stops such a cell voting once the relation is declared, but the relation
   between these two is not `gated_by` — it is graded, not on/off, and picking
   between a constrained pair and letting `ncmoe` own the axis wants measurement
