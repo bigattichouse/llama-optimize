@@ -111,16 +111,16 @@ and whether any reuse survives with MTP off — and that single run separates th
 It was asked for before `63452e7` and generated 25 runs; on current `main` it is
 one. Nothing is blocked on the answer.
 
-**Left open deliberately, not forgotten:**
+**Spun out rather than left in this issue's tail**, so they do not die with it —
+same treatment as #14:
 
-- **`-ctxcp` / `--ctx-checkpoints` and `--cache-ram` are not swept or set.** On
-  hybrid/recurrent and SWA models they are the only llama.cpp knobs that can
-  restore any prefix reuse, so the `agents` profile currently measures a workload
-  those users cannot get. A factor decision, not a bug fix.
-- **MTP's knobs still share a flat array with `mtp` when it is swept** rather
-  than pinned. The correct shape is the staged decomposition the ngram gate
-  already uses; it changes what every MTP sweep does, so it is sequenced
-  separately ([`CONDITIONAL-FACTORS.md`](CONDITIONAL-FACTORS.md), "Still open").
+- **Issue #15** — prefix reuse is unattainable on hybrid/recurrent and SWA
+  models, and `--ctx-checkpoints` is not swept.
+- **Issue #16** — MTP's tuning knobs share a flat array with the `mtp` gate when
+  it is swept. `gated_by` fixed only the pinned case.
+
+**Still only written down here:**
+
 - **`TG_OVER_PP_LIMIT`.** The guard's comment claims "the honest ratio runs
   10-100x in prefill's favour"; measured on CPU (gemma-3-270m, `-p 8192 -n 256`)
   it is 11.7x at depth 0, **7.5x at 8192** and 7.3x at 32768. It flattens rather

@@ -139,17 +139,17 @@ needs two non-identical GPUs and by construction cannot be tested here.
   [`constants-audit.md`](constants-audit.md). `FIXED_FA` is the sharpest and the
   least tractable: it needs a non-ROCm backend to validate.
 - **RoPE/YaRN tail** — complete the family or state the scope.
-- **Stage the MTP knobs behind their gate** (issue #11). `spec_n_max`,
-  `spec_n_min_frac`, `spec_p_min` and `spec_p_split` no longer sweep when `mtp`
-  is pinned off (`gated_by`), but when `mtp` is *swept* they still share one flat
-  array with it — the dilution `plan_stages` already solves for the ngram gate.
-  Needs no hardware; it changes what every MTP sweep does, which is why it is not
-  folded into the bug fix ([`CONDITIONAL-FACTORS.md`](CONDITIONAL-FACTORS.md)).
-- **Prefix reuse on hybrid/recurrent and SWA models** (issue #11). `-ctxcp` /
+- **Issue #15 — prefix reuse on hybrid/recurrent and SWA models.** `-ctxcp` /
   `--ctx-checkpoints` and `--cache-ram` are the only llama.cpp knobs that can
-  deliver any reuse there, and neither is swept or set — so the `agents` profile
+  deliver any reuse there, and neither is swept or set — so `--profile agents`
   measures a workload those users cannot get
-  ([`workload-shape-design.md`](workload-shape-design.md)).
+  ([`workload-shape-design.md`](workload-shape-design.md)). Needs a hybrid or SWA
+  model on a GPU, so it is opportunistic rather than scheduled.
+- **Issue #16 — stage the MTP knobs behind their gate.** `gated_by` handles the
+  pinned case (`--factor mtp=0`); when `mtp` is *swept* the four knobs still
+  share one flat array with it. Needs no hardware, and is the same shape as the
+  draft-model staging in step 6 — worth doing as one piece of work
+  ([`CONDITIONAL-FACTORS.md`](CONDITIONAL-FACTORS.md)).
 
 ## What this plan assumes
 

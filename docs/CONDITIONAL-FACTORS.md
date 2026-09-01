@@ -67,11 +67,11 @@ column in the design at all. `active_when` treats an absent gate as *inactive*
 gate is present **and** none of its levels is live, which is exactly the case
 that is provably inert.
 
-**Still open:** when `mtp` is swept rather than pinned, the four knobs share one
-flat array with it — the F2/F3 dilution below, unfixed. The correct shape is the
-staged one: screen `mtp` on/off, then a `tune:mtp=1` stage for its knobs. That is
-a change to what every MTP sweep does, so it is sequenced separately rather than
-folded into a bug fix.
+**Still open (issue #16):** when `mtp` is swept rather than pinned, the four knobs
+share one flat array with it — the F2/F3 dilution below, unfixed. The correct
+shape is the staged one: screen `mtp` on/off, then a `tune:mtp=1` stage for its
+knobs. That is a change to what every MTP sweep does, so it is sequenced
+separately rather than folded into a bug fix.
 
 ## Why a flat orthogonal array is wrong here
 

@@ -344,7 +344,9 @@ Consequences:
   8192 with ~6k tokens of `n_ctx` to spare.
 - `-ctxcp` / `--ctx-checkpoints` (and `--cache-ram`) are the only llama.cpp knobs
   that can restore any reuse on these models, and we do not sweep or set either.
-  That is a coverage gap worth its own entry, not a fix to be guessed at here.
+  Filed as **issue #15**, with the open questions — whether checkpoints deliver
+  reuse at `agents` depths at all, at what memory cost, and whether this is a
+  factor or an input.
 - It also explains the reporter's earlier result that `--prefix-reuse 100` did not
   clear the rejection. It was never going to: the delivered reuse was 0 either
   way, so the reps re-prefilled and the wall clock stayed mostly prefill.
