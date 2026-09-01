@@ -1176,8 +1176,51 @@ def spec_type_args(cfg: "Config", level: str) -> list[str]:
         return []
     if level == "draft-mtp":
         return ["--spec-type", "draft-mtp"]
+    return draft_model_args(cfg)
+
+
+def draft_self_describes(path) -> bool:
+    """Whether llama.cpp can work out this draft's speculative type on its own.
+
+    `common_speculative_types_from_gguf` recognises two things: architecture
+    `dflash` (DFlash2, or DSpark when the Markov head is there), and an ordinary
+    architecture carrying `blk.N.nextn.eh_proj.weight` — an MTP head. The second
+    is a tensor and this reader parses key/values only, but the standalone MTP
+    sidecars carry `{arch}.nextn_predict_layers` in their KV as well, which is the
+    same signal one layer up.
+
+    Anything else is an ordinary model, and llama.cpp infers NOTHING from it —
+    which is the whole reason this function exists."""
+    if not path:
+        return False
+    meta = read_gguf_metadata(Path(path))
+    if not meta:
+        return False
+    return (str(meta.get("general.architecture", "")) == "dflash"
+            or model_nextn_layers(meta) > 0)
+
+
+def draft_model_args(cfg: "Config") -> list[str]:
+    """`-md`, plus the type when llama.cpp cannot infer one.
+
+    A plain draft model — the classic speculative setup, a small sibling of the
+    target — tells llama.cpp nothing about itself. Inference returns an empty
+    list, the type stays at its default of `none` (`common/arg.cpp`
+    `spec_types_is_default`), and the draft is **loaded, charged to VRAM, and
+    never used**. Nothing said so: the row is not flagged `spec_off` either,
+    because on a target without its own MTP head nothing had requested
+    speculation in the first place.
+
+    So `--spec-type draft-simple` is named for exactly the drafts that cannot
+    name themselves, and withheld from the ones that can — overriding a working
+    inference is the bug this file already fixed once (issue #19)."""
     dm = getattr(cfg, "draft_model", None)
-    return ["-md", str(dm)] if dm else []
+    if not dm:
+        return []
+    args = ["-md", str(dm)]
+    if not draft_self_describes(dm):
+        args += ["--spec-type", "draft-simple"]
+    return args
 
 
 def draft_decides_spec_type(cfg: "Config") -> bool:
@@ -2715,6 +2758,13 @@ def server_command(cfg: Config, f: dict, ctx: int) -> str:
         parts.append(f"-b {max(FIXED_BATCH, ub)}")
     parts += [" ".join(shlex.quote(t) for t in g)
               for g in factor_flags(cfg, f, "server")]
+    # The pasted command is the deliverable, so it has to carry the draft model
+    # the row was measured with. It did not: a --draft-model sweep printed a
+    # command with no `-md` at all, which would not reproduce the number above it.
+    _dm = (spec_type_args(cfg, f["spec_type"]) if "spec_type" in f
+           else draft_model_args(cfg))
+    if _dm:
+        parts.append(" ".join(shlex.quote(t) for t in _dm))
     if "concurrency" in f:
         parts += [" ".join(concurrency_flags(f["concurrency"]))] if \
             concurrency_flags(f["concurrency"]) else []
@@ -3238,7 +3288,7 @@ def build_server_args(cfg: Config, f: dict, port: int, n_ctx: int) -> list[str]:
     # measuring would both cost VRAM and let llama.cpp infer a type the row did
     # not choose (issue #19).
     if cfg.draft_model and "spec_type" not in f:
-        args += ["-md", str(cfg.draft_model)]
+        args += draft_model_args(cfg)
     # A multimodal projector is a third resident artifact and the same kind of
     # input: it occupies VRAM from load, whether or not any image ever arrives.
     if cfg.mmproj:
@@ -5394,9 +5444,52 @@ def selftest() -> bool:
                         llama_server=Path("s"), array="auto", ctx_floor=8192,
                         driver="server", emit_mtp=True,
                         draft_model=Path("dflash.gguf"), hw=dict(_hw_mtp))
-        _a_dm = build_server_args(cfg_dm, {"ngl": "99"}, 8080, 4096)
-        assert "-md" in _a_dm, _a_dm                     # the draft is loaded...
-        assert "--spec-type" not in _a_dm, _a_dm         # ...and decides the type
+        _real_meta2 = read_gguf_metadata
+        try:
+            # a head that names its own kind: llama.cpp infers, we stay quiet
+            globals()["read_gguf_metadata"] = \
+                lambda _p: {"general.architecture": "dflash"}
+            _a_dm = build_server_args(cfg_dm, {"ngl": "99"}, 8080, 4096)
+            assert "-md" in _a_dm, _a_dm                 # the draft is loaded...
+            assert "--spec-type" not in _a_dm, _a_dm     # ...and decides the type
+            assert draft_self_describes(Path("x")) is True
+            # an MTP sidecar names itself through its KV, one layer up from the
+            # nextn tensor llama.cpp actually looks for
+            globals()["read_gguf_metadata"] = lambda _p: {
+                "general.architecture": "qwen35", "qwen35.nextn_predict_layers": 1}
+            assert draft_self_describes(Path("x")) is True
+            assert "--spec-type" not in build_server_args(cfg_dm, {"ngl": "99"},
+                                                          8080, 4096)
+
+            # A PLAIN draft model -- the classic speculative setup -- names
+            # nothing. llama.cpp infers an empty list, the type stays at its
+            # default of `none`, and the draft is loaded, charged to VRAM and
+            # never used. Nothing said so, because on a target with no MTP head
+            # nothing had requested speculation to begin with.
+            globals()["read_gguf_metadata"] = \
+                lambda _p: {"general.architecture": "qwen3"}
+            assert draft_self_describes(Path("x")) is False
+            # A draft we cannot read counts as NOT self-describing, on purpose.
+            # llama.cpp reads only the first split, so a sharded draft needs an
+            # explicit type by its own account (common/arg.cpp) -- and naming a
+            # possibly-wrong type that shows up in the pasted command beats
+            # silently speculating with nothing.
+            globals()["read_gguf_metadata"] = lambda _p: {}
+            assert draft_self_describes(Path("x")) is False
+            assert "draft-simple" in build_server_args(cfg_dm, {"ngl": "99"},
+                                                       8080, 4096)
+            globals()["read_gguf_metadata"] = \
+                lambda _p: {"general.architecture": "qwen3"}
+            _a_plain = build_server_args(cfg_dm, {"ngl": "99"}, 8080, 4096)
+            assert "-md" in _a_plain, _a_plain
+            assert _a_plain[_a_plain.index("--spec-type") + 1] == "draft-simple", \
+                _a_plain
+            # and the pasted command carries the draft too -- it printed a
+            # command with no -md at all, which would not reproduce the row
+            _cmd_plain = server_command(cfg_dm, {"ngl": "99"}, 4096)
+            assert "-md" in _cmd_plain and "draft-simple" in _cmd_plain, _cmd_plain
+        finally:
+            globals()["read_gguf_metadata"] = _real_meta2
         # with no draft model the target's own MTP head still switches it on
         cfg_no = Config(model=Path("q.gguf"), llama_bench=Path("b"),
                         llama_server=Path("s"), array="auto", ctx_floor=8192,

@@ -117,6 +117,22 @@ earlier.
 - **The recommended `-c` could exceed the context the sweep ever loaded.** It was
   derived from the requested depth; it is now capped by the delivered one.
 
+- **A plain `--draft-model` never speculated at all.** Found while closing the
+  rest of [issue #19]. llama.cpp infers the speculative type from the draft GGUF,
+  but only for heads that name themselves — architecture `dflash`, or an MTP
+  head. An *ordinary* draft model (the classic setup: a small sibling of the
+  target) tells it nothing, inference returns an empty list, the type stays at
+  its default of `none`, and the draft is **loaded, charged to VRAM, and never
+  used**. Nothing reported it: on a target with no MTP head of its own, nothing
+  had requested speculation, so the row was not flagged `spec_off` either.
+  `--spec-type draft-simple` is now named for exactly the drafts that cannot name
+  themselves, and withheld from the ones that can.
+
+- **The pasted command omitted the draft model entirely.** A `--draft-model`
+  sweep printed a suggested `llama-server` line with no `-md` on it, so the
+  command could not reproduce the row above it. The command is the deliverable;
+  it now carries the draft and its type.
+
 - **A supplied `--draft-model` was loaded and then ignored.** [Issue #19]. On a
   target carrying its own MTP head the tool emitted `--spec-type draft-mtp`
   unconditionally, so pointing `--draft-model` at a DFlash2 head produced
