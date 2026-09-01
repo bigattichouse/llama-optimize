@@ -1631,6 +1631,23 @@ def build_factors(cfg: Config):
         factors["spec_n_min_frac"] = ["0.0", "0.5", "1.0"]
         factors["spec_p_min"] = ["0.0", "0.25", "0.5", "0.75", "0.9"]
         factors["spec_p_split"] = ["0.1", "0.3", "0.5"]
+    # llama.cpp toggles we were merely inheriting the defaults of. Each is a
+    # documented behaviour switch with no universal answer -- whether repacking
+    # weights, offloading host ops, or bypassing the host buffer helps depends on
+    # the backend, the CPU and the model, which is the case for MEASURING them
+    # rather than picking one. Verified free: an L125 holds 31 factors, so adding
+    # these keeps the same 125 runs, and none of them changes how the model is
+    # loaded (unlike load_mode, which would make every launch slower).
+    #
+    # Gated on the binary advertising the flag, since these are recent, and safe
+    # to sweep blind because a level that turns out not to run is reported and
+    # dropped by `dead_levels` rather than silently poisoning the design.
+    if cfg.driver == "server":
+        for _name, _flag in (("repack", "--repack"),
+                             ("no_op_offload", "--op-offload"),
+                             ("no_host", "--no-host")):
+            if supports_flag(cfg.llama_server, _flag):
+                factors[_name] = ["0", "1"]
     # Sliding-window attention: --swa-full decides whether the SWA layers keep a
     # full-size KV cache. Measured on gemma-3-270m at a 15.7k-token prompt with a
     # 90% shared prefix (issue #15): WITHOUT it the second rep re-prefills the
@@ -5389,6 +5406,42 @@ def selftest() -> bool:
         # and the pasted command agrees with what was run
         assert "--spec-type draft-mtp" not in server_command(cfg_dm, {"ngl": "99"}, 4096)
         assert "--spec-type draft-mtp" in server_command(cfg_no, {"ngl": "99"}, 4096)
+
+        # --- inherited llama.cpp toggles are measured, not assumed ---
+        # Each is a documented behaviour switch with no universal answer, and we
+        # were taking llama.cpp's default on every run without ever asking. Free
+        # in runs: an L125 holds 31 factors, so these ride along at the same 125.
+        _hw_tog = {"phys": 8, "logical": 16, "n_layers": 32,
+                   "n_ctx_train": 32768, "n_experts": 0, "n_nextn": 0}
+        _real_supports = supports_flag
+        try:
+            globals()["supports_flag"] = lambda _b, _f: True
+            cfg_tog = Config(model=Path("m.gguf"), llama_bench=Path("b"),
+                             llama_server=Path("s"), array="auto", ctx_floor=8192,
+                             driver="server", hw=dict(_hw_tog))
+            f_tog = build_factors(cfg_tog)
+            for _n in ("repack", "no_op_offload", "no_host"):
+                assert f_tog[_n] == ["0", "1"], (_n, f_tog.get(_n))
+            # ...and they cost nothing: same array as without them
+            assert choose_array(f_tog) == choose_array(
+                {k: v for k, v in f_tog.items()
+                 if k not in ("repack", "no_op_offload", "no_host")})
+            # a build too old for a flag does not get a column that cannot be
+            # emitted -- every level would be the same run
+            globals()["supports_flag"] = lambda _b, _f: False
+            cfg_old = Config(model=Path("m.gguf"), llama_bench=Path("b"),
+                             llama_server=Path("s"), array="auto", ctx_floor=8192,
+                             driver="server", hw=dict(_hw_tog))
+            f_old = build_factors(cfg_old)
+            assert not ({"repack", "no_op_offload", "no_host"} & set(f_old)), f_old
+            # and the bench driver has no spelling for them
+            globals()["supports_flag"] = lambda _b, _f: True
+            cfg_b = Config(model=Path("m.gguf"), llama_bench=Path("b"),
+                           llama_server=Path("s"), array="auto", ctx_floor=8192,
+                           driver="bench", hw=dict(_hw_tog))
+            assert "repack" not in build_factors(cfg_b)
+        finally:
+            globals()["supports_flag"] = _real_supports
 
         # --- swa_full is swept when the model has SWA (issue #15) ---
         # Measured on gemma-3-270m, 15.7k-token prompt, 90% shared prefix: the

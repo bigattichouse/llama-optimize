@@ -217,6 +217,49 @@ about is how inert columns get created.
       rows that set it, because these flags reduce the footprint and ignoring
       one over-estimates in the direction that prunes valid configs
 - [ ] `-sps` folded into [`workload-shape-design.md`](workload-shape-design.md)
+## Audit: detected-and-explored, or assumed?
+
+The tool's job is to find out what a *user's* model and hardware can do, then
+measure which of those is best. A knob we pin is a knob nobody can discover — and
+every pin here was chosen on one box. Reviewed 2026-09-01:
+
+**Explored (levels come from detection, the answer from measurement).** `ngl`
+(span from `block_count`, narrowed by `llama-fit-params` on the user's card, and
+under `--run` by a launch probe that asks which levels load), `n_depth`
+(`context_length`), `threads`/`threads_batch` (core counts), `ncmoe` vs
+`ffn_place` (`expert_count`, and whether the binary has `-ncffn`), `swa_full`
+(`attention.sliding_window`), `mtp`/`spec_*` (`nextn_predict_layers`),
+`spec_type` (which heads exist), `numa` (node count), `mmproj_offload` and
+`spec_draft_*` (present only with the artifact they act on), `kv_type`, `ubatch`,
+`nkvo`, `poll`, `batch_ratio`.
+
+**Newly explored.** `repack`, `no_op_offload` and `no_host` were registered,
+reachable by hand, and never swept — so every run silently took llama.cpp's
+default. Each is a documented behaviour switch whose answer depends on backend,
+CPU and model. They are now auto-swept where the binary advertises the flag, and
+they cost **nothing**: an L125 holds 31 factors, so the design stays at 125 runs.
+
+**Still assumed, and why it is not a one-liner:**
+
+- **`fa` (`FIXED_FA = 1`)** — the big one, and
+  [`constants-audit.md`](constants-audit.md) C-A has the analysis. Pinned from
+  gfx906 while llama.cpp's own default is `auto`, which decides per build. It
+  cannot simply be unpinned: `-fa` is a precondition for quantized KV, so letting
+  it fall to `auto` on a backend that declines FA would silently invalidate every
+  `q8_0` row. The honest fix is to probe whether FA is active and gate `kv_type`
+  on the answer — the same shape as the `ngl` launch probe, which is now built
+  and can be followed.
+- **`load_mode`** — pinned to `mmap` where llama.cpp's default is `auto`. The
+  reason is documented (every row should load the model the same way) and is
+  defensible, but unlike the others this one is *not* free to sweep: `none` reads
+  the whole model per launch, so it would slow every row rather than ride along.
+  Worth measuring once, not sweeping always.
+- **`cpu_mask`/`cpu_range`/`prio` and friends** — no universal levels, as
+  recorded below. Genuinely a user input rather than a knob to search.
+- **`ctx_checkpoints`, `checkpoint_min_step`** — registered, never swept.
+  Measured not to restore prefix reuse on SWA or recurrent models (issue #15),
+  which is one question of several they might answer.
+
 - [x] Auto-sweep `swa_full` — SWA **is** detectable from GGUF metadata
       (`{arch}.attention.sliding_window`, present on gemma3/gemma4/muse-glimmer,
       absent on qwen35), and the flag decides whether a shared-prefix workload

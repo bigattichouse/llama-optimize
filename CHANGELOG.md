@@ -217,6 +217,14 @@ earlier.
 
 ### Added
 
+- **`repack`, `no_op_offload` and `no_host` are now swept** instead of silently
+  inheriting llama.cpp's default on every run. Each is a documented behaviour
+  switch whose answer depends on backend, CPU and model, and each was registered
+  and reachable by hand but never explored. Free in runs: an L125 holds 31
+  factors, so the design stays at 125. Gated on the binary advertising the flag,
+  and safe to sweep blind because a level that turns out not to run is reported
+  and dropped by the out-of-bounds detection rather than poisoning the design.
+
 - **`spec_type` factor: sweep *which* speculative head, not MTP on/off.**
   [Issue #19]. Reported from the field — "DFlash2 seems a lot better than MTP" —
   on a model that has both, where the sweep could not put that question at all
