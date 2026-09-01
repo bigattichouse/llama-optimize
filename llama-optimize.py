@@ -1517,6 +1517,38 @@ DEFAULT_UBATCH_LEVELS = [128, 256, 512, 1024, 2048]
 KV_QUALITY = ["f32", "f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "iq4_nl"]
 
 
+# `-fa` levels that mean OFF, across the spellings llama.cpp has used: it took
+# 0|1 and now takes on|off|auto.
+FA_OFF_LEVELS = frozenset({"0", "off", "false", "no"})
+
+
+def fa_forces_unquantized_kv(fa_levels: list) -> bool:
+    """Whether a swept `fa` makes quantized KV levels unusable.
+
+    Measured, not inferred: `llama-server -fa off -ctk q8_0 -ctv q8_0` fails with
+    `failed to create context with model`, while `-fa on` with the same cache
+    loads. Flash attention is a precondition for a quantized KV cache in
+    llama.cpp, so a design that sweeps `fa` across an off level AND keeps
+    quantized `kv_type` levels contains cells that cannot launch — every one of
+    them a SIGNAL row that measures nothing and unbalances the array.
+
+    This is why the README's manual recipe was `--factor fa=0,1 --min-kv f16`.
+    Doing it automatically is the difference between a flag that works and one
+    with a footgun attached (issue #20)."""
+    return any(str(v).lower() in FA_OFF_LEVELS for v in fa_levels)
+
+
+def kv_levels_for_fa(fa_levels: list, kv_levels: list) -> list:
+    """The `kv_type` levels that can still launch, given the `fa` levels in play.
+
+    Extracted from `main` so the connection is testable at all: the predicate
+    above being right is worth nothing if nothing consults it, and that wiring is
+    exactly what silently regresses."""
+    if not fa_levels or not fa_forces_unquantized_kv(fa_levels):
+        return list(kv_levels)
+    return kv_at_or_above(kv_levels, "f16")
+
+
 def kv_at_or_above(levels: list, floor: str) -> list:
     """Keep only KV types at least as high-quality as `floor` (order in
     KV_QUALITY). floor 'any'/'none'/'' disables the filter."""
@@ -5546,6 +5578,25 @@ def selftest() -> bool:
         assert "--spec-type draft-mtp" not in server_command(cfg_dm, {"ngl": "99"}, 4096)
         assert "--spec-type draft-mtp" in server_command(cfg_no, {"ngl": "99"}, 4096)
 
+        # --- sweeping fa must not build rows that cannot launch (issue #20) ---
+        # Measured: `llama-server -fa off -ctk q8_0 -ctv q8_0` fails with
+        # "failed to create context with model", while `-fa on` with the same
+        # cache loads. Flash attention is a precondition for a quantized KV
+        # cache, so a design holding both an fa-off level and a quantized
+        # kv_type carries cells that can only ever be SIGNAL rows.
+        assert fa_forces_unquantized_kv(["0", "1"]) is True
+        assert fa_forces_unquantized_kv(["off", "on"]) is True
+        assert fa_forces_unquantized_kv(["on"]) is False
+        assert fa_forces_unquantized_kv(["1"]) is False
+        # `auto` is llama.cpp deciding, not us asking for off
+        assert fa_forces_unquantized_kv(["auto"]) is False
+        # the levels it leaves behind are the ones a context can be made with
+        assert kv_levels_for_fa(["0", "1"], ["f16", "q8_0", "q4_0"]) == ["f16"]
+        # ...and an fa that is never off changes nothing
+        assert kv_levels_for_fa(["1"], ["f16", "q8_0", "q4_0"]) \
+            == ["f16", "q8_0", "q4_0"]
+        assert kv_levels_for_fa([], ["f16", "q8_0"]) == ["f16", "q8_0"]
+
         # --- a hand-named spec type works, and says what it is (issue #19) ---
         # spec_type_levels only generates none/draft-mtp/<detected arch>, but
         # --factor spec_type=... can name any of llama.cpp's eleven values. The
@@ -9379,6 +9430,18 @@ def main():
         _gates = sorted({FACTORS[n]["gated_by"][0] for n in _inert})
         print(f"not swept: {', '.join(_inert)} — inert at the pinned "
               f"{', '.join(_gates)}")
+
+    # Sweeping `fa` across an off level makes every quantized-KV cell unlaunchable
+    # (measured: `-fa off -ctk q8_0` cannot create a context). Drop those levels
+    # rather than let the design carry rows that can only fail (issue #20).
+    if "fa" in cfg.factors:
+        _kv_was = cfg.factors.get("kv_type", [])
+        _kv_now = kv_levels_for_fa(cfg.factors["fa"], _kv_was)
+        if _kv_now != _kv_was:
+            cfg.factors["kv_type"] = _kv_now
+            print(f"fa is swept with an 'off' level, and quantized KV needs flash "
+                  f"attention — dropping {', '.join(v for v in _kv_was if v not in _kv_now)} "
+                  f"so no row is unlaunchable (keeping {', '.join(_kv_now)})")
 
     # apply --env: each becomes an orthogonal factor that sets a process env var
     for spec in args.env:
