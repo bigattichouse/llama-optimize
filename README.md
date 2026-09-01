@@ -144,7 +144,7 @@ Swept by default (auto-scaled to your hardware and model):
 
 | Factor        | Flag             | Levels (example, Qwen3.6-27B on MI50) | Notes |
 |---------------|------------------|----------------------------------------|-------|
-| GPU layers    | `-ngl`           | `0, 16, 32, 48, 64` — or `0, 48, 54, 60, 64` when the model fits | biggest lever; top = model's real layer count. When `llama-fit-params` says every layer fits at the deepest depth in the sweep, the levels bias to the top quarter instead of spanning evenly: the reason to offload is memory pressure, and there is none. `ngl=0` is always kept, in case that verdict is wrong. `--no-oom-prune` restores the even span |
+| GPU layers    | `-ngl`           | `0, 16, 32, 48, 64` — or `0, 48, 54, 60, 64` when the model fits, or `0, 99` on a recurrent model | biggest lever; top = model's real layer count. When `llama-fit-params` says every layer fits at the deepest depth in the sweep, the levels bias to the top quarter instead of spanning evenly: the reason to offload is memory pressure, and there is none. `ngl=0` is always kept, in case that verdict is wrong. `--no-oom-prune` restores the even span. On **hybrid SSM models** the grid is `0, 99` only — every partial offload core-dumps llama-server, so those levels would abort rather than measure |
 | Context depth | `-d` (n-depth)   | 5 levels `0..min(native ctx, 65536)`   | KV pre-fill; the speed-vs-context axis, adaptive to the model's native context |
 | CPU threads   | `-t`             | `4, 6, 8, 12, 16`                      | auto-derived around the physical-core count |
 | KV cache type | `-ctk`/`-ctv`    | `f16, q8_0` (default)                  | KV precision; **floored to near-lossless** by `--min-kv q8_0` |

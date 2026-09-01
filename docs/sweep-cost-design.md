@@ -217,6 +217,39 @@ pruner uses, so the two cannot disagree about what fits. It answers True / False
   estimator enough to delete rows has not asked it to trust it enough to shape
   the grid either.
 
+### Recurrent models: two levels, not five (issue #18)
+
+A separate reason the `ngl` grid can be wrong, and a harder one — those rows do
+not merely lose, they **abort**. On a hybrid SSM model every *partial* offload
+core-dumps `llama-server`, right after:
+
+```
+resolve_fused_ops: layer 0 is assigned to device CPU but fused Gated Delta Net
+  (chunked) is assigned to device ROCm0 (usually due to missing support)
+```
+
+Measured on `Qwen3.6-27B-Q5_K_M` (`qwen35`, 64 blocks) at `-ngl 5` **and**
+`-ngl 40`; `-ngl 0` runs, and `-ngl 99` runs. It is the split that kills it, not
+the amount — the recurrent half of the model ends up straddling two devices.
+
+So on `ssm_state > 0` the grid is `[0, 99]`: the only two placements that
+execute. Three of five default levels would otherwise be recorded as `SIGNAL`,
+which is honest but useless, and on a first run it looks like the tool is broken
+rather than the placement being impossible.
+
+**99 rather than `n_layers`**, deliberately: `-ngl 99` is the spelling that was
+verified, and `-ngl n_layers` still leaves the output tensor on the CPU — a split
+of a different kind that was not tested. llama.cpp clamps 99 to the real count.
+
+**The CPU anchor stays**, for a different reason than in the fit case: if the
+model does not fit, the OOM pruner drops the `99` row and CPU-only is genuinely
+the one placement that runs. That is a real answer for the report to give.
+
+A side effect worth noting for issue #17: on a hybrid **MoE** the `ngl` column
+stops competing with `ncmoe` for the offload axis, because `ngl` no longer has
+intermediate levels. `-ngl 99 -ncmoe N` is measured and works — that is how the
+prefix-reuse experiments ran the 25 GiB model in 3.1 GiB.
+
 ### Not addressed here — issue #17
 
 Whether `ngl` and `ncmoe` should both be arguing about what lives on the CPU on

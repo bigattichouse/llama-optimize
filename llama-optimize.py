@@ -1241,8 +1241,21 @@ def thread_levels(phys: int, logical: int, levels: int = 5) -> list[int]:
 
 
 def ngl_levels(n_layers: int | None, levels: int = 5,
-               fits: bool | None = None) -> list[int]:
+               fits: bool | None = None, recurrent: bool = False) -> list[int]:
     """`levels` values for -ngl, spanning 0 (pure CPU) to all layers.
+
+    `recurrent=True` — the model has SSM/recurrent memory — collapses the grid to
+    `[0, 99]`, the only two placements that WORK. Every partial offload
+    core-dumps llama-server: measured on `Qwen3.6-27B-Q5_K_M` (`qwen35`) at both
+    `-ngl 5` and `-ngl 40`, right after `resolve_fused_ops: layer 0 is assigned to
+    device CPU but fused Gated Delta Net (chunked) is assigned to device ROCm0`.
+    It is the split that kills it, not the amount. An even span therefore spends
+    three of five levels on rows that abort rather than measure (issue #18).
+
+    99 rather than `n_layers` deliberately: `-ngl 99` is the spelling that was
+    verified, and `-ngl n_layers` still leaves the output tensor on the CPU, which
+    is a split of a different kind and was not tested. llama.cpp clamps 99 to the
+    real count.
 
     `fits=True` — the model provably fits in VRAM at the most demanding cell of
     this design — biases the levels toward full offload: the reason to put layers
@@ -1261,6 +1274,12 @@ def ngl_levels(n_layers: int | None, levels: int = 5,
     top = n_layers if n_layers else 99
     # Always include 0 (pure CPU) and the top (all layers). 99 = "all" is safe
     # since llama.cpp clamps to the real layer count.
+    if recurrent:
+        # Nothing between these two loads. The OOM pruner may drop the 99 row on
+        # a model too big for the card, which correctly leaves CPU-only as the
+        # one placement that runs -- a real and useful thing for the report to
+        # say, rather than a grid full of SIGNAL rows.
+        return [0, 99]
     if fits and levels >= 3 and top >= 4:
         # anchor + a span across the top quarter, widened when a quarter is too
         # narrow to hold `levels - 1` distinct values -- otherwise a small model
@@ -1382,6 +1401,9 @@ class Config:
     # set by build_factors: the ngl grid was biased toward full offload because
     # the model provably fits. Recorded so the header can say so (issue #14).
     ngl_biased: bool = False
+    # set by build_factors: the model has recurrent memory, so partial -ngl is
+    # not a placement that runs (issue #18)
+    ngl_recurrent: bool = False
     min_tgs: float = 0.0        # abandon a config generating slower than this
     min_pps: float = 0.0        # ...or prefilling slower than this
     slow_grace: int = 60        # never judge a config on less than this many seconds
@@ -1427,8 +1449,12 @@ def build_factors(cfg: Config):
     # optimistic; the ngl=0 anchor and the OOM pruner are what bound that.
     fits = full_offload_fits(cfg, depths, kv_lv, n_layers)
     cfg.ngl_biased = bool(fits)          # reported in the header, not inferred
+    # Recurrent models crash on any partial offload, so the grid has two usable
+    # points and there is no sense generating the three that abort (issue #18).
+    cfg.ngl_recurrent = int(cfg.hw.get("ssm_state", 0) or 0) > 0
     factors = {
-        "ngl": [str(x) for x in ngl_levels(n_layers, nlv, fits)],
+        "ngl": [str(x) for x in ngl_levels(n_layers, nlv, fits,
+                                           recurrent=cfg.ngl_recurrent)],
         "n_depth": [str(x) for x in depths],
         "threads": [str(x) for x in thread_levels(phys, logical, nlv)],
         "kv_type": list(DEFAULT_KV_LEVELS)[:nlv],
@@ -5185,6 +5211,38 @@ def selftest() -> bool:
         # a model too small to carve a top quarter from keeps the even span
         assert ngl_levels(3, 5, fits=True) == ngl_levels(3, 5)
 
+        # --- recurrent models: only two -ngl values run at all (issue #18) ---
+        # Measured on Qwen3.6-27B-Q5_K_M (qwen35): -ngl 5 and -ngl 40 both
+        # core-dump llama-server after "layer 0 is assigned to device CPU but
+        # fused Gated Delta Net (chunked) is assigned to device ROCm0"; -ngl 0
+        # and -ngl 99 run. It is the split that kills it, not the amount, so an
+        # even span spends three of five levels on rows that abort.
+        assert ngl_levels(64, 5, recurrent=True) == [0, 99]
+        assert ngl_levels(40, 3, recurrent=True) == [0, 99]
+        # 99, not n_layers: -ngl 99 is the spelling that was verified, and
+        # -ngl n_layers still leaves the output tensor on the CPU
+        assert 64 not in ngl_levels(64, 5, recurrent=True)
+        # recurrent wins over the fit bias -- a level that aborts is worse than a
+        # level that merely loses
+        assert ngl_levels(64, 5, fits=True, recurrent=True) == [0, 99]
+        # and it changes nothing for a model without recurrent memory
+        assert ngl_levels(64, 5, recurrent=False) == ngl_levels(64, 5)
+
+        # WIRING: read off the model's own metadata, like swa_full
+        _hw_rec = {"phys": 8, "logical": 16, "n_layers": 64,
+                   "n_ctx_train": 32768, "n_experts": 0, "n_nextn": 0,
+                   "ssm_state": 128}
+        cfg_rec = Config(model=Path("q.gguf"), llama_bench=Path("b"),
+                         llama_server=Path("s"), array="auto", ctx_floor=8192,
+                         driver="server", hw=dict(_hw_rec))
+        assert build_factors(cfg_rec)["ngl"] == ["0", "99"]
+        assert cfg_rec.ngl_recurrent is True      # so the header can say why
+        cfg_plain = Config(model=Path("t.gguf"), llama_bench=Path("b"),
+                           llama_server=Path("s"), array="auto", ctx_floor=8192,
+                           driver="server", hw={**_hw_rec, "ssm_state": 0})
+        assert build_factors(cfg_plain)["ngl"] != ["0", "99"]
+        assert cfg_plain.ngl_recurrent is False
+
         # the fit probe asks about the WORST cell the design contains, since the
         # levels are generated once while n_depth varies per row: a model that
         # fits at depth 0 and not at 64k must not get an optimistic grid.
@@ -8803,7 +8861,11 @@ def main():
         print(f"  {name:10s}: {', '.join(levels)}")
     # Say when the ngl grid was reshaped, and why. A level set that silently
     # depends on an estimate is one the reader cannot check (issue #14).
-    if getattr(cfg, "ngl_biased", False):
+    if getattr(cfg, "ngl_recurrent", False):
+        print("  note: ngl is 0 or 99 only — this model has recurrent (SSM) "
+              "memory, and llama-server core-dumps on any partial offload "
+              "(issue #18). Those levels would abort, not measure.")
+    elif getattr(cfg, "ngl_biased", False):
         print(f"  note: ngl levels bias to full offload — every layer fits in "
               f"VRAM at depth {max(int(d) for d in cfg.factors['n_depth'])}. "
               f"ngl=0 is kept in case that verdict is wrong "

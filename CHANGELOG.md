@@ -136,6 +136,15 @@ earlier.
   columns shrinks nothing and a screen-plus-tune split would cost 150 runs
   instead of 125.
 
+- **On hybrid SSM models, three of five `ngl` levels aborted the server.**
+  [Issue #18]. Every *partial* offload core-dumps `llama-server` — measured at
+  `-ngl 5` and `-ngl 40` on `qwen35`, after "layer 0 is assigned to device CPU but
+  fused Gated Delta Net (chunked) is assigned to device ROCm0". `-ngl 0` and
+  `-ngl 99` both run, so it is the split, not the amount. The grid is now
+  `[0, 99]` on those models, detected from `{arch}.ssm.state_size`, with the
+  reason printed. The CPU anchor stays: if the model does not fit, the OOM pruner
+  drops the `99` row and CPU-only really is the only placement that runs.
+
 - **The `ngl` grid spent its slowest rows where the answer could not be.**
   [Issue #14]. `ngl_levels` spanned `0 .. n_layers` evenly and never asked
   whether the model fits, so a 40-layer model that fits entirely in VRAM still
@@ -624,3 +633,4 @@ crash journal, `--resume`, `--iterate`, `--diff`, and a GPU-free `--selftest`.
 [Issue #14]: https://github.com/bigattichouse/llama-optimize/issues/14
 [Issue #16]: https://github.com/bigattichouse/llama-optimize/issues/16
 [Issue #15]: https://github.com/bigattichouse/llama-optimize/issues/15
+[Issue #18]: https://github.com/bigattichouse/llama-optimize/issues/18
