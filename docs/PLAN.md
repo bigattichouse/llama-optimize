@@ -90,12 +90,24 @@ that, `auto` is reachable for the first time, and `kv_unified` is recorded per
 row. All four levels verified against llama.cpp's own log —
 [`concurrency-kv-design.md`](concurrency-kv-design.md).
 
-### 6. Draft model / `-md` — *designed, one prerequisite*
+### 6. Draft model / `-md` — *mostly landed, one path unverified*
 
-[`draft-model-design.md`](draft-model-design.md). Unlocks ~12 `--spec-draft-*`
-knobs plus `draft-simple`/`draft-dflash`/`draft-dspark`. Prerequisite:
-`predict_fits` must account for two resident models — which is step 4, so these
-are naturally sequential.
+[`draft-model-design.md`](draft-model-design.md). The prerequisite is met —
+`predict_fits` prices the second resident model (step 4) — and the speculative
+types are reachable: `draft-simple`, `draft-dflash`, `draft-dspark`,
+`draft-eagle3` and `draft-mtp` all emit correctly, chosen from the draft GGUF's
+own architecture where llama.cpp can infer it and named where it cannot
+(issue #19).
+
+Three bugs on this path were found and fixed on the way, all of them silent: a
+supplied draft was loaded and then ignored on a target with its own MTP head; a
+*plain* draft model never speculated at all, because llama.cpp infers nothing
+from an ordinary model and its default type is `none`; and the pasted command
+omitted `-md` entirely, so it could not reproduce the row above it.
+
+**What is left is verification, not construction.** `draft-eagle3` has never
+actually run — see [`NEXT-SESSION.md`](NEXT-SESSION.md), including which head to
+use and which one not to waste an hour on.
 
 ### 7. ~~`ngl` levels that know about VRAM~~ — **done** (`aa63d19`)
 
@@ -134,34 +146,37 @@ needs two non-identical GPUs and by construction cannot be tested here.
   ([`flag-coverage.md`](flag-coverage.md)).
 - **The four hardware-poisoned constants** left as findings in
   [`constants-audit.md`](constants-audit.md). `FIXED_FA` is the sharpest and the
-  least tractable: it needs a non-ROCm backend to validate.
+  least tractable: it needs a non-ROCm backend to validate, and see issue #20
+  below for how far it got. `CHARS_PER_TOKEN` (C-B) is now measured rather than
+  assumed.
 - **RoPE/YaRN tail** — complete the family or state the scope.
-- **Issue #15 — prefix reuse on hybrid/recurrent models.** The SWA half is done:
-  `swa_full` is swept automatically, because `--swa-full` is what restores reuse
-  past the window and `--ctx-checkpoints` measurably is not
-  ([`workload-shape-design.md`](workload-shape-design.md)). What remains needs a
-  hybrid model resident on the GPU, so it is opportunistic.
-- **~~Issue #18~~ — done** (`7b4b052`). The `ngl` grid is `[0, 99]` on recurrent
-  models, since every partial offload aborts the server.
-- **Issue #19 — five of llama.cpp's eleven `--spec-type` values are
-  unreachable.** `mtp` is a binary on/off factor, so the sweep asks "MTP or
-  nothing" when the axis is categorical and `--spec-type` takes a list. Reported
-  from the field (issue #11: "DFlash2 seems to perform a lot better than MTP") on
-  exactly a model where the winner is a value the tool cannot express. Supersedes
-  the `draft-simple`/`draft-eagle3`/`draft-dflash` line in
-  [`draft-model-design.md`](draft-model-design.md). Needs a draft sidecar to test
-  against; none exists locally.
-- **Issue #17 — `ngl` and `ncmoe` both decide what lives on the CPU on MoE
-  models.** Test subject arriving: `Qwen3.6-35B-A3B` (`qwen3_5_moe`, 256
-  experts) is being downloaded. Caveat to plan around — it is the MoE sibling of
-  `qwen35`, so it is very likely hybrid SSM as well and will carry issue #18's
-  partial-`ngl` crash. Since #17 is precisely about the `ngl` x `ncmoe`
-  interaction, the partial-`ngl` cells may abort rather than measure; settle #18
-  first, or the confound eats the experiment. `ngl=0 x any ncmoe` is a cell where `ncmoe` cannot act; `is_inert`
-  now stops such a cell voting once the relation is declared, but the relation
-  between these two is not `gated_by` — it is graded, not on/off, and picking
-  between a constrained pair and letting `ncmoe` own the axis wants measurement
-  on a real MoE model.
+- **Issue #20 — `fa` is pinned from one GPU.** Half done: `--factor fa=0,1` no
+  longer builds unlaunchable rows (measured — `-fa off -ctk q8_0` cannot create a
+  context, so the quantized `kv_type` levels are dropped automatically). What
+  remains is whether the pin itself is right, and it needs a *constrained
+  relation* between `fa` and `kv_type` rather than a level filter: the cells that
+  must not exist are an interaction, and an orthogonal array cannot omit one cell.
+  **Note the retraction** in [`constants-audit.md`](constants-audit.md) C-A — the
+  "33% slower" measurement was a cold row against a hot one, and the question is
+  still open rather than answered.
+- **Issue #21 — shareable fingerprints.** Mostly serialisation now: `device_label`,
+  `backend_version`, `model_hw` and `cfg.hw` already hold the values, and the
+  report prints them. JSON with a schema version, because `--selftest` promises
+  stdlib-only. It is the only route to answering the questions this box cannot —
+  every architecture-conditional behaviour found this session was measured on one
+  card, one backend, one quant.
+- **Issue #17 — `ngl` and `ncmoe` on MoE models.** Partly dissolved: on a *hybrid*
+  MoE, `ngl` is now `[0, 99]` (#18) so the two no longer compete for the offload
+  axis. Still open for a dense-attention MoE, which this box does not have.
+- **Verify `draft-eagle3`.** Built and unit-tested, never run. Needs the PRISM
+  GGUF head; the base-matched specdrift heads are a different EAGLE3 flavour and
+  do not convert — see [`NEXT-SESSION.md`](NEXT-SESSION.md) for why, so nobody
+  spends an hour rediscovering it.
+- **`tg=0.00` with status `OK` at deep context.** Two rows measured `pp` fine and
+  never produced a decode number. `measured_ok` keeps it out of the picks, so
+  nothing is wrong in the report — but something did not measure and did not say
+  so, which is the defect class the rest of this list exists for. Free to
+  investigate.
 
 ## What this plan assumes
 

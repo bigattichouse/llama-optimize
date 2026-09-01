@@ -1,4 +1,4 @@
-# Handoff — open work as of 2026-09-01
+# Handoff — open work as of 2026-09-01 (evening)
 
 Working state at the end of the 2026-09-01 session. For what order to do the
 remaining work in and why, see [`PLAN.md`](PLAN.md). Unlike the other files in
@@ -6,324 +6,121 @@ remaining work in and why, see [`PLAN.md`](PLAN.md). Unlike the other files in
 up next, and should be pruned as items land. Durable reasoning belongs in the
 design docs it points at.
 
-Everything below is committed and pushed to `main` (through `63452e7`), the
-working tree is clean, and `--selftest` passes.
+Everything is committed and pushed to `main` (through `eb6ea85`, 41 commits this
+session), the working tree is clean, `--selftest` passes, and no GPU work is
+running.
 
-**A live sweep did run this session**, but only on CPU: gemma-3-270m through the
-server driver, two configs, to exercise the calibration probe and the new
-delivered-depth column end to end. The GPU is still another project's. Anything
-below marked "needs GPU" is genuinely unverified on hardware, not merely untested
-by convention.
+**Six issues closed: #11, #14, #15, #16, #18, #19.** Five open: #3, #5, #17, #20,
+#21.
 
 ## What landed
 
-**PR #10 / issue #9 — `-ncffn` dense FFN offload.** Merged in `e87f13a` with
-Fathi Boudra's commit cherry-picked intact, plus a fix: the pruner gate dropped
-`-ncffn` from the estimate when `llama-fit-params` predated the flag, which made
-every level share one cache key and one verdict computed for the *un-offloaded*
-config — silently deleting the whole factor on exactly the machines it exists
-for. Superseded the same day by `ffn_place` (below).
+Almost all of it came out of one field report (#11) and the questions that fell
+out of chasing it. Detail is in the CHANGELOG; the short version:
 
-**`ffn_place` (`2ed5873`)** — one dense placement column spanning `-ot` and
-`-ncffn`, because they are different axes (*which tensor* vs *how many layers*)
-and cannot be two OA columns: `-ncffn` appends to the same override vector `-ot`
-writes to, so `ffn_cpu` swallows every `first_N` level. Added a build-time
-invariant that an `emit` factor's levels must emit *distinct* arguments — it
-immediately caught a level spelled `up_cpu` that missed the `OT_PATTERNS` key,
-emitted nothing, and silently duplicated `none`.
+**Measurement validity.** The wall-clock check credits prefill from `prompt_ms`;
+each rep is screened against its own clock so one broken counter costs a rep
+rather than a configuration; chars-per-token is measured by a probe before the
+first prompt is sized, not after; `prompt_tok`, `cache_hit`, `rejected_reps` record
+what was *delivered* against what was asked for.
 
-**Free-VRAM preflight (`d422125`)** — the pruner compares against *total* VRAM;
-`list_devices` already parsed free per device and nothing read it. On a shared
-card that approves configs which abort in the allocator. Warns, never prunes.
+**Things that were assumed and are now measured.** `swa_full` swept on SWA models;
+`spec_type` swept when more than one speculative head exists; `repack`,
+`no_op_offload`, `no_host` swept instead of inheriting llama.cpp's defaults; the
+`ngl` grid narrowed by `llama-fit-params` and, on recurrent models, by a launch
+probe that asks *this box* which levels load.
 
-**Sweep cost (`71367e7`, `e2f50c9`, `5810272`, `eea04db`)** — `--timeout` became
-a per-config deadline (it was per-*request* on the server driver, allowing
-`(1+reps)×`), `--min-tgs`/`--min-pps` abandon slow configs by arithmetic, and
-`--levels` narrows every auto-generated factor together. A bare invocation on a
-TTY now interviews the user. See [`sweep-cost-design.md`](sweep-cost-design.md).
+**Bugs found by asking rather than assuming.** The OOM pruner priced the opposite
+KV placement from the one each row would run (~6 GB error, both directions). A
+supplied `--draft-model` was loaded and then ignored on MTP models. A *plain*
+draft model never speculated at all — loaded, charged to VRAM, silent. An EAGLE3
+head would have been run as `draft-simple`. The pasted command omitted `-md`
+entirely, so it could not reproduce the row above it.
 
-**Draft model (`1c69ad5`)** — `--draft-model` input, `-ngld` and `-ctkd`/`-ctvd`
-as factors present only with it. First increment of F2.
+**Crashes are read as data.** A level that failed in *every* one of its rows is
+reported as out of bounds and dropped from the next `--iterate` pass.
 
-**`--mmproj` and artifact pricing (`1099475`)** — a projector is an input too,
-and the pruner now prices both it and the draft model from their on-disk size
-scaled by per-row placement, rather than standing down. `llama-fit-params`
-rejects `-md` and `--mmproj`, so this is the only way those rows get pruned at
-all. A lower bound, deliberately: understating wastes time, overstating deletes
-configs that would have fit. Closed issue #13, and superseded the stand-down
-answer given on #12 earlier the same day.
-
-**Issue #11, in three commits (`b1170ed`, `032c153`, `63452e7`)** — the
-wall-clock check, then three defects the reporter's data exposed underneath it:
-per-rep rejection, prompts running at 2/3 of their stated depth, and four inert
-speculative columns sizing the array. Section 1 below has the detail. Verified on
-a CPU sweep as well as `--selftest`: delivered depth 1540/2565 tokens against
-1536/2560 requested, `cache_hit` 0.90 against a requested 0.90.
-
-**The defect class written down (`ff045dc`)** — five instances across four
-subsystems, generalised into [`DESIGN.md`](DESIGN.md), with the testing practices
-that catch it.
+**The report says what it is conditioned on:** quant, card, backend *and backend
+version*, capacity, cores, driver, profile.
 
 ## Do these first
 
-### 1. Issue #11 — closed
+### 1. `tg=0.00` with status `OK` at depth 16384 — free, and the right shape
 
-**Everything this issue produced has landed** (`b1170ed`, `032c153`, `63452e7`).
-Four defects, only the first of which the issue was filed about:
+Both rows of the last `fa` sweep did it: `pp` measured fine (88.7 / 98.0),
+`secs` 639–689, and decode never produced a number. `measured_ok` stops it
+poisoning a pick, so nothing is *wrong* in the report — but something silently did
+not measure, which is the defect class this whole session was about. Leading
+suspect is the per-config deadline (`slow_budget_secs`) cutting the reps at depth,
+which would mean deep-context rows quietly stop reporting decode. Investigable
+from `scratchpad/fadepth.csv` and the log; no GPU needed.
 
-- **I5 bounded a decode-only rate by a whole-request wall.** Fixed by crediting
-  the prefill from the same response's `prompt_ms`, capped at 90% of the wall.
-  See I5 in [`measurement-validity.md`](measurement-validity.md).
-- **A rejection was wider than its fault.** The check compared the *mean* rate
-  across reps to the *kindest* rep's ceiling, so one broken counter zeroed a
-  config that had good measurements in it. Reps are now screened individually,
-  survivors take the median, and `rejected_reps` records partial rejections.
-- **Server prompts ran at ~2/3 of their stated depth.** Chars-per-token was
-  measured from the warm request — after the prompts were built. A probe now runs
-  at session open and the ratio holds for the session; `prompt_tok` records what
-  the prompt became. [`constants-audit.md`](constants-audit.md) C-B.
-- **`--factor mtp=0` still swept four inert speculative knobs** — 25 runs of one
-  configuration, and a main-effects table crediting each knob with noise. New
-  `gated_by` relation, [`CONDITIONAL-FACTORS.md`](CONDITIONAL-FACTORS.md).
+### 2. Verify `draft-eagle3` end to end — waiting on a download
 
-**The two mysteries from the last handoff are both solved, and both guesses in
-it were wrong.**
+`--factor spec_type=draft-eagle3` and the draft-architecture mapping are built and
+unit-tested, but the path has never run. `wimmmm/Ex0bit-Qwen3.6-27B-PRISM-EAGLE3-GGUF`
+(Q8_0, 1.77 GB) is the only *ready* GGUF EAGLE3 head for a Qwen3.6-27B-family
+target; it was being downloaded and had not landed in `../gguf/` at session end.
 
-*The prompt cache not hitting* is not a context overrun. Their model is
-`general.architecture = qwen35` with `qwen35.ssm.*` metadata — hybrid
-SSM/attention — and llama.cpp cannot roll a recurrent state back to an arbitrary
-prefix, so it forces full re-processing unless a context checkpoint covers it
-(`tools/server/server-context.cpp`). Delivered reuse was 0% at depth 8192 too,
-where `n_ctx` had ~6k tokens to spare, which is what rules the overrun theory
-out. Prefix reuse is a property the model has or does not:
-[`workload-shape-design.md`](workload-shape-design.md).
+Caveat when it runs: that head targets the **Ex0bit PRISM fine-tune**, not base
+Qwen3.6-27B. Read weak acceptance as "wrong base model", and a layer-id abort as a
+dimension mismatch — neither is a tool bug.
 
-*`secs=113.4`, which "does not fit any story"*, fits the depth bug exactly. Their
-prose tokenizes at **6.05 chars/token** (measured with `llama-tokenize`), so the
-prompt was ~26,900 tokens, not 40,960. Four requests × (26.9k prefill at pp=1184
-+ 256 tokens at tg=45.6) = **113.3 s** against the recorded 113.36. Their second
-CSV agrees independently. No deadline cut anything short.
+**Do not retry the specdrift heads.** `Dogacel/specdrift-qwen3.6-27b-eagle3` is
+downloaded to `../model/specdrift-qwen3.6-27b-eagle3` and is **not convertible**:
+it is a different EAGLE3 flavour carrying `fcs.0/1/2.weight` (one fc projection per
+aux hidden-state layer) and a `t2d` map, where llama.cpp expects a single `fc` and
+only `d2t`. `convert_hf_to_gguf.py` stops at `Can not map tensor 'fcs.0.weight'`.
+Dimensions matched fine (5120, 24 heads, 4 KV, aux layers [3, 31, 59] against
+64–65 blocks); the topology does not.
 
-**The confirming run came back and settled both unknowns** (`mtp=0`,
-`n_depth=8192`, on `63452e7`):
+### 3. Re-measure `fa` properly (#20)
 
-- `cache_hit=0.0` with speculation off, at a depth with `n_ctx` to spare — so the
-  cache miss is the architecture, not the speculative path. Issue #15.
-- `tg=15.98`, `rejected_reps=0`, no discard — so the 333,362 t/s counter follows
-  MTP. A llama.cpp accounting problem in the speculative path, not ours; the
-  per-rep screening handles it by dropping the rep rather than the row.
-- `prompt_tok=16435` against 16,384 requested (**+0.3%**), where the old sizing
-  would have built 10,832 (66%). The calibration fix is confirmed on their model,
-  not just on gemma-3.
-- The row reconciles to 101.8s against a recorded `secs` of 102.89 (1.1%), with
-  a 0.3% spread across reps. Nothing unaccounted for.
+**The earlier "flash attention is 33% slower" finding was retracted** — it was a
+44 °C row against a 91 °C row with `--no-thermal-wait` on. Re-run hot and
+randomised it was 1.03x. See `constants-audit.md` C-A.
 
-Incidental, worth remembering: `mtp=1` measured 45.6 t/s at a *deeper* context
-against 16.0 with MTP off. Different depths, so a floor rather than a number —
-but MTP is earning its keep on this model.
+The question is therefore still open, and doing it right costs what cutting the
+corner saved: thermal settle **on**, more reps, and read `temp_c` before drawing
+anything. The `--factor fa=0,1` footgun is already fixed (quantized `kv_type`
+levels are dropped automatically, since `-fa off -ctk q8_0` cannot create a
+context). What remains is whether the pin itself is right, and the honest version
+needs a constrained relation between `fa` and `kv_type` rather than a level
+filter.
 
-**Spun out rather than left in this issue's tail**, so they do not die with it —
-same treatment as #14:
+### 4. The fingerprint (#21)
 
-- **Issue #15** — measured twice, and corrected twice. **The recurrent claim was
-  also wrong**: `qwen35moe` delivers 87% reuse at 4,002 tokens, 43.5% at 8,004 and
-  0% at 16,352, so recurrent memory reuses fine until some depth rather than never
-  ([`workload-shape-design.md`](workload-shape-design.md)). Depth is the variable
-  in both the SWA and the recurrent case; the architecture only decides which knob
-  moves it. **`--ctx-checkpoints` does not move it here either** — 0% at both 32
-  and 512, fresh server per variant — so SWA has `--swa-full` and recurrent has
-  nothing, and depth is the only lever. `cache_miss_advice` now branches on the
-  model's metadata and says the measured thing for each class. Earlier
-  correction, still standing: `--ctx-checkpoints` is *not* the lever (no effect at 0/32/128/512, nor
-  `--cache-ram`); **`--swa-full` is**, and it is now swept automatically on models
-  carrying `{arch}.attention.sliding_window`. The failure is also intermittent
-  rather than total — rep1 reuses, rep2 does not, once the window has scrolled
-  past the prefix — and depth decides whether it happens at all (the same model at
-  1,960 tokens reuses fine, which is why the first control saw nothing). **Still
-  open** for the recurrent half: hybrid models have no equivalent knob, and
-  whether `--swa-full` helps a hybrid's *attention* layers is untested because the
-  smallest such model here is 18 GB.
-- **~~Issue #18~~** — done (`7b4b052`). `-ngl 99` loads on a hybrid model, so it
-  is the split that aborts, not GPU use; the grid is now `[0, 99]` when
-  `ssm_state > 0`. Answered for **3.1 GiB** rather than the ~18 predicted, by
-  running the MoE at `-ngl 99 -ncmoe 40` — on an MoE the experts are most of the
-  weight, and `llama-fit-params` prices the whole `-ncmoe` curve without loading
-  anything. Worth reusing: that is the cheap way to plan any large-model run here.
+Most of it already exists — `device_label`, `backend_version`, `model_hw`,
+`cfg.hw` — so it is largely serialisation plus a schema version. JSON, because
+`--selftest` promises stdlib-only. It is also the only route to answering the
+questions this box cannot: every architecture-conditional behaviour found this
+session was measured on one card, one backend, one quant.
 
-  Side effect: on a hybrid MoE, `ngl` (now `0, 99`) stops competing with `ncmoe`
-  for the offload axis, which removes the confound **#17** was blocked on for that
-  model class.
-- **~~Issue #16~~** — done (`866e9e3`), and the fix is not the one the issue
-  proposed. Staging the `mtp` gate was measured first and rejected: eleven other
-  factors already force L125, so removing the four spec columns shrinks nothing
-  and a screen-plus-tune split would cost 150 runs instead of 125. What was real
-  was F1/F3, and `is_inert` fixes both without an executor. The transferable
-  finding is in [`CONDITIONAL-FACTORS.md`](CONDITIONAL-FACTORS.md): F2 is a claim
-  about a specific design, not a property of the shape — check it against
-  `choose_array` before paying for a staged executor.
+## Blocked, and on what
 
-**Still only written down here:**
+- **#20** — the interesting half needs a backend where FA is absent or slow.
+- **#17** — needs a dense-attention MoE. The hybrid MoE case dissolved when #18
+  collapsed `ngl` to `[0, 99]`, so the two no longer compete there.
+- **#5** — needs two non-identical GPUs.
+- **#3** — needs the reporter's original CSV, which may not exist.
 
-- **`TG_OVER_PP_LIMIT`.** The guard's comment claims "the honest ratio runs
-  10-100x in prefill's favour"; measured on CPU (gemma-3-270m, `-p 8192 -n 256`)
-  it is 11.7x at depth 0, **7.5x at 8192** and 7.3x at 32768. It flattens rather
-  than inverting, so the check never trips — but the margin on the deep-context
-  profile is thinner than the constant was reasoned from.
+## Owed by others
 
-### 2. The estimate/answer rule is now written down — apply it
+Issue #11's reporter still owes DFlash2-vs-MTP numbers on their box and how they
+invoke it, asked twice. Nothing depends on it. For the record, on this MI50 at 8k
+depth: `draft-mtp` 13.96 tg t/s, `dflash` 12.51, `none` 7.22 — with DFlash2 ahead
+on prefill (116 vs 94.7).
 
-Five instances across four subsystems, generalised into
-[`DESIGN.md`](DESIGN.md#be-wary-wherever-an-estimate-can-answer-a-different-question-than-the-one-asked)
-with the testing practices that actually catch it (property tests over the whole
-input set, mutation-testing the guard, asserting against a stub rather than
-against absence).
+## Small things noticed and not filed
 
-The refinement worth remembering, because the first answer was wrong: prefer a
-**conservative estimate** to no estimate wherever a bound exists — standing down
-admits every doomed config, a lower bound admits only some. Stand down only where
-no bound exists.
-
-Still open as a design question, not a bug: whether total-vs-free VRAM should
-become a blind condition in `fit_blind_flags` rather than a warning.
-
-### 3. Multi-GPU (issue #5) — the free-VRAM reading was a red herring
-
-Last session read 6672 MiB free of 24117 on the reporter's 3090 and concluded
-that 16.5 GB free against 36 GB total probably explained their "35B kept getting
-offloaded" report. [They have since corrected
-it](https://github.com/bigattichouse/llama-optimize/issues/5#issuecomment-5471917817):
-a model was loaded when they captured that output, and the box idles at about
-1 GiB used per card. Free is ~35 of 36 GB, and `headroom_warning` will never fire
-there.
-
-The single-device VRAM bug does not explain it either. `cfg.hw["vram"]` has
-exactly one consumer — `predict_fits` — so if the pruner had been active *and*
-misreading capacity, their forced `ngl=99` would have been pruned to `SKIP_PRED`
-along with everything else. It ran. The low-`ngl` rows were simply the default
-grid: `ngl_levels()` spans 0 → n_layers evenly and never consults VRAM, so a
-40-layer model that fits gets `[0, 10, 20, 30, 40]` and spends four levels below
-the answer. Filed as **issue #14**.
-
-Two corrections landed in `57ff8d7`. `ts_levels()` is now specified against
-per-device **total** VRAM — the checklist said *free*, reasoned entirely from
-that one transient reading, which on their box would have derived the tensor
-split from a number that was true for a minute. And `parse_fit_print`'s
-single-pool sum is now written down as a `-ts` prerequisite rather than an
-abstraction inside N2: it sums per-device footprints and compares against summed
-total, so a config can clear 36 GB and still overflow the 3060.
-
-`-sm`/`-ts` remain unimplemented; [`multi-gpu-design.md`](multi-gpu-design.md) is
-still the plan of record, and the device-order trap still needs their hardware.
-
-The transferable part: a device list is a reading of a moment, and the design
-treated it as a property of a machine. Anything derived from `free` inherits
-that, which is why free warns and total decides.
-
-### 4. ~~Issue #14~~ — done (`aa63d19`), and it spun out #17
-
-`ngl_levels` now spans the top quarter when `predict_fits` says every layer fits
-at the deepest depth and largest KV in the design; `ngl=0` survives every verdict
-because the verdict can be wrong, and `--no-oom-prune` restores the even span.
-Reasoning in [`sweep-cost-design.md`](sweep-cost-design.md), which also records
-the framing correction worth carrying: this was never "80% of a factor's levels
-wasted" — in an orthogonal array every row informs every factor. It cost wall
-clock and additivity.
-
-**Issue #17** is what fell out: on MoE models `ngl` and `ncmoe` both decide what
-lives on the CPU, and `ngl=0 × any ncmoe` is a cell where `ncmoe` cannot act yet
-still votes on its own main effect — the `--factor mtp=0` shape again. Wants a
-real MoE model before choosing between `gated_by`, a constrained pair, or letting
-`ncmoe` own the axis outright.
-
-**The ordering question this section used to pose is settled by having done it.**
-Step 8 (multi-GPU) is next on its own merits, and still needs hardware this
-project does not have.
-
-## The queued GPU run — done, and it closed three things
-
-Ran on `Qwen3.8-27B-UD-Q6_K_XL` (hybrid + MTP head), `--profile agents`,
-`n_depth=8192`, `ngl=99`, `--factor mtp=0,1`, reps 3:
-
-| `mtp` | pp t/s | **tg t/s** | draft_acc | cache_hit | prompt_tok | rejected_reps |
-|---|---|---|---|---|---|---|
-| 0 | 118.4 | **7.13** | — | 0.0 | 16,435 | 0 |
-| 1 | 93.7 | **15.12** | 0.699 | 0.0 | 16,435 | 0 |
-
-**MTP is worth 2.12x on decode here**, at a cost in prefill (118 -> 94 t/s) — the
-trade a draft head makes, now measured rather than assumed. `pp` is low in
-absolute terms because the reporter's config pins `-tb 1`, single-threaded
-prefill; each run took ~13 minutes for that reason.
-
-Three things it settled, two of them claims made without checking:
-
-- **Issue #11's 333,362 t/s counter did not reproduce.** `rejected_reps=0` at both
-  levels, no discard. So it is not inherent to MTP on this architecture — the
-  trigger is something else in that reporter's setup. The per-rep screening
-  handles it either way, which is why this was never a blocker.
-- **`cache_hit=0.0` at BOTH `mtp` levels**, so speculation was never involved in
-  their cache miss. That was asserted to the reporter; now verified on their
-  architecture with MTP actually present.
-- **`prompt_tok=16435` against 16,384 requested** (+0.3%) — the calibration fix
-  confirmed on the exact model that motivated it.
-
-Step 1 of this run (does `-ngl 99` load on a hybrid model?) had already been
-answered for 3.1 GiB via the MoE, using `-ncmoe 40` to keep the experts on CPU.
-`llama-fit-params` gives the whole VRAM curve without loading anything, which is
-the cheap way to plan any of these:
-
-| `-ncmoe` | predicted VRAM |
-|---|---|
-| 0 | 25.0 GiB |
-| 20 | 13.9 GiB |
-| 40 | **2.7 GiB** (measured 3.1) |
-
-## Also in flight## Also in flight
-
-- **Issue #19 — speculative type coverage.** Narrow half fixed (`d9d0d4b`): a
-  supplied `--draft-model` used to be loaded and then ignored, because the tool
-  forced `--spec-type draft-mtp` whenever the *target* carried a NextN head. So
-  `--draft-model dflash.gguf` ran MTP anyway — anyone checking the DFlash2 claim
-  through this tool would have measured MTP twice. llama.cpp infers the type from
-  the draft GGUF itself, and we now let it.
-
-  **The DFlash2 head is downloaded** —
-  `/home/bigattichouse/workspace/gguf/Qwen3.8-27B-DFlash2-Q4_K_M.gguf`, 1.1 GB,
-  from `z-lab/Qwen3.8-27B-DFlash2-GGUF`. It reports `general.architecture =
-  dflash`, `dflash.block_count = 5`, `dflash.target_layers = [6, 20, 34, 48, 62]`.
-  Note these ship as standalone GGUFs in their own repo, NOT as `dflash-` siblings
-  of the model — that convention is llama.cpp's `-hf` auto-download path and does
-  not apply here.
-
-  Remaining: a `spec_type` factor (levels `none` / `draft-mtp` / `draft-dflash`,
-  with `-md` emitted only for the levels that need it) so one sweep can compare
-  them. The MTP baseline to beat is **15.12 t/s** from the run above, same config.
-- **`Qwen3.6-35B-A3B` downloading** — the MoE test subject for #17, and the only
-  MoE anywhere on this box (checked: every local GGUF reports `expert_count = 0`,
-  and of the safetensors in `../model/` only this one is `qwen3_5_moe`). Expect it
-  to be hybrid SSM too, so #18 should be settled first or its partial-`ngl` crash
-  will confound the `ngl` x `ncmoe` question #17 is about.
-
-## Then
-
-- **Draft-model staging (F2 continued).** The staged screen from
-  [`draft-model-design.md`](draft-model-design.md) — screen `--spec-type`, then
-  tune the winner's placement — is not built; draft factors currently ride the
-  flat array. Also `-ncmoed` and the `draft-simple`/`draft-eagle3`/`draft-dflash`
-  spec types.
-- **Route 1 vs route 2 for MTP (needs GPU, ideally not ours).** Whether passing
-  `-md` with an already-embedded NextN head measurably differs from omitting it.
-  Now expressible; asked on issue #12 for anyone with the setup.
-- **Multimodal as a *workload*** — request shape, `--image-min-tokens`,
-  `-mmdev`, and embedding/rerank serving. Still out of scope, and still a
-  decision rather than an oversight ([`flag-coverage.md`](flag-coverage.md)).
-  The *validity* half is done: `--mmproj` is an input and its footprint is
-  priced (issue #13).
-- **Report time saved by the floors.** Nothing says, after a sweep, how much
-  `--min-tgs` actually bought. That number is the honest way to tune the advice.
-- **Issue #3** — fix shipped and retroactive; the upstream cause is still
-  unconfirmed. Leading hypothesis is now the tight-fit/total-VRAM interaction
-  (`ngl=20 -ncmoe 40` on an 8 GB card). Offered to close as "cause not confirmed"
-  if the reporter no longer has the CSV.
+- `spec_draft_ngl`/`spec_draft_kv` are emitted on rows with no draft model. Inert,
+  but it is the `gated_by` relation with a live set that static metadata cannot
+  express (any draft architecture).
+- `ctx_checkpoints`/`checkpoint_min_step` are registered and never swept. Measured
+  not to restore prefix reuse (#15); that is one question of several.
+- `load_mode` is pinned to `mmap` where llama.cpp's default is `auto`. The one
+  knob that is genuinely *not* free to sweep: `none` re-reads the model per launch,
+  so it slows every row rather than riding along.
 
 ## Traps worth remembering
 
@@ -342,6 +139,12 @@ the cheap way to plan any of these:
   kill by PID.
 - **Piping a long run into `tail` shows nothing until it exits.** stdout is block
   buffered through a pipe: run with `python3 -u` and redirect to a file.
+- **Never `pkill -f` a pattern that matches your own command line.** It kills the
+  shell running it (exit 144), and a broad `llama-server` pattern also kills other
+  people's servers on a shared box. Kill by PID, or by a port-specific pattern.
+- **`--no-thermal-wait` will hand you an artifact and call it a finding.** A cold
+  first row against a hot second one looked like a 33% effect. `temp_c` is in every
+  row; read it before believing a comparison.
 - **Metadata declares an architecture, not a file's contents.** Both
   `Qwen3.8-27B-UD-IQ4_XS` and the standalone `mtp-*.gguf` report
   `nextn_predict_layers = 1`; only the tensor list distinguishes them. Checking
