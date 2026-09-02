@@ -458,8 +458,13 @@ so it survives a crash — see below).
   Re-run hot and order-randomised, the difference was **1.03x** — nothing.
   Separately, an EAGLE3 draft head read as **+12%** against a baseline that
   happened to be measured 43 °C hotter — with the settle *enabled*, which is how
-  three separate bugs in it came to light. At matched temperature it was
-  **1.00x**. Read `temp_c` before believing any comparison.
+  three separate bugs in it came to light. At matched temperature that pairing
+  came out **1.00x**: one head, one target, one box, and emphatically *not* a
+  result about speculative decoding. The head drafted well (47% acceptance, 58%
+  coverage); the overhead simply cancelled the gain there. A different head, a
+  matched target, a faster card or a slower memory bus can all move it, which is
+  why `spec_type` is swept rather than pinned. Read `temp_c` before believing any
+  comparison — including that one.
 
 ---
 
