@@ -1765,6 +1765,11 @@ class Config:
     factors: dict = field(default_factory=dict)
     hw: dict = field(default_factory=dict)
     prefix_reuse: float = 1.0   # workload SHAPE: shared-prefix fraction (W-D1)
+    # workload CONTENT: an instruction at the prompt's tail, so the model
+    # generates the kind of thing the user actually asks it for. Speculative
+    # acceptance is a property of the OUTPUT, and without this the output is
+    # always more filler prose (issue #11).
+    task: str | None = None
     env_factor_names: set = field(default_factory=set)  # factors that set env vars
     # Throughput floors: a config below them is a real measurement the user has
     # said they do not want, so waiting for it to finish buys nothing (T1).
@@ -3764,9 +3769,80 @@ def _fill(n_chars: int, rnd) -> str:
     return "".join(out)[:max(0, n_chars)]
 
 
+# How a `--task` instruction is attached to the end of a generated prompt. A raw
+# completion has no chat structure, so the shape has to say "the filler is over,
+# answer this" on its own. Deliberately plain: it is an opinion about prompting
+# and a small one is easier to argue with than an elaborate one.
+TASK_TEMPLATE = "\n\n### Task\n{task}\n\n### Response\n"
+
+
+# Named workloads, expanded by `--task <name>`. These are EXAMPLES, not
+# standards: each one is an opinion about what "code" or "reasoning" output looks
+# like, and the opinion is visible in the prompt rather than buried in a table of
+# scores. The point is that speculative acceptance is a property of the generated
+# text, so a handful of representative shapes beats one prose default — and any
+# of them can be replaced by passing your own instruction instead.
+TASK_PRESETS = {
+    "code": "Write a complete, working program that plays tic-tac-toe against "
+            "the user on the command line. Include the full source.",
+    "code:sql": "Write the SQL for a reporting schema: tables for customers, "
+                "orders and line items, then a query returning each customer's "
+                "monthly spend for the last year with running totals.",
+    "code:js": "Write a single-file JavaScript module that implements a virtual "
+               "scrolling list: rendering only visible rows, recycling nodes, "
+               "and handling resize. Include the full source.",
+    "code:cpp": "Write a C++ header-only implementation of a lock-free "
+                "single-producer single-consumer ring buffer, with the memory "
+                "ordering justified in comments.",
+    "code:web": "Write a complete single-page web app — HTML, CSS and JS in one "
+                "file — that renders a sortable, filterable table of a few "
+                "hundred rows.",
+    "reasoning": "A train leaves station A at 14:05 travelling at 78 km/h. A "
+                 "second leaves station B, 340 km away, at 14:40 travelling at "
+                 "94 km/h toward A. Work out where and when they meet, showing "
+                 "every step, then check the answer a different way.",
+    "roleplay": "You're a bartender on a space station, telling a story about "
+                "your childhood on the planet below before first contact.",
+}
+
+
+def resolve_task(task: str | None) -> str | None:
+    """A preset name expands; anything else is used verbatim.
+
+    One flag rather than two, because `--task roleplay` and
+    `--task 'Implement chess in brainfuck'` are the same request at different
+    levels of specificity. A literal instruction that happens to equal a preset
+    name is the only ambiguity, and it is documented rather than defended
+    against."""
+    if task is None:
+        return None
+    return TASK_PRESETS.get(task.strip().lower(), task)
+
+
+def task_block(task: str | None) -> str:
+    """The instruction as it will appear at the tail of every prompt, or ""."""
+    task = (resolve_task(task) or "").strip()
+    return TASK_TEMPLATE.format(task=task) if task else ""
+
+
 def prompt_battery(n_tokens: int, count: int, reuse: float = 1.0,
-                   seed: int = 42, chars_per_token: float | None = None) -> list:
+                   seed: int = 42, chars_per_token: float | None = None,
+                   task: str | None = None) -> list:
     """`count` prompts of ~n_tokens tokens, sharing the first `reuse` fraction.
+
+    `task` puts an instruction at the TAIL of every prompt, and it is there for
+    a reason worth stating: speculative decoding drafts *output* tokens, so its
+    acceptance rate is a property of what the model GENERATES, not of what it
+    reads. Without a task the generation is a continuation of the filler — more
+    prose — so every speculative number the sweep produces is a statement about
+    prose. A reporter measuring real work saw 31 t/s where the sweep said 45
+    (issue #11).
+
+    Tail, not head, for two reasons: the depth axis needs the prompt to be a
+    specific length and an instruction is a dozen tokens, so the filler has to
+    carry the length; and long-context-then-instruction is the shape agent and
+    RAG traffic actually has. It also leaves the shared prefix intact, so
+    `reuse` still means what it meant.
 
     `reuse` is the workload's SHAPE, not a tunable: an agent stack with a fixed
     system prompt has ~90% shared prefix whether or not that is convenient, and
@@ -3779,9 +3855,16 @@ def prompt_battery(n_tokens: int, count: int, reuse: float = 1.0,
     nothing while looking like it should (W-D3). Suffixes are drawn from the
     category banks so the varying part is varied prose rather than a counter,
     which matters because speculation feeds on how predictable text is."""
-    n_chars = int(max(1, n_tokens) * (chars_per_token or CHARS_PER_TOKEN))
+    tail = task_block(task)
+    # the instruction is part of the prompt's length, not extra on top of it,
+    # so a row labelled n_depth=8192 still sends ~8192 tokens
+    total_chars = int(max(1, n_tokens) * (chars_per_token or CHARS_PER_TOKEN))
+    n_chars = max(1, total_chars - len(tail))
     reuse = min(1.0, max(0.0, reuse))
-    n_shared = int(n_chars * reuse)
+    # the shared fraction is of the WHOLE prompt, not of the filler: asking for
+    # 90% reuse and being handed 84% because the tail was subtracted first would
+    # make `reuse` mean something different with a task than without one
+    n_shared = min(n_chars, int(total_chars * reuse))
     rnd = random.Random(seed)
     # the shared part is generated once, from its own stream, so it is identical
     # across requests no matter how many suffixes follow it
@@ -3789,11 +3872,12 @@ def prompt_battery(n_tokens: int, count: int, reuse: float = 1.0,
     out = []
     for i in range(max(1, count)):
         if n_shared >= n_chars:
-            out.append(shared[:n_chars])       # fully shared: identical requests
+            out.append(shared[:n_chars] + tail)   # fully shared: identical requests
             continue
         # a per-request stream: suffixes differ from each other AND are varied
         # prose internally, which is the part that took a measurement to get right
-        out.append(shared + _fill(n_chars - n_shared, random.Random(seed + 1 + i)))
+        out.append(shared + _fill(n_chars - n_shared, random.Random(seed + 1 + i))
+                   + tail)
     return out
 
 
@@ -4287,7 +4371,8 @@ class ServerSession:
         # rather than from the second (docs/constants-audit.md C-B, issue #11).
         self.calibrate(_left(timeout, deadline))
         prompts = prompt_battery(prompt_len, n_req, reuse,
-                                 chars_per_token=getattr(self, "cpt", None))
+                                 chars_per_token=getattr(self, "cpt", None),
+                                 task=getattr(self.cfg, "task", None))
         self.last_reuse = achieved_reuse(prompts)
         prompt = prompts[0]
         n_err = 0
@@ -4897,9 +4982,13 @@ def result_scope(cfg: Config) -> str:
                  else f"{src} ({vram} MiB)")
     else:
         where = src or (f"{vram} MiB VRAM" if vram else "this machine")
+    # The workload is part of the scope, not a footnote: speculative acceptance
+    # is a property of the generated text, so two sweeps with different tasks
+    # measured different things and their numbers do not compare.
+    work = f", task {cfg.task!r}" if getattr(cfg, "task", None) else ""
     return (f"For {cfg.model.name}, on {where}, "
             f"{cfg.hw.get('phys', '?')} physical cores, "
-            f"{cfg.driver} driver, {cfg.profile} profile — we find:")
+            f"{cfg.driver} driver, {cfg.profile} profile{work} — we find:")
 
 
 def report(cfg: Config, rows: list[dict], probe: dict | None = None):
@@ -7812,6 +7901,44 @@ def selftest() -> bool:
         assert prompt_tokens_of({"prompt_n": 8192}) == 8192
         assert prompt_tokens_of({}) == 0
 
+        # --- --task: measure on the content the user actually generates ---
+        # Speculative decoding drafts OUTPUT tokens, so acceptance is a property
+        # of what the model writes. Without a task the generation is a
+        # continuation of the filler -- more prose -- so every speculative number
+        # describes prose. A reporter measuring real work saw 31 t/s where the
+        # sweep said 45 (issue #11). Verified against gemma-3-270m, the weakest
+        # model here: with `--task code:sql` after 2000 tokens of filler it emits
+        # SQL; without one it continues the prose.
+        _tp = prompt_battery(200, 3, 0.9, task="Do the thing.")
+        assert all(p.endswith(task_block("Do the thing.")) for p in _tp), _tp[0][-40:]
+        # the tail is INSIDE the requested length, so a depth label stays honest
+        assert len(_tp[0]) == len(prompt_battery(200, 3, 0.9)[0]), \
+            (len(_tp[0]), len(prompt_battery(200, 3, 0.9)[0]))
+        # ...and `reuse` means the same with a task as without one: the shared
+        # fraction is of the whole prompt, not of the filler left after the tail
+        assert abs(achieved_reuse(_tp) - 0.9) < 0.02, achieved_reuse(_tp)
+        assert abs(achieved_reuse(prompt_battery(8192, 3, 0.9, task="x")) - 0.9) < 0.02
+
+        # reuse 1.0 takes the identical-prompts branch, which is a separate code
+        # path and dropped the tail: at full reuse every request would have been
+        # filler again, silently, on exactly the profile that asks for it
+        _tp1 = prompt_battery(200, 3, 1.0, task="Do the thing.")
+        assert all(p.endswith(task_block("Do the thing.")) for p in _tp1), _tp1[0][-40:]
+        assert len(set(_tp1)) == 1, "reuse 1.0 must still be identical requests"
+
+        # a preset expands, anything else is used verbatim, and None stays None
+        assert resolve_task("roleplay") == TASK_PRESETS["roleplay"]
+        assert resolve_task("code:sql") == TASK_PRESETS["code:sql"]
+        assert resolve_task("  ROLEPLAY ") == TASK_PRESETS["roleplay"]   # forgiving
+        assert resolve_task("Implement chess in brainfuck") \
+            == "Implement chess in brainfuck"
+        assert resolve_task(None) is None
+        assert task_block(None) == "" and task_block("   ") == ""
+        # every preset says what to DO -- a corpus in the prompt would change
+        # prefill and leave the output as prose, which is the whole failure mode
+        for _name, _txt in TASK_PRESETS.items():
+            assert len(_txt) > 40, _name
+
         # delivered cache hit: what the server reused, not what we asked for
         assert delivered_cache_hit([{"cache_n": 7373, "prompt_n": 819}]) == 0.9
         assert delivered_cache_hit([{"cache_n": 0, "prompt_n": 8192}]) == 0.0
@@ -8780,7 +8907,7 @@ RESULT_COLS = {"run_id", "pp_tps", "tg_tps", "eff_tps", "status", "secs",
                "temp_c", "vram_mib", "implausible", "draft_acc", "spec_off",
                "tool_version", "llama_build", "backend", "err_rate", "reuse",
                "draft_cov", "kv_unified", "too_slow", "cache_hit",
-               "prompt_tok", "rejected_reps"}
+               "prompt_tok", "rejected_reps", "task"}
 
 
 def merge_result_rows(cfg: Config, rows: list[dict],
@@ -9507,6 +9634,15 @@ def main():
                     help="disable the default 'wait and watch' settle that pauses "
                          "between runs until GPU temp returns near its idle "
                          "baseline (keeps measurements thermally comparable)")
+    ap.add_argument("--task", default=None, metavar="TEXT",
+                    help="an instruction appended to every prompt, so the model "
+                         "GENERATES the kind of content you care about. Either "
+                         "your own text (--task 'Implement chess in brainfuck') "
+                         "or a preset: " + ", ".join(sorted(TASK_PRESETS)) + ". "
+                         "Speculative decoding drafts output tokens, so its "
+                         "measured benefit depends on what is generated — "
+                         "without this the output is filler prose and the "
+                         "numbers describe prose. Server driver only")
     ap.add_argument("--prefix-reuse", type=float, default=None, metavar="PCT",
                     help="workload SHAPE: percent of each prompt that is a "
                          "prefix shared across requests (0-100). Describes your "
@@ -9757,6 +9893,7 @@ def main():
         emit_mtp=not args.no_mtp,
         # request shape, from the profile unless --prefix-reuse says otherwise
         prefix_reuse=prefix_reuse,
+        task=args.task,
         ngram=args.ngram,
         ngram_type=args.ngram_type,
         ngram_keep=args.ngram_keep,
@@ -9841,6 +9978,14 @@ def main():
             ap.error(f"--env expects NAME=v1,v2,... (got '{spec}')")
         cfg.factors[name] = levels
         cfg.env_factor_names.add(name)
+
+    # --task shapes the prompt text, and llama-bench does not take one: it is
+    # given token COUNTS (-p/-n) and generates its own. Accepting it there would
+    # silently measure something else (the same shape as DM2 below).
+    if args.task and cfg.driver != "server":
+        ap.error("--task needs the server driver (llama-bench generates its own "
+                 "prompts from token counts): add --driver server, or a "
+                 "--use-case that implies it")
 
     # DM2: a draft model is a server-driver concept. llama-bench cannot speculate
     # at all, so accepting it there would emit a flag the binary rejects — or,
@@ -10037,6 +10182,11 @@ def main():
                 "CHANGELOG" if cfg.prefix_reuse >= 1.0 else
                 "  (set --prefix-reuse to match your traffic)")
         print(f"workload   : {shape}{warn}")
+        if cfg.task:
+            _t = resolve_task(cfg.task)
+            print(f"task       : {_t[:88] + ('...' if len(_t) > 88 else '')}")
+            print("             (the model GENERATES this kind of content — "
+                  "speculative results depend on it)")
     print("objective  : " + ("eff (effective t/s: blends pp + tg)"
                              if cfg.score == "eff" else
                              "tg (generation t/s; pp reported, not scored)"))
@@ -10151,6 +10301,7 @@ def main():
             # why a row was rejected, on the row. It costs one mostly-empty
             # column and it is the difference between a bug report that can be
             # decided on sight and one that takes five round trips (issue #11).
+            + (["task"] if cfg.task else [])
             + ["implausible", "tool_version", "llama_build"])
 
     # Resume keys on run_id (unique per array row), not config values, because
@@ -10179,6 +10330,11 @@ def main():
     # question it must answer later — "what produced this?" — travels with it.
     stamp = {"tool_version": __version__,
              "llama_build": llama_build(cfg.llama_server, cfg.llama_bench)}
+    if cfg.task:
+        # constant across the sweep, like the version stamps, and recorded for
+        # the same reason: a CSV outlives its terminal and the question it has
+        # to answer later includes "what was it generating?"
+        stamp["task"] = cfg.task
 
     fresh = not (args.resume and args.results.exists())
     fh = open(args.results, "w" if fresh else "a", newline="")

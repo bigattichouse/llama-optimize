@@ -1004,6 +1004,16 @@ python3 llama-optimize.py model-UD.gguf --run --driver server \
   **Affects existing results** section per release: when a fix changes what past
   measurements *mean*, it says so and whether to re-run. Results CSVs are stamped
   with `tool_version` and `llama_build` so a file can be matched against it later.
+- **Describe your *work* with `--task`** — an instruction appended to every
+  prompt, so the model **generates** the kind of content you care about. This
+  matters most for speculative decoding, which drafts *output* tokens: without a
+  task the generation is a continuation of filler prose, so the numbers describe
+  prose. A reporter measuring real work saw 31 t/s where the sweep said 45.
+  Either your own text (`--task 'Implement chess in brainfuck'`) or a preset —
+  `code`, `code:sql`, `code:js`, `code:cpp`, `code:web`, `reasoning`, `roleplay`.
+  The presets are examples, not standards; the task is recorded in the CSV and
+  printed with the results, because two sweeps with different tasks measured
+  different things. Server driver only.
 - **Describe your traffic with `--prefix-reuse`** — how much of each prompt is a
   prefix shared across requests (0–100). It is an input, not a tuned knob: an
   agent stack with a fixed system prompt sits near 90, independent requests at 0.

@@ -439,6 +439,77 @@ Consequences:
   clear the rejection. It was never going to: the delivered reuse was 0 either
   way, so the reps re-prefilled and the wall clock stayed mostly prefill.
 
+## Shape is not the only input — content is one too (`--task`)
+
+`--prefix-reuse` describes how requests relate to *each other*. It says nothing
+about what the model is asked to produce, and for speculative decoding that is
+the term that matters: **speculation drafts output tokens, so acceptance is a
+property of what the model GENERATES.**
+
+Without a task the prompt is filler prose and `n_gen` is a continuation of it, so
+every speculative number the sweep has ever produced is a statement about prose.
+Issue #11's reporter measured their real workload and found the gap:
+
+| | tg t/s |
+|---|---|
+| what the sweep reported | 45 |
+| what they got on `Implement chess in brainfuck` | 31 |
+
+Both measured the same model on the same box. They measured different work.
+
+`--task` puts an instruction at the **tail** of every prompt. Tail rather than
+head for three reasons: the depth axis needs the prompt to be a specific length
+and an instruction is a dozen tokens, so the filler must carry the length;
+long-context-then-instruction is the shape agent and RAG traffic actually has;
+and it leaves the shared prefix intact, so `reuse` still means what it meant.
+
+Two properties worth keeping true, both tested:
+
+- **The tail is inside the requested length**, not added on top, so a row labelled
+  `n_depth=8192` still sends ~8192 tokens.
+- **`reuse` is a fraction of the whole prompt**, not of the filler left after the
+  tail is subtracted — otherwise asking for 90% and being handed 84% would make
+  the same flag mean two different things depending on whether a task was set.
+
+### It works on the weakest model available
+
+The design risk was that a model would ignore a short instruction sitting after
+thousands of tokens of unrelated prose. Measured on gemma-3-270m — 270M
+parameters, the smallest thing here — after 2000 tokens of filler:
+
+| | first output tokens |
+|---|---|
+| no task | `ueded a rounding convention in a footnote. a monsoon front quietly abandoned…` |
+| `--task code:sql` | `` ```sql SELECT customer_id, SUM(order_total) AS monthly_spend…`` `` |
+| `--task roleplay` | `The station's automated systems are running smoothly. The weather is clear…` |
+
+### Self-similar content is not contamination
+
+`_fill` generates *varied* prose because identical prompts across reps drove
+n-gram acceptance to 100% — a measurement artifact (F4). Code is genuinely
+self-similar: indentation, boilerplate, repeated identifiers. **A code workload
+will raise n-gram numbers and that is correct**, because real code generation
+really is more predictable than random prose. The two look alike and are not the
+same thing, and this is written down so nobody "fixes" it back.
+
+### The presets are examples, not standards
+
+`code`, `code:sql`, `code:js`, `code:cpp`, `code:web`, `reasoning`, `roleplay`.
+Each is an opinion about what that kind of output looks like, kept visible in the
+prompt rather than buried in a scoring table, and each is replaceable by passing
+your own instruction. The task is recorded in the results CSV and printed in the
+report's scope line, because two sweeps with different tasks measured different
+things and their numbers do not compare.
+
+### Still unmeasured, and possibly larger
+
+Sampling. The tool sends `temperature: 0`; the reporter's command used
+`--temp 1.0 --top-p 0.95 --top-k 20`. Greedy output is more predictable, so temp 0
+should *inflate* acceptance — plausibly a large part of the same 45-vs-31 gap and
+entirely independent of content. The tool also sends a raw completion where their
+run used `--jinja` with a chat template and a reasoning format. Neither has been
+measured; both are cheap to test and neither needs new machinery.
+
 ## Open questions
 
 1. Is `--prefix-reuse` per-request-shape enough, or does arrival pattern (bursty

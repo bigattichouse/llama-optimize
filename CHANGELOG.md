@@ -294,6 +294,27 @@ earlier.
 
 ### Added
 
+- **`--task`: measure on the content you actually generate.** [Issue #11]'s
+  reporter saw 31 t/s on real work where the sweep reported 45 — same model, same
+  box, different work. Speculative decoding drafts *output* tokens, so its
+  acceptance is a property of what the model generates, and without a task the
+  generation is a continuation of filler prose. Every speculative number the tool
+  has produced is therefore a statement about prose.
+
+  `--task` appends an instruction to the tail of every prompt: your own text, or
+  a preset (`code`, `code:sql`, `code:js`, `code:cpp`, `code:web`, `reasoning`,
+  `roleplay`). Tail rather than head because the depth axis needs the filler to
+  carry the length, because long-context-then-instruction is the shape agent and
+  RAG traffic has, and because it leaves the shared prefix — and therefore
+  `--prefix-reuse` — meaning what it meant. The tail counts *inside* the
+  requested length, so a row labelled `n_depth=8192` still sends ~8192 tokens.
+
+  Verified on gemma-3-270m, the weakest model available: after 2000 tokens of
+  filler, `--task code:sql` produces SQL and `--task roleplay` produces
+  narrative, where no task produces more filler. The task is recorded in the
+  results CSV and printed in the report's scope line, since two sweeps with
+  different tasks did not measure the same thing.
+
 - **`ngram-cache` is reachable at last**, via `--ngram-type ngram-cache` or
   `--factor ngram=ngram-cache` — the last of llama.cpp's eleven `--spec-type`
   values the tool could not express. Not in the default screen, and that is a
