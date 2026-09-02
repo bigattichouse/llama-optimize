@@ -92,6 +92,32 @@ earlier.
   `--verify-picks` already applied to its own re-measurements; no re-run is
   needed for it alone.
 
+### Added
+
+- **`--thermal-mode warm` (now the default)** preheats each config with its own
+  workload until the GPU stops heating, then measures it at that steady state.
+  That is the **sustained** rate — what a deployment gets from a card that is
+  already hot, throttling included. `--thermal-mode idle` keeps the previous
+  settle-to-baseline behaviour, which measures **burst** performance and is the
+  right question for a bursty agent workload. `--no-thermal-wait` disables both.
+
+  Warm means "at its own steady state", not "still hot from the last run" — the
+  latter is the confound that produced rows at 44 °C and 87 °C. Preheating under
+  the config's own load defines the state by the config rather than by its
+  neighbour. Different configs plateau at different temperatures, and that is the
+  honest answer: one that heats harder really does throttle harder.
+
+  Plateau detection is a rolling **window**, not a step-to-step comparison, which
+  was measured rather than assumed: an MI50 holding steady under load oscillates
+  99↔100 °C, so a 0.5 °C step test resets on every other poll and never
+  converges — the preheat ran to its cap while sitting at the steady state it was
+  waiting for.
+
+  Warm costs less wall-clock than it replaces: no idle baseline to establish and
+  no cooldown between runs.
+
+- **`--thermal-cap SECS`** bounds the idle-mode settle (default 600).
+
 ### Fixed
 
 - **The thermal settle had three ways of silently not settling**, all found by

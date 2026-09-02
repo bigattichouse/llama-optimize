@@ -4758,9 +4758,15 @@ class ServerSession:
                     except (urllib.error.URLError, OSError,
                             json.JSONDecodeError):
                         pass
+                # Never more than a third of what is left. The preheat spends
+                # the SAME budget the measurement needs, and bounding it by the
+                # whole remainder let it eat the lot: the max-context probe
+                # preheated for its full cap and then recorded TIMEOUT, "the
+                # budget expired before any rep finished". A preheat that
+                # starves the measurement has inverted its own purpose.
                 got = run_until_warm(
                     _heat, cap_s=min(THERMAL_WARMUP_CAP_S,
-                                     max(0.0, _left(timeout, deadline))))
+                                     max(0.0, _left(timeout, deadline)) / 3.0))
                 if got:
                     self.last_warm = got
                     if got[0] == "cap":
@@ -8763,6 +8769,32 @@ def selftest() -> bool:
                     measure_in_session(fake_cfg, {"n_depth": "8192"}, sess, 30)
                 assert len(seen) > 2, seen          # warm + preheat + rep
                 assert seen[1] == seen[0], "preheat must reuse the real request"
+                # The preheat spends the SAME budget the measurement needs, so
+                # it may never claim all of it. Bounding it by the whole
+                # remainder let it eat the lot: the max-context probe preheated
+                # for its full cap and then recorded TIMEOUT, "the budget
+                # expired before any rep finished" -- a preheat that starves
+                # the measurement has inverted its own purpose.
+                # The preheat spends the SAME budget the measurement needs, so
+                # it must never be handed all of it. Bounding it by the whole
+                # remainder let it eat the lot: the max-context probe preheated
+                # to its cap and then recorded TIMEOUT, "the budget expired
+                # before any rep finished" — a preheat that starves the
+                # measurement has inverted its own purpose. Asserted on the cap
+                # actually passed, because the failure needs a deadline and
+                # measure_in_session's callers are what supply one.
+                seen.clear()
+                _caps, _real_warm = [], run_until_warm
+                try:
+                    globals()["run_until_warm"] = (
+                        lambda work, cap_s=None, **kw: (_caps.append(cap_s),
+                                                        ("warm", 99.0))[1])
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        measure_in_session(fake_cfg, {"n_depth": "8192"}, sess, 30)
+                finally:
+                    globals()["run_until_warm"] = _real_warm
+                assert _caps and _caps[0] < 30.0 * 0.9, _caps
+                assert _caps[0] <= THERMAL_WARMUP_CAP_S, _caps
             finally:
                 globals()["gpu_temp_c"] = _real_gt
 
