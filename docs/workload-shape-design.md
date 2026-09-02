@@ -538,6 +538,22 @@ task       : none — the model continues filler prose at temp 0.0.
 and the setup interview asks for the workload **first**, listing the presets with
 their temperatures, because it is the question whose default is most misleading.
 
+**Ask and announce, rather than picking one.** Defaulting to `code` was the
+obvious alternative and is deliberately not what happens. Two reasons, and the
+second is the one that would bite:
+
+- A default task is still an opinion, just a louder one. `code` is no more
+  representative of an arbitrary user than prose is; it is only more
+  representative of *some* users, and the tool cannot tell which.
+- It would silently move every number the tool has produced. A result recorded
+  last week and one recorded today would differ for a reason absent from both
+  CSVs. Changing it is expressible — it wants an **Affects existing results**
+  entry and a `task` column, both of which now exist — but it is a release
+  decision, not a default that should drift in.
+
+So: the interactive path asks, the non-interactive path says what it is doing and
+how to change it, and neither pretends prose was a considered choice.
+
 ## Open questions
 
 1. Is `--prefix-reuse` per-request-shape enough, or does arrival pattern (bursty
