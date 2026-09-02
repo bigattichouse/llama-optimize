@@ -120,6 +120,24 @@ earlier.
 
 ### Fixed
 
+- **A deep prompt of filler alone silently stopped measuring decode**, and the
+  row said `0 t/s` without saying why. Root-caused on `Qwen3.6-35B-A3B`
+  (MI50 32GB / ROCm) by reading the server's counters: at 13,058 tokens of
+  repeated filler the model returns `predicted_n=1`, `stop_type=eos` and empty
+  content, with `truncated=0` — it emits **EOS as its first token**, having
+  decided the document is finished. The same prompt with a `--task` block
+  appended generates its full 128 tokens at 26.1 t/s.
+
+  `ended_at_eos` now names that case specifically and points at `--task`,
+  because the two ways to get no rate need opposite responses: a slow config or
+  a broken counter is a tuning problem, while a model that considers the prompt
+  over is a prompt problem no amount of retuning `ubatch` will fix.
+
+  Ruled out and recorded so they are not re-suspected: the per-config deadline
+  (`secs` 639 against a 1200 s budget, `err_rate=0.0`, `rejected_reps=0`), and
+  the tool's own deep prompt construction (the same sweep shape at
+  `n_depth=16384` on gemma-3-270m, CPU-only, measured 53.9 tg t/s).
+
 - **`temp_c` recorded the temperature *before* the run, not the one it ran at.**
   Harmless until warm mode, which puts a preheat in between: a validation sweep
   recorded 45 °C and 89 °C for two rows that both measured at the ~99 °C plateau.

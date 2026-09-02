@@ -253,6 +253,44 @@ when it fails is indistinguishable from a guard that works, and all three of
 these failed silently for as long as they existed. A settle that gives up now
 says so, naming the temperature it gave up at.
 
+### A deep prompt of filler alone stops measuring decode
+
+`tg=0.00` with `status=OK` on both deep rows of an `fa` sweep — `pp` fine,
+`err_rate=0.0`, `rejected_reps=0`, `secs` 639 against a 1200 s budget. Every rep
+returned successfully and reported nothing.
+
+Bracketed rather than guessed, on `Qwen3.6-35B-A3B` (MI50 32GB / ROCm, llama.cpp
+`6c84c7d5d`), reading the server's own counters:
+
+| prompt | `prompt_n` | `predicted_n` | `stop_type` | rate |
+|---|---|---|---|---|
+| filler, shallow | 2,347 | 128 | `limit` | 27.1 t/s |
+| filler, deep | 13,058 | **1** | **`eos`** | 0.00 |
+| filler, deep **+ task block** | 15,401 (cached) | 128 | `limit` | 26.1 t/s |
+
+**The model emits EOS as its first token.** `truncated = 0`, so it is not context
+overflow, and the deadline is not involved. Given thousands of tokens of repeated
+filler and no instruction, the model decides the document is finished — which is
+a reasonable thing for it to do. The row was honest; there was genuinely no
+decode to measure.
+
+Two consequences:
+
+- **`--task` is not only about content realism, it is what keeps deep rows
+  measurable.** Ending the prompt with an instruction restores full generation at
+  the same depth, in the same context. Sweeps predating `--task` are the ones
+  exposed.
+- **The diagnosis has to be specific, because the responses are opposite.** A
+  config that is slow, or whose counter is broken, is a tuning problem. A model
+  that has decided the prompt is over is a *prompt* problem, and no amount of
+  retuning `ubatch` touches it. `ended_at_eos` separates them and names `--task`
+  in the message.
+
+Ruled out along the way, and worth recording so they are not re-suspected: the
+per-config deadline (`secs` well inside budget, no rep cut short), and the tool's
+deep prompt construction — the same sweep shape at `n_depth=16384` on
+`gemma-3-270m-it-Q8_0`, CPU-only, measured 53.9 tg t/s.
+
 ### Warm is the default, because that is where inference runs
 
 Fixing the settle raised a better question: *should the tool be cooling the card

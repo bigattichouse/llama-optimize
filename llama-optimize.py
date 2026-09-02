@@ -4843,7 +4843,8 @@ class ServerSession:
                              if cut_short else
                              "no rep returned a decode measurement")
             elif kept and tg <= 0:
-                no_result = "every rep that survived reported 0 t/s"
+                no_result = ended_at_eos(timings) or (
+                    "every rep that survived reported 0 t/s")
             return {"pp": pp, "tg": tg, "no_result": no_result,
                     # Only when NOTHING survived is the configuration itself
                     # unmeasurable; the reason is then built from the reps that
@@ -4978,6 +4979,31 @@ def read_journal(path: Path):
             except json.JSONDecodeError:
                 tried_run[p[2]] = {}
     return tried_load, ok_load, tried_run
+
+
+def ended_at_eos(timings: list) -> str | None:
+    """Did the model stop immediately rather than generate? Returns a reason.
+
+    Distinguishes the two ways a row reports no decode rate, because they need
+    opposite responses from the user. A config that is too slow, or whose
+    counter is broken, is a *tuning* problem. A model that emits EOS as its
+    first token has decided the prompt is finished — a *prompt* problem, and no
+    amount of retuning `ubatch` will fix it.
+
+    Measured on `Qwen3.6-35B-A3B` (MI50 32GB / ROCm): at a 2,347-token prompt of
+    repeated filler the model generated its full 128 tokens, and at 13,058
+    tokens of the same filler it returned `predicted_n=1`, `stop_type=eos`,
+    empty content, with `truncated=0` — so it is not context overflow. Deep
+    prompts made only of filler give the model nothing to continue, and it says
+    so. A `--task` block ends the prompt with an instruction instead."""
+    if not timings:
+        return None
+    decoded = [t.get("predicted_n", 0) or 0 for t in timings]
+    if any(n > 1 for n in decoded):
+        return None
+    return ("the model emitted EOS as its first token — the prompt gave it "
+            "nothing to continue, which deep prompts of filler alone tend to "
+            "do. Add --task to end the prompt with an instruction")
 
 
 def measure_in_session(cfg: Config, f: dict, session, timeout: int) -> dict:
@@ -8699,7 +8725,7 @@ def selftest() -> bool:
                 return {"content": "",
                         "timings": {"prompt_per_second": 444.1,
                                     "predicted_per_second": 0.0,
-                                    "predicted_n": 0, "prompt_n": 8192,
+                                    "predicted_n": 64, "prompt_n": 8192,
                                     "cache_n": 0}}
 
             globals()["_completion"] = _zero_rate
@@ -8708,6 +8734,30 @@ def selftest() -> bool:
                 r_z = measure_in_session(_slow_cfg, {"n_depth": "8192"}, sess, 30)
             assert r_z["status"] != "OK", r_z
             assert "0 t/s" in _buf_z.getvalue(), _buf_z.getvalue()
+
+            # ...and a model that stops at EOS on its FIRST token is a third
+            # thing, needing the opposite response from the user: no amount of
+            # retuning fixes a prompt the model considers finished. Measured on
+            # Qwen3.6-35B-A3B (MI50/ROCm): 128 tokens generated at a 2,347-token
+            # filler prompt, predicted_n=1 and stop_type=eos at 13,058 tokens of
+            # the same filler, truncated=0 -- so not context overflow.
+            def _eos_first(port, prompt, n_gen, timeout, cache=False, **_kw):
+                return {"content": "",
+                        "timings": {"prompt_per_second": 444.1,
+                                    "predicted_per_second": 0.0,
+                                    "predicted_n": 1, "prompt_n": 16384,
+                                    "cache_n": 0}}
+
+            globals()["_completion"] = _eos_first
+            _buf_e = io.StringIO()
+            with contextlib.redirect_stdout(_buf_e):
+                r_e = measure_in_session(_slow_cfg, {"n_depth": "16384"}, sess, 30)
+            assert r_e["status"] != "OK", r_e
+            assert "--task" in _buf_e.getvalue(), _buf_e.getvalue()
+            # the two diagnoses must not be confused for one another
+            assert ended_at_eos([{"predicted_n": 1}, {"predicted_n": 1}])
+            assert ended_at_eos([{"predicted_n": 64}]) is None
+            assert ended_at_eos([]) is None
 
                 # ...and it stays out of the main effects two ways over: by not
             # being OK, and -- for a CSV recorded before that was fixed, where
