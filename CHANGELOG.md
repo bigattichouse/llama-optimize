@@ -137,6 +137,20 @@ earlier.
 - **The recommended `-c` could exceed the context the sweep ever loaded.** It was
   derived from the requested depth; it is now capped by the delivered one.
 
+- **A draft head combined with `--ngram` loaded and then did nothing.** Reported
+  from the field on [issue #11] with the command that works:
+  `--spec-type draft-dflash,ngram-mod -md <head>`. Ours emitted
+  `-md <head> --spec-type ngram-mod` — and naming *any* type makes llama.cpp's
+  `spec_types_is_default()` false, so `common_speculative_types_from_gguf()` is
+  never consulted. The head loaded, cost VRAM, and only ngram drafted; a sweep
+  would have measured ngram and labelled it DFlash2.
+
+  The draft's own type is now named whenever anything else will be, and merged
+  into one flag. Doing that safely needed an exact DFlash-vs-DSpark distinction,
+  so the GGUF reader carries its single pass one block further and reads tensor
+  names — llama.cpp tells them apart by `markov_w1.weight` and now so do we.
+  When the draft is alone, the inference is still left to llama.cpp.
+
 - **An EAGLE3 draft head would have run as the wrong kind of drafter.** llama.cpp
   implements EAGLE3 in full — encoder, decoder, target-layer hidden-state
   extraction — but `common_speculative_types_from_gguf` still recognises only

@@ -1156,6 +1156,43 @@ def read_gguf_metadata(path: Path) -> dict:
         return {}
 
 
+def read_gguf_tensor_names(path: Path, limit: int = 4096) -> set:
+    """Tensor names in a GGUF, or an empty set if it cannot be read.
+
+    The tensor table sits immediately after the key/values, so this is the same
+    single pass `read_gguf_metadata` already makes, carried one block further.
+    Needed because two speculative head types are distinguishable only by a
+    tensor: llama.cpp tells DSpark from DFlash by `markov_w1.weight`, and an MTP
+    head from an ordinary model by `blk.N.nextn.eh_proj.weight`
+    (`common_speculative_types_from_gguf`).
+
+    `limit` caps how many entries are walked: a draft head has tens of tensors
+    and a large model tens of thousands, and nothing here needs the latter."""
+    try:
+        with open(path, "rb") as f:
+            r = _GGUFReader(f)
+            if r._read(4) != _GGUF_MAGIC:
+                return set()
+            if r.u32() < 2:
+                return set()
+            n_tensors = r.u64()
+            kv_count = r.u64()
+            for _ in range(kv_count):
+                r.string()
+                r.value(r.u32())
+            names = set()
+            for _ in range(min(n_tensors, limit)):
+                names.add(r.string())
+                n_dims = r.u32()
+                for _ in range(n_dims):
+                    r.u64()
+                r.u32()               # ggml type
+                r.u64()               # offset
+            return names
+    except (OSError, EOFError, ValueError, struct.error):
+        return set()
+
+
 def _meta_int(meta: dict, suffix: str) -> int | None:
     for k, v in meta.items():
         if k.endswith(suffix):
@@ -1318,14 +1355,28 @@ def draft_spec_type_for(path) -> str | None:
     arch = str(meta.get("general.architecture", ""))
     if arch in DRAFT_ARCH_SPEC_TYPE:
         return DRAFT_ARCH_SPEC_TYPE[arch]
-    if arch == "dflash" or model_nextn_layers(meta) > 0:
-        return None
+    if arch == "dflash":
+        # DSpark carries a Markov head; DFlash does not. llama.cpp makes the
+        # same call on the same tensor, and we need it too because naming any
+        # other type (ngram) suppresses its inference entirely.
+        return ("draft-dspark"
+                if "markov_w1.weight" in read_gguf_tensor_names(Path(path))
+                else "draft-dflash")
+    if model_nextn_layers(meta) > 0:
+        return "draft-mtp"
     return "draft-simple"
+
+
+# Types llama.cpp can work out from the draft GGUF on its own. We leave those to
+# it when nothing else is being named — but the moment ANY type is named,
+# `spec_types_is_default()` goes false and the inference is never consulted, so
+# the draft's own type has to be named alongside (issue #11).
+DRAFT_TYPES_INFERRABLE = frozenset({"draft-dflash", "draft-dspark", "draft-mtp"})
 
 
 def draft_self_describes(path) -> bool:
     """Whether llama.cpp can work out this draft's speculative type on its own."""
-    return draft_spec_type_for(path) is None
+    return draft_spec_type_for(path) in DRAFT_TYPES_INFERRABLE
 
 
 def draft_model_args(cfg: "Config") -> list[str]:
@@ -1347,9 +1398,20 @@ def draft_model_args(cfg: "Config") -> list[str]:
         return []
     args = ["-md", str(dm)]
     needed = draft_spec_type_for(dm)
-    if needed:
+    # Name it unless llama.cpp can infer it AND nothing else will be named.
+    # `--spec-type ngram-mod` beside a draft head is the case that bites: naming
+    # ngram makes `spec_types_is_default()` false, the draft inference never
+    # runs, and the head loads and does nothing. `_merge_spec_type_args` folds
+    # the two into `draft-dflash,ngram-mod`, which is what actually works.
+    if needed and (not draft_self_describes(dm) or names_other_spec_type(cfg)):
         args += ["--spec-type", needed]
     return args
+
+
+def names_other_spec_type(cfg: "Config") -> bool:
+    """Whether something other than the draft will put a `--spec-type` on the
+    command line — today that is ngram, whose gate is emitted independently."""
+    return bool(getattr(cfg, "ngram", False))
 
 
 def draft_decides_spec_type(cfg: "Config") -> bool:
@@ -5680,7 +5742,10 @@ def selftest() -> bool:
             # a head that names its own kind: llama.cpp infers, we stay quiet
             globals()["read_gguf_metadata"] = \
                 lambda _p: {"general.architecture": "dflash"}
-            assert draft_spec_type_for(Path("x")) is None   # llama.cpp infers it
+            # the type is always known; whether llama.cpp can infer it is the
+            # separate question that decides whether we have to name it
+            assert draft_spec_type_for(Path("x")) == "draft-dflash"
+            assert draft_self_describes(Path("x")) is True
             _a_dm = build_server_args(cfg_dm, {"ngl": "99"}, 8080, 4096)
             assert "-md" in _a_dm, _a_dm                 # the draft is loaded...
             assert "--spec-type" not in _a_dm, _a_dm     # ...and decides the type
@@ -5817,6 +5882,43 @@ def selftest() -> bool:
         assert kv_levels_for_fa(["1"], ["f16", "q8_0", "q4_0"]) \
             == ["f16", "q8_0", "q4_0"]
         assert kv_levels_for_fa([], ["f16", "q8_0"]) == ["f16", "q8_0"]
+
+        # --- a draft head beside ngram must still be named (issue #11) ---
+        # Reported from the field: `--spec-type draft-dflash,ngram-mod -md head`
+        # is what works. Ours emitted `-md head --spec-type ngram-mod`, and
+        # naming ANY type makes llama.cpp's spec_types_is_default() false, so
+        # common_speculative_types_from_gguf() never runs -- the head loads,
+        # costs VRAM, and only ngram does any drafting. A sweep would have
+        # measured ngram and labelled it DFlash2.
+        _real_meta4, _real_tn = read_gguf_metadata, read_gguf_tensor_names
+        try:
+            globals()["read_gguf_metadata"] = \
+                lambda _p: {"general.architecture": "dflash"}
+            globals()["read_gguf_tensor_names"] = lambda _p, limit=4096: set()
+            _cfg_ng2 = Config(model=Path("q.gguf"), llama_bench=Path("b"),
+                              llama_server=Path("s"), array="auto",
+                              ctx_floor=8192, driver="server",
+                              draft_model=Path("d.gguf"),
+                              hw={"phys": 8, "logical": 16, "n_layers": 65,
+                                  "n_ctx_train": 32768, "n_experts": 0,
+                                  "n_nextn": 0})
+            # alone: llama.cpp can infer it, so we stay out of the way
+            _alone = build_server_args(_cfg_ng2, {"ngl": "99"}, 8080, 4096)
+            assert "--spec-type" not in _alone, _alone
+            # beside ngram: it must be named, and merged into one flag
+            _cfg_ng2.ngram = True
+            _with = build_server_args(_cfg_ng2, {"ngl": "99"}, 8080, 4096)
+            _val = _with[_with.index("--spec-type") + 1]
+            assert "draft-dflash" in _val and "ngram-mod" in _val, _with
+            assert _with.count("--spec-type") == 1, _with   # merged, not doubled
+            # DSpark is told from DFlash by its Markov head, the same tensor
+            # llama.cpp keys on -- needed because we now have to name it
+            globals()["read_gguf_tensor_names"] = \
+                lambda _p, limit=4096: {"markov_w1.weight"}
+            assert draft_spec_type_for(Path("d.gguf")) == "draft-dspark"
+        finally:
+            globals()["read_gguf_metadata"] = _real_meta4
+            globals()["read_gguf_tensor_names"] = _real_tn
 
         # --- a hand-named spec type works, and says what it is (issue #19) ---
         # spec_type_levels only generates none/draft-mtp/<detected arch>, but
