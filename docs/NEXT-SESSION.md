@@ -1,4 +1,4 @@
-# Handoff — open work as of 2026-09-01 (evening)
+# Handoff — open work as of 2026-09-02
 
 Working state at the end of the 2026-09-01 session. For what order to do the
 remaining work in and why, see [`PLAN.md`](PLAN.md). Unlike the other files in
@@ -6,9 +6,8 @@ remaining work in and why, see [`PLAN.md`](PLAN.md). Unlike the other files in
 up next, and should be pruned as items land. Durable reasoning belongs in the
 design docs it points at.
 
-Everything is committed and pushed to `main` (through `eb6ea85`, 41 commits this
-session), the working tree is clean, `--selftest` passes, and no GPU work is
-running.
+Everything is committed and pushed to `main` (through `877fbf3`), the working
+tree is clean, `--selftest` passes, and no GPU work is running.
 
 **Six issues closed: #11, #14, #15, #16, #18, #19.** Five open: #3, #5, #17, #20,
 #21.
@@ -43,6 +42,79 @@ reported as out of bounds and dropped from the next `--iterate` pass.
 **The report says what it is conditioned on:** quant, card, backend *and backend
 version*, capacity, cores, driver, profile.
 
+## What landed on 2026-09-02
+
+Four defects, all of the same shape as the ones above: **a guard that reported
+nothing when it failed, which is indistinguishable from a guard that works.**
+
+**The thermal settle had three silent no-op paths.** Found by reading `temp_c` on
+a comparison that had the settle *enabled*: 44 °C against 87 °C, a 12% apparent
+effect, no warning. The plateau rule gave up after one poll that cooled <0.5 °C
+(at a 3 s poll that is 10 °C/min, a rate a hot card passes straight through); the
+120 s cap was shorter than an MI50 takes to shed a run; and the "idle baseline"
+was a single sample, so a hot card produced `idle baseline 99°C — settle to
+≤104°C`, a target nothing can exceed. A settle that gives up now names the
+temperature it gave up at.
+
+**Warm is now the default** (`--thermal-mode warm`). Inference runs on a hot
+card, so a number off an idle one is a *burst* figure. Each config is preheated
+with its own workload to its own steady state. The distinction that makes it safe:
+warm means "at its own steady state", not "still hot from the last run" — the
+latter is the confound that produced 44-vs-87. `--thermal-mode idle` keeps the
+old behaviour for bursty agent workloads. Full reasoning in
+[`measurement-validity.md`](measurement-validity.md).
+
+**A `--factor` pin was overridden by a probe.** A run pinned to `ngl=99` swept
+48/53/59/64, because `probe_loadable_ngl` rebuilt candidates from the
+un-collapsed span. A probe now never runs on a factor the user set by hand.
+
+**`--draft-model` heads recorded no telemetry.** `spec_cols_wanted` knew about
+NextN heads and `--ngram` but not a draft model on the command line, so an EAGLE3
+run on a model with `n_nextn=0` wrote every row with `draft_acc`, `draft_cov` and
+`spec_off` **absent from the CSV** — no way to see whether the head drafted a
+single token. The `spec_off` guard was blind in the same place.
+
+### `draft-eagle3` is verified end to end
+
+`Qwen3.6-27B-Q5_K_M` + `wimmmm/Ex0bit-Qwen3.6-27B-PRISM-EAGLE3` (Q8_0), MI50 32GB
+/ ROCm, llama.cpp `6c84c7d5d`, `--task code`, depth 4096, ngl 99, q8_0 KV:
+
+| spec_type | tg t/s | temp | draft_acc | draft_cov |
+|---|---|---|---|---|
+| none | 9.09 | 59 °C | — | — |
+| eagle3 | 9.06 | 64 °C | 0.47 | 0.58 |
+
+**The head works and buys nothing *here*.** 47% acceptance means speculation
+genuinely ran; the overhead cancels the gain. Do not restate this as "EAGLE3 does
+not help" — it is one head (trained for the PRISM finetune) against a *base*
+target on one card, and a matched head could plausibly do better. An earlier
+reading of **+12%** was the thermal confound above.
+
+**Do not retry the specdrift head.** `Dogacel/specdrift-qwen3.6-27b-eagle3` is at
+`../model/specdrift-qwen3.6-27b-eagle3` and is **not convertible**: a different
+EAGLE3 flavour carrying `fcs.0/1/2.weight` (one fc per aux hidden-state layer) and
+a `t2d` map for a reduced 32000-token draft vocab, where llama.cpp expects a
+single `fc` and only `d2t`. `convert_hf_to_gguf.py` stops at `Can not map tensor
+'fcs.0.weight'`. Dimensions match fine; the topology does not. Not a tool bug.
+
+### The `#18` dead band was reported with the wrong cause
+
+Corrected in [`sweep-cost-design.md`](sweep-cost-design.md). Two errors:
+
+- The `resolve_fused_ops: layer 0 is assigned to device CPU but fused Gated Delta
+  Net (chunked) ...` warning was named as the cause. **It is not** — the identical
+  two lines, `set to disabled` and all, appear in launches that load fine. The
+  crash is later, between `threadpool init` and slot init.
+- The map is the **bare** map. On `Qwen3.6-27B-Q5_K_M`, `-ngl 53` and `-ngl 5`
+  segfault bare and **load, generating correctly**, under `--spec-type
+  draft-eagle3` or `draft-dflash` — the two heads that reuse the target's hidden
+  states. `draft-simple`, `draft-mtp` and four `ngram-*` types all still die, as
+  does every other flag tried.
+
+So `probe_loadable_ngl` no longer trusts one assignment: a level is dead only if
+it fails under every level of `LOAD_SENSITIVE_FACTORS`, and levels that load
+conditionally are reported as such.
+
 ## Do these first
 
 ### 1. `tg=0.00` with status `OK` at depth 16384 — free, and the right shape
@@ -55,24 +127,20 @@ suspect is the per-config deadline (`slow_budget_secs`) cutting the reps at dept
 which would mean deep-context rows quietly stop reporting decode. Investigable
 from `scratchpad/fadepth.csv` and the log; no GPU needed.
 
-### 2. Verify `draft-eagle3` end to end — waiting on a download
+### 2. Validate `--thermal-mode warm` on real hardware — GPU, ~25 min
 
-`--factor spec_type=draft-eagle3` and the draft-architecture mapping are built and
-unit-tested, but the path has never run. `wimmmm/Ex0bit-Qwen3.6-27B-PRISM-EAGLE3-GGUF`
-(Q8_0, 1.77 GB) is the only *ready* GGUF EAGLE3 head for a Qwen3.6-27B-family
-target; it was being downloaded and had not landed in `../gguf/` at session end.
+Warm is now the **default** and has never completed a sweep under the code that
+ships. The one warm run that did finish predates the plateau fix and burned its
+full 300 s cap on every config.
 
-Caveat when it runs: that head targets the **Ex0bit PRISM fine-tune**, not base
-Qwen3.6-27B. Read weak acceptance as "wrong base model", and a layer-id abort as a
-dimension mismatch — neither is a tool bug.
+The fix it needs to exercise: plateau detection is a rolling **window**, because
+an MI50 holding steady under load was measured oscillating **99↔100 °C** — a
+step-to-step 0.5 °C test resets on every other poll and never converges. Unit
+tests cover the trace; nothing has confirmed it against the card.
 
-**Do not retry the specdrift heads.** `Dogacel/specdrift-qwen3.6-27b-eagle3` is
-downloaded to `../model/specdrift-qwen3.6-27b-eagle3` and is **not convertible**:
-it is a different EAGLE3 flavour carrying `fcs.0/1/2.weight` (one fc projection per
-aux hidden-state layer) and a `t2d` map, where llama.cpp expects a single `fc` and
-only `d2t`. `convert_hf_to_gguf.py` stops at `Can not map tensor 'fcs.0.weight'`.
-Dimensions matched fine (5120, 24 heads, 4 KV, aux layers [3, 31, 59] against
-64–65 blocks); the topology does not.
+What to check: that `run_until_warm` returns `warm` rather than `cap`, that the
+preheat is a fraction of a run rather than a multiple of it, and that two rows of
+one sweep land within a few degrees of each other in `temp_c`.
 
 ### 3. Re-measure `fa` properly (#20)
 
@@ -81,8 +149,8 @@ Dimensions matched fine (5120, 24 heads, 4 KV, aux layers [3, 31, 59] against
 randomised it was 1.03x. See `constants-audit.md` C-A.
 
 The question is therefore still open, and doing it right costs what cutting the
-corner saved: thermal settle **on**, more reps, and read `temp_c` before drawing
-anything. The `--factor fa=0,1` footgun is already fixed (quantized `kv_type`
+corner saved: warm mode (now the default), more reps, and read `temp_c` before
+drawing anything — the rows must land within a few degrees of each other. The `--factor fa=0,1` footgun is already fixed (quantized `kv_type`
 levels are dropped automatically, since `-fa off -ctk q8_0` cannot create a
 context). What remains is whether the pin itself is right, and the honest version
 needs a constrained relation between `fa` and `kv_type` rather than a level
@@ -142,9 +210,12 @@ on prefill (116 vs 94.7).
 - **Never `pkill -f` a pattern that matches your own command line.** It kills the
   shell running it (exit 144), and a broad `llama-server` pattern also kills other
   people's servers on a shared box. Kill by PID, or by a port-specific pattern.
-- **`--no-thermal-wait` will hand you an artifact and call it a finding.** A cold
-  first row against a hot second one looked like a 33% effect. `temp_c` is in every
-  row; read it before believing a comparison.
+- **A temperature gap will hand you an artifact and call it a finding, and
+  `--no-thermal-wait` is not the only way in.** A cold row against a hot one
+  looked like a 33% flash-attention effect; a 43 °C gap made an EAGLE3 head look
+  like +12%. The second happened with the settle *enabled* — it had three silent
+  no-op paths. `temp_c` is in every row; read it before believing a comparison,
+  including one taken with the guards on.
 - **Metadata declares an architecture, not a file's contents.** Both
   `Qwen3.8-27B-UD-IQ4_XS` and the standalone `mtp-*.gguf` report
   `nextn_predict_layers = 1`; only the tensor list distinguishes them. Checking
