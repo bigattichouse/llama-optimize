@@ -94,6 +94,36 @@ earlier.
 
 ### Added
 
+- **Flash attention is derived from the box, not pinned from one GPU**
+  ([issue #20]). `FIXED_FA = 1` was chosen on gfx906 and shipped to everyone,
+  while llama.cpp's own default is `auto` — decided per build and per backend.
+  Under `--run` the box is now asked (three launches) and the answer decides:
+
+  - **quantized `kv_type` levels in the design → `-fa 1`, pinned.** Those levels
+    *require* FA, and a silent decline would not fail loudly — it would produce
+    rows labelled `kv_type=q8_0` whose cache was never quantized. The probe
+    confirms that combination stands up before the sweep commits to it.
+  - **f16-only design → `-fa auto`**, handed back to llama.cpp, which knows its
+    own backend better than a constant does. The printed reason names which way
+    `auto` actually resolved.
+
+  llama.cpp reports FA state in no log line at any default verbosity, so the
+  probe is **behavioural**: a quantized KV cache cannot be created without FA, so
+  `-fa auto -ctk q8_0` standing up *is* proof that `auto` resolved to on. Sturdier
+  than scraping a line that is free to change. Measured on this build:
+
+  ```
+  -fa 1    -ctk q8_0  -> loads      -fa 1 -ctk f16 -> loads
+  -fa 0    -ctk q8_0  -> FAILS      -fa 0 -ctk f16 -> loads
+  -fa auto -ctk q8_0  -> loads
+  ```
+
+  Not done, and deliberately: the issue sketched constraining `kv_type` to `f16`
+  *on the `fa=0` rows only*. That violates the constrained-factor invariants —
+  clamping at emission breaks C3 (the record must match the run) and aliases
+  cells, breaking C2 (orthogonality). `fa=0 × q8_0` is an infeasible cell, not a
+  derivable value, so the existing whole-design `kv` floor stays.
+
 - **Shareable hardware/model fingerprints** ([issue #21]). Every sweep now writes
   `<results>.fingerprint.json` beside its CSV: CPU model, cores and RAM; each GPU
   with VRAM, backend and backend *version*; OS; llama.cpp build; the model's
@@ -946,4 +976,5 @@ crash journal, `--resume`, `--iterate`, `--diff`, and a GPU-free `--selftest`.
 [Issue #16]: https://github.com/bigattichouse/llama-optimize/issues/16
 [Issue #15]: https://github.com/bigattichouse/llama-optimize/issues/15
 [Issue #18]: https://github.com/bigattichouse/llama-optimize/issues/18
+[issue #20]: https://github.com/bigattichouse/llama-optimize/issues/20
 [issue #21]: https://github.com/bigattichouse/llama-optimize/issues/21

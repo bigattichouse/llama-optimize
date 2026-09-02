@@ -57,7 +57,30 @@ These are properties of llama.cpp or of arithmetic, not of any machine.
 
 Ranked by how much damage each can do.
 
-### C-A. `FIXED_FA = 1` — pinned from *our* GPU
+### C-A. `FIXED_FA = 1` — pinned from *our* GPU (**fixed 2026-09-02**)
+
+> **Resolved.** Under `--run`, `-fa` is now derived from a three-launch probe of
+> the actual box rather than taken from this constant, which survives only as the
+> plan-only fallback. `resolve_fa` pins `-fa 1` where the design carries
+> quantized `kv_type` levels (they require FA, and a silent decline would
+> mislabel rather than fail) and otherwise emits `-fa auto`, llama.cpp's own
+> default, printing which way `auto` resolved here. The audit below is kept for
+> the reasoning; see the CHANGELOG entry for issue #20 for what shipped.
+>
+> **Detection is behavioural, because there is nothing to read.** llama.cpp
+> reports FA state in no log line at any default verbosity. But a quantized KV
+> cache cannot be created without FA — so `-fa auto -ctk q8_0` standing up *is*
+> proof that `auto` resolved to on. Sturdier than parsing a line that is free to
+> change.
+>
+> **What was deliberately not built:** gating `kv_type` per-row on `fa`. The
+> issue sketched restricting `kv_type` to `f16` on the `fa=0` rows only, which
+> would clamp at emission (C3: the record must match the run) and alias cells
+> (C2: orthogonality). `fa=0 × q8_0` is an *infeasible cell*, not a derivable
+> value, so it is not the ordered-pair shape
+> [`CONSTRAINED-FACTORS.md`](CONSTRAINED-FACTORS.md) was built for. The
+> whole-design `kv` floor stays.
+
 
 [`DESIGN.md`](DESIGN.md) justifies flash attention being fixed on with "reduces
 KV-cache bandwidth and **helps gfx906**". That is literally the development

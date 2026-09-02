@@ -178,6 +178,10 @@ def prepare_taguchi_cli():
 # to answer "is this CSV affected?" is for the CSV to say what made it.
 __version__ = "0.2.0"
 
+# The value emitted when nothing better is known: plan-only, or a box whose
+# probe could not run. `resolve_fa` derives the answer under --run instead,
+# because a constant chosen on gfx906 and shipped to everyone is the defect
+# issue #20 is about, not the fix for it.
 FIXED_FA = 1
 FIXED_MMAP = 1
 FIXED_BATCH = 2048
@@ -1932,6 +1936,77 @@ KV_QUALITY = ["f32", "f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "iq4
 FA_OFF_LEVELS = frozenset({"0", "off", "false", "no"})
 
 
+def fa_value(cfg) -> str:
+    """The `-fa` value this sweep emits when `fa` is not itself a factor.
+
+    One accessor for three emission sites and the report line, because the
+    failure that matters is them disagreeing: a report saying "flash-attn on"
+    over rows launched with something else is worse than either."""
+    return str(getattr(cfg, "fa_fixed", None) or FIXED_FA)
+
+
+def probe_fa_support(cfg: "Config", timeout: int) -> dict:
+    """What flash attention actually does on THIS box. Three launches.
+
+    llama.cpp does not report FA state in its log at any default verbosity, so
+    this asks behaviourally instead — sturdier than scraping a line that is free
+    to change, and resting on an invariant the design already depends on: **a
+    quantized KV cache requires flash attention**. Measured on this build
+    (llama.cpp 6c84c7d5d, gemma-3-270m, MI50 32GB / ROCm):
+
+        -fa 1    -ctk q8_0  -> loads
+        -fa 0    -ctk q8_0  -> FAILS, "failed to create context with model"
+        -fa 1    -ctk f16   -> loads
+        -fa 0    -ctk f16   -> loads
+        -fa auto -ctk q8_0  -> loads
+
+    That last line answers "did the flag take effect", which is otherwise
+    invisible: if `auto` plus a quantized cache stands up, `auto` resolved to FA
+    **on**, because the context could not have been created otherwise. No log
+    parsing, no guessing.
+
+    Returns {"quant_kv": bool, "fa_off": bool, "auto_on": bool}."""
+    def loads(fa: str, kv: str) -> bool:
+        f = {**{k: v[0] for k, v in cfg.factors.items() if v},
+             "kv_type": kv, "fa": fa}
+        session = ServerSession(cfg, f, cfg.n_prompt + cfg.n_gen + 256, timeout)
+        try:
+            return bool(getattr(session, "ok", False))
+        finally:
+            session.close()
+
+    return {"quant_kv": loads("1", "q8_0"),
+            "fa_off": loads("0", "f16"),
+            "auto_on": loads("auto", "q8_0")}
+
+
+def resolve_fa(support: dict, sweeping_quant_kv: bool) -> tuple[str, str]:
+    """The `-fa` value to emit, and why. Returns (value, reason).
+
+    llama.cpp's own default is `auto` — it decides per build and per backend,
+    which is exactly the knowledge a constant picked on one card does not have.
+    So `auto` is preferred wherever it is safe, and it is safe whenever the
+    design does not depend on FA being on.
+
+    It is not safe when the sweep carries **quantized KV levels**, because those
+    require FA: letting `auto` decline would not fail loudly, it would produce
+    rows labelled `kv_type=q8_0` whose cache was never quantized. Silent
+    mislabelling is the failure this project treats as the worst kind, so where
+    quantized KV is in play FA is pinned on — with the probe confirming that
+    combination stands up before the sweep commits to it."""
+    if sweeping_quant_kv:
+        if support.get("quant_kv"):
+            return "1", ("pinned on: the sweep has quantized KV levels, which "
+                         "require it (probed: -fa 1 with q8_0 loads here)")
+        return "1", ("pinned on for quantized KV, but the probe could not "
+                     "confirm it loads here — expect those rows to fail")
+    if support.get("auto_on") is not None:
+        where = "on" if support.get("auto_on") else "off"
+        return "auto", (f"left to llama.cpp, which is its own default "
+                        f"(probed: auto resolves to {where} on this backend)")
+    return str(FIXED_FA), "unprobed: no launch could be judged"
+
+
 def fa_forces_unquantized_kv(fa_levels: list) -> bool:
     """Whether a swept `fa` makes quantized KV levels unusable.
 
@@ -2048,6 +2123,9 @@ class Config:
     # deployment actually runs at); "idle" settles back to the idle baseline
     # first (a burst figure). See run_until_warm.
     thermal_mode: str = "warm"
+    # The resolved `-fa` value, filled in by the probe under --run. None means
+    # "not probed", and FIXED_FA stands in (see resolve_fa).
+    fa_fixed: str | None = None
     min_tgs: float = 0.0        # abandon a config generating slower than this
     min_pps: float = 0.0        # ...or prefilling slower than this
     slow_grace: int = 60        # never judge a config on less than this many seconds
@@ -3188,7 +3266,7 @@ def bench_command(cfg: Config, f: dict) -> list[str]:
     # disable — and emitting a flag it does not know makes it exit non-zero,
     # which would fail every bench run rather than fail safe.
     if "fa" not in f:                              # flash-attn fixed unless swept
-        cmd += ["-fa", str(FIXED_FA)]
+        cmd += ["-fa", fa_value(cfg)]
     ub = int(f.get("ubatch", 512))
     if "batch_ratio" not in f:                     # batch fixed; needs -b >= -ub
         cmd += ["-b", str(max(FIXED_BATCH, ub))]
@@ -3256,7 +3334,7 @@ def server_command(cfg: Config, f: dict, ctx: int) -> str:
     if _lm:
         parts.append(" ".join(_lm))
     if "fa" not in f:
-        parts.append(f"-fa {FIXED_FA}")
+        parts.append(f"-fa {fa_value(cfg)}")
     if "batch_ratio" not in f:
         parts.append(f"-b {max(FIXED_BATCH, ub)}")
     parts += [" ".join(shlex.quote(t) for t in g)
@@ -3827,7 +3905,7 @@ def build_server_args(cfg: Config, f: dict, port: int, n_ctx: int) -> list[str]:
     if "load_mode" not in f:                       # fixed unless swept (R4)
         args += load_mode_args(cfg.llama_server, "server")
     if "fa" not in f:                              # flash-attn fixed unless swept
-        args += ["-fa", str(FIXED_FA)]
+        args += ["-fa", fa_value(cfg)]
     if "batch_ratio" not in f:
         args += ["-b", str(max(FIXED_BATCH, ub))]
     args += _flat(factor_flags(cfg, f, "server"))
@@ -7511,6 +7589,48 @@ def selftest() -> bool:
         assert f2 is rows_v[3] and b2 is None
         assert pick_recommendations(cfg_v, []) == (None, None, None)
 
+        # --- flash attention is derived, not assumed (issue #20) ---
+        # `FIXED_FA = 1` was chosen on gfx906 and shipped to everyone, and the
+        # failure it can cause is by construction invisible on the box it was
+        # chosen from. These are the four verdicts the probe can reach.
+        _sup_ok = {"quant_kv": True, "fa_off": True, "auto_on": True}
+        # quantized KV in the design => FA pinned on, because those levels
+        # REQUIRE it and a silent decline would label a row q8_0 whose cache was
+        # never quantized -- mislabelling, not slowness
+        _v, _w = resolve_fa(_sup_ok, sweeping_quant_kv=True)
+        assert _v == "1" and "require" in _w, (_v, _w)
+        # f16-only design => hand it back to llama.cpp, whose own default it is
+        _v, _w = resolve_fa(_sup_ok, sweeping_quant_kv=False)
+        assert _v == "auto" and "llama.cpp" in _w, (_v, _w)
+        # ...and the reason names which way auto actually resolved here
+        _v, _w = resolve_fa({"quant_kv": True, "fa_off": True, "auto_on": False},
+                            sweeping_quant_kv=False)
+        assert _v == "auto" and "off" in _w, (_v, _w)
+        # a box where FA+quantized KV does NOT stand up still gets the pin, and
+        # is told so: silently switching to f16 would answer a question the user
+        # did not ask
+        _v, _w = resolve_fa({"quant_kv": False, "fa_off": True, "auto_on": None},
+                            sweeping_quant_kv=True)
+        assert _v == "1" and "could not confirm" in _w, (_v, _w)
+        # nothing probed at all => the documented fallback, said out loud
+        _v, _w = resolve_fa({}, sweeping_quant_kv=False)
+        assert _v == str(FIXED_FA) and "unprobed" in _w, (_v, _w)
+
+        # The accessor is what the emission sites and the report both read, so
+        # they cannot disagree. A report saying "flash-attn on" over rows
+        # launched with something else is worse than either alone.
+        _fa_cfg = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
+                         ctx_floor=8192, driver="server")
+        assert fa_value(_fa_cfg) == str(FIXED_FA)      # unprobed default
+        _fa_cfg.fa_fixed = "auto"
+        assert fa_value(_fa_cfg) == "auto"
+        _fa_cfg.fa_fixed = "0"
+        assert fa_value(_fa_cfg) == "0", "a probed 0 must survive the accessor"
+        _srv = build_server_args(_fa_cfg, {"ngl": "99", "kv_type": "f16",
+                                           "ubatch": "512", "threads": "8"},
+                                 18899, 1024)
+        assert _srv[_srv.index("-fa") + 1] == "0", _srv
+
         # --- fingerprint (issue #21): structured identity, no personal data ---
         _fp_cfg = Config(model=Path("/home/someuser/private-dir/Model-Q5_K_M.gguf"),
                          llama_bench=Path("/home/someuser/bin/llama-bench"),
@@ -11055,6 +11175,22 @@ def main():
     # ngl_levels) and only under --run, so plan-only keeps its promise to touch no
     # GPU. What loads is a property of the model, the backend and the build, and
     # none of those is knowable from here (issue #18).
+    # Flash attention: derived, not assumed. `FIXED_FA = 1` was chosen on gfx906
+    # and shipped to everyone, and the failure it can cause is invisible on the
+    # box it was chosen from — which is the whole of issue #20. Under --run the
+    # box is asked instead. Skipped when `fa` is a factor (the sweep is
+    # measuring it) or pinned by hand (that is the user's answer).
+    if (args.run and cfg.driver == "server" and "fa" not in cfg.factors
+            and "fa" not in cfg.pinned_factors):
+        _quant_kv = any(k != "f16" for k in cfg.factors.get("kv_type", []))
+        print("probing flash attention (3 launches)...", flush=True)
+        _sup = probe_fa_support(cfg, args.timeout)
+        cfg.fa_fixed, _why = resolve_fa(_sup, _quant_kv)
+        print(f"  -fa {cfg.fa_fixed} — {_why}")
+        if _quant_kv and not _sup.get("quant_kv"):
+            print("  !! quantized KV levels are in the design but -fa 1 with "
+                  "q8_0 did not load here; those rows will fail")
+
     if probe_ngl_wanted(cfg, bool(args.run)):
         cands = sorted({int(x) for x in
                         (getattr(cfg, "ngl_candidates", None) or cfg.factors["ngl"])}
@@ -11196,7 +11332,9 @@ def main():
               f"(--no-oom-prune restores an even span).")
     fixed_bits = [f"mmap {'on' if FIXED_MMAP else 'off'}"]
     if "fa" not in cfg.factors:
-        fixed_bits.insert(0, f"flash-attn {'on' if FIXED_FA else 'off'}")
+        _fa = fa_value(cfg)
+        fixed_bits.insert(0, "flash-attn " + ("on" if _fa == "1" else
+                                              "off" if _fa == "0" else _fa))
     if "batch_ratio" not in cfg.factors:
         fixed_bits.append(f"batch {FIXED_BATCH}")
     print(f"fixed      : {', '.join(fixed_bits)}  "
