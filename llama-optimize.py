@@ -4955,9 +4955,14 @@ def factor_level_means(rows: list[dict], factor: str) -> dict:
     from run-to-run noise, in the table the user reads to decide what matters —
     which is worse than the wasted runs, because the runs are at least honest
     about the other factors (issue #16)."""
-    ok = [r for r in rows
-          if r["status"] == "OK" and is_active(factor, r)
-          and not is_inert(factor, r)]
+    # `measured_ok`'s criterion, not just the status. The two used to disagree:
+    # the picks required a positive score while the main effects took any OK row,
+    # so a row that produced NO number counted here as a measured zero and pulled
+    # down every level it appeared at. Being score-based rather than status-based
+    # also repairs a CSV recorded before that was fixed — the status is stored in
+    # the file and cannot be recomputed, but the number can be read.
+    ok = [r for r in measured_ok(rows)
+          if is_active(factor, r) and not is_inert(factor, r)]
     means = {}
     levels = sorted(set(str(r[factor]) for r in ok if factor in r),
                     key=lambda x: (len(x), x))
@@ -7869,10 +7874,18 @@ def selftest() -> bool:
             assert r_z["status"] != "OK", r_z
             assert "0 t/s" in _buf_z.getvalue(), _buf_z.getvalue()
 
-            # ...and being non-OK is what keeps it out of the main effects
+                # ...and it stays out of the main effects two ways over: by not
+            # being OK, and -- for a CSV recorded before that was fixed, where
+            # the stored status cannot be recomputed -- by not having produced a
+            # number. factor_level_means uses measured_ok's criterion now, which
+            # the picks always used and the analysis did not.
             assert factor_level_means(
                 [{"status": "OK", "ngl": "99", "eff_tps": 40.0},
                  {"status": r_nm["status"], "ngl": "99", "eff_tps": 0.0}],
+                "ngl") == {"99": 40.0}
+            assert factor_level_means(
+                [{"status": "OK", "ngl": "99", "eff_tps": 40.0},
+                 {"status": "OK", "ngl": "99", "eff_tps": 0.0}],   # old CSV
                 "ngl") == {"99": 40.0}
 
             # --- the `agents` request shape reaches measure() (issue #11) ---

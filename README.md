@@ -155,6 +155,7 @@ Swept by default (auto-scaled to your hardware and model):
 | MoE expert offload | `-ncmoe`   | `0 .. n_layers` (5 levels)             | **MoE models** (replaces `-ot`): how many layers keep experts on CPU |
 | Dense FFN placement | `-ot` / `-ncffn` | `none, ffn_up_cpu, first_N, first_M, ffn_cpu` | **dense models**: where the FFN weights live. One column over two mechanisms — `ffn_up_cpu` moves the up-projection across *all* layers, `first_N` moves the whole FFN for the first N (needs `-ncffn`, llama.cpp b10645+; older builds get the three `-ot` levels) |
 | SWA cache     | `--swa-full`     | `0, 1`                                 | **sliding-window models** (gemma3/gemma4/…), server driver: full-size KV for the SWA layers. Past the window a shared-prefix workload otherwise loses its prompt cache entirely — measured 0% vs 90% reuse on the second rep of a 15.7k-token prompt. Not free: attention loses the sliding-window shortcut, so which side wins is a measurement |
+| llama.cpp toggles | `--repack`, `--op-offload`, `--no-host` | `0, 1` each | **server driver**, where the binary has the flag: weight repacking, offloading host tensor ops to the device, and bypassing the host buffer. Each is a documented behaviour switch with no universal answer, and each was previously just inheriting llama.cpp's default. Free in runs — an L125 holds 31 factors |
 | NUMA policy   | `--numa`         | `distribute, isolate`                  | **multi-NUMA-node boxes only** (inert on one node) |
 | Prefill threads | `-tb`          | same levels as `-t`                    | **server driver**: decode vs prefill thread split |
 | ngram variant  | `--spec-type <variant>` | `none, ng-simple, ng-mod, ng-map-k, ng-map-k4v` | **server driver, --ngram**: which pattern-matching variant — *screened* first (see [ngram staging](#ngram-staged-search)) |
@@ -246,10 +247,19 @@ For each config, `llama-bench` reports two throughput numbers, both captured:
 - **`pp_tps`** — prompt-processing t/s (prefill speed; matters for long-context/RAG).
   Reported alongside; `--score eff` folds it into the objective.
 
-Runs that **OOM, crash, or time out** are recorded as data (`tg=0`, with a status of
-`OOM`/`ERROR`/`TIMEOUT`) rather than aborting the sweep. High context depth at low
-`-ngl` with an `f16` KV cache is *expected* to OOM — that failure is the memory cliff
-we're mapping, not a bug.
+Runs that **OOM, crash, or time out** are recorded as data (`tg=0`) rather than
+aborting the sweep: `OOM`, `SIGNAL` (killed by a signal — a segfault in the
+backend, say), `ERROR`, `PARSE_FAIL`, `TIMEOUT`, and `SKIP_PRED` for a config the
+OOM pruner predicted would not fit. High context depth at low `-ngl` with an
+`f16` KV cache is *expected* to OOM — that failure is the memory cliff we're
+mapping, not a bug.
+
+**A config that produced no number at all is never `OK`.** If the reps could not
+finish, or every one of them reported 0 t/s, the row is `TIMEOUT` (the budget ran
+out) or `SLOW` (`--min-tgs` tightened it deliberately) — never `OK` with `tg=0`.
+The distinction matters beyond tidiness: the main-effects table averages `OK`
+rows, so an unmeasured row recorded as a zero halves the apparent effect of every
+factor level it touched.
 
 Those failures are then **read as boundary measurements**. A level where *every*
 row failed is out of bounds rather than unlucky — the array visits each level
@@ -407,11 +417,16 @@ so it survives a crash — see below).
 - **Trust the Pareto frontier and the raw `results.csv`** for the actual
   recommendation — those read measured numbers directly.
 - **Use the main-effects table to rank which knobs matter**, not as gospel for the
-  single best config. Because OOM is scored as `0 t/s` and is driven by an
-  *interaction* (the `ngl × n_depth × kv_type` memory budget), the additive
-  main-effects model can misattribute an interaction to a main effect. This is why
-  the recommendation is driven off the Pareto, and why we keep the spare column for
-  an error estimate.
+  single best config. The additive model can misattribute an *interaction* to a
+  main effect, and the memory budget (`ngl × n_depth × kv_type`) is exactly such
+  an interaction — a level can look bad only because its OOM-ing partners are
+  missing from the average. This is why the recommendation is driven off the
+  Pareto, and why we keep the spare column for an error estimate.
+
+  Rows that produced no number — `OOM`, `SIGNAL`, `TIMEOUT`, or anything scoring
+  `0 t/s` — are excluded from the table rather than averaged in as zeros. That is
+  the same criterion the picks use; when the two disagreed, an unmeasured row
+  halved the apparent effect of every level it touched.
 - **Beware thermal drift.** GPUs (notably the MI50) throttle under sustained load,
   so throughput drifts *down* over a long sweep — the same config can measure 40%+
   slower late in the run than early. Two defaults fight it: **execution order is
@@ -422,6 +437,12 @@ so it survives a crash — see below).
   the CSV (`temp_c`) so you can check comparability afterwards. For steadier
   numbers use `--full` (more reps). If `--confirm` reports a large predicted-vs-
   actual gap, suspect either interactions *or* thermal drift.
+
+  This is not theoretical, and `--no-thermal-wait` is how you walk into it. A
+  flash-attention comparison run here with the settle disabled read as a **33%
+  loss**; `temp_c` showed the two rows were taken at 44 °C and 91 °C. Re-run hot
+  and order-randomised, the difference was **1.03x** — nothing. Read `temp_c`
+  before believing any comparison.
 
 ---
 

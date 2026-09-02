@@ -277,7 +277,15 @@ Reproduced by tightening the budget (`--timeout 45` at depth 16384) so the reps
 cannot finish: `status=OK tg=0.0 err_rate=0.5`. Note `err_rate` does not catch it
 either — a deadline break is not an exception, so nothing was counted as failed.
 
-The server driver now names it the way the bench driver already did: **`SLOW`**
+Fixed at both ends, because the root cause was a disagreement rather than a
+missing check: **`measured_ok` required a positive score and `factor_level_means`
+did not.** The analysis now uses the same criterion the picks always used, so a
+row that produced no number is excluded whatever its recorded status says — which
+also repairs a CSV written before the fix, since the status is stored in the file
+and cannot be recomputed while the number can be read. Verified on a hand-built
+historical CSV: a level whose true mean was 7.06 read as 3.53 and now reads 7.06.
+
+And the server driver names it the way the bench driver already did: **`SLOW`**
 when the budget was deliberately tightened by `--min-tgs`, **`TIMEOUT`** when it
 simply ran out, with the reason in `too_slow` and printed as it happens. Two ways
 in, both covered: no rep finished, or every surviving rep reported 0 t/s. Being

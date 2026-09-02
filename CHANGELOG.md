@@ -25,6 +25,26 @@ earlier.
 
 ### ⚠️ Affects existing results
 
+- **Main-effects tables from server-driver sweeps may understate a factor.** A
+  config whose reps never finished was recorded as `OK` with `tg=0.0`, and
+  `factor_level_means` averages `OK` rows — so an unmeasured row counted as a
+  measured zero and pulled down every factor level it appeared at. On a balanced
+  design one such row halves the apparent effect at those levels, and
+  `refine_factors` used the same means to choose what the next `--iterate` pass
+  swept, so a bad pass could narrow toward the wrong region.
+
+  **The picks, the Pareto frontier and the recommended command are unaffected** —
+  those go through `measured_ok`, which already required a positive score. Only
+  the main-effects table and `--iterate` refinement were touched.
+
+  **Re-read, do not re-run.** If a sweep's CSV has rows with `status=OK` and
+  `tg_tps=0`, its main-effects ranking was computed with them in.
+  `--report-only` on the same CSV is enough: the stored status cannot be
+  recomputed, but the *number* can be read, and `factor_level_means` now uses
+  `measured_ok`'s criterion — a row that produced nothing is excluded whatever
+  its recorded status says. Verified against a hand-built historical CSV: a
+  level whose true mean was 7.06 read as 3.53 before and reads 7.06 after.
+
 - **OOM-pruning decisions on any sweep that varied `nkvo` were made against the
   wrong KV placement.** The estimator had the two levels the wrong way round, a
   ~6 GB error on a large model. `SKIP_PRED` rows with `nkvo=1` were very likely
@@ -196,17 +216,21 @@ earlier.
 
 - **An unmeasured config was averaged into the main effects as a zero.** A
   server-driver row whose reps never finished came back `tg=0.0` with status
-  `OK`. `measured_ok` kept it out of the picks, but `factor_level_means` filters
-  on `status == "OK"` alone — so the row was counted as a measured zero and
+  `OK`. `measured_ok` kept it out of the picks, but `factor_level_means` filtered
+  on `status == "OK"` alone — the two disagreed about what counts as a
+  measurement — so the row was counted as a measured zero and
   **halved the main effect of every factor level it touched**, which
   `refine_factors` then used to decide what the next `--iterate` pass sweeps. The
   picks stayed right while the analysis and the refinement quietly did not.
   `err_rate` did not catch it either: a deadline break is not an exception.
 
-  Such a row is now `SLOW` (budget deliberately tightened by `--min-tgs`) or
-  `TIMEOUT` (it simply ran out), matching what the bench driver already did, with
-  the reason recorded and printed. Both routes covered: no rep finished, or every
-  surviving rep reported 0 t/s.
+  Fixed at both ends. Such a row is now `SLOW` (budget deliberately tightened by
+  `--min-tgs`) or `TIMEOUT` (it simply ran out), matching what the bench driver
+  already did, with the reason recorded and printed — both routes covered, no rep
+  finished or every surviving rep reported 0 t/s. And `factor_level_means` now
+  uses `measured_ok`'s criterion rather than the status alone, which closes the
+  disagreement at its source and repairs CSVs recorded before the fix, since the
+  stored status cannot be recomputed but the number can be read.
 
 - **The OOM pruner priced the wrong KV placement on every row.**
   `_fit_params_flags` emitted `--no-kv-offload` for `nkvo=0`, but `nkvo=1` is the
