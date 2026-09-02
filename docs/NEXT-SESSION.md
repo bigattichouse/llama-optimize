@@ -9,8 +9,8 @@ design docs it points at.
 Everything is committed and pushed to `main` (through `877fbf3`), the working
 tree is clean, `--selftest` passes, and no GPU work is running.
 
-**Seven issues closed: #11, #14, #15, #16, #18, #19, #21.** Four open: #3, #5,
-#17, #20 — three of them blocked on hardware or on someone else's data.
+**Eight issues closed: #11, #14, #15, #16, #18, #19, #20, #21.** Three open —
+#3, #5 and #17 — all blocked on hardware or on someone else's data.
 
 ## What landed
 
@@ -174,19 +174,27 @@ without a preheat the two sampling points agree.
 Note the sustained numbers sit slightly below the burst ones measured earlier at
 59–64 °C (9.09 / 9.06) — which is the point of the mode, not a discrepancy.
 
-### 3. Re-measure `fa` properly (#20)
+### 3. ~~`fa` pinned from one GPU (#20)~~ — derived now; the *benefit* is still open
 
-**The earlier "flash attention is 33% slower" finding was retracted** — it was a
-44 °C row against a 91 °C row with `--no-thermal-wait` on. Re-run hot and
-randomised it was 1.03x. See `constants-audit.md` C-A.
+**Shipped 2026-09-02.** `-fa` comes from a three-launch probe under `--run`, not
+from `FIXED_FA`, which survives only as the plan-only fallback. Quantized
+`kv_type` levels pin it on (they require FA, and a silent decline mislabels
+rather than fails); an f16-only design gets `-fa auto`, llama.cpp's own default,
+with the printed reason naming which way `auto` resolved here.
 
-The question is therefore still open, and doing it right costs what cutting the
-corner saved: warm mode (now the default), more reps, and read `temp_c` before
-drawing anything — the rows must land within a few degrees of each other. The `--factor fa=0,1` footgun is already fixed (quantized `kv_type`
-levels are dropped automatically, since `-fa off -ctk q8_0` cannot create a
-context). What remains is whether the pin itself is right, and the honest version
-needs a constrained relation between `fa` and `kv_type` rather than a level
-filter.
+Detection is **behavioural**, because llama.cpp reports FA state in no log line
+at any default verbosity: a quantized KV cache cannot be created without FA, so
+`-fa auto -ctk q8_0` standing up *is* proof that `auto` resolved to on.
+
+**What is still open is the original question**: *does FA help or hurt?* The
+"33% slower" reading was retracted as a thermal artifact, and nothing has
+replaced it. That needs `--factor fa=0,1 --min-kv f16` under warm mode, and it
+answers only for this card — the interesting half needs a backend where FA is
+absent or slow, which this box cannot provide.
+
+**Do not "fix" the kv coupling per-row.** The issue sketched restricting
+`kv_type` to `f16` on the `fa=0` rows only. That clamps at emission (C3) and
+aliases cells (C2). `fa=0 × q8_0` is an infeasible cell, not a derivable value.
 
 ### 4. ~~The fingerprint (#21)~~ — shipped; matching is the follow-up
 
