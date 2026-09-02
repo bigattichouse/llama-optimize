@@ -37,9 +37,18 @@ context that will load. That is exactly what the sweep is built to map.
 These are the starting beliefs that shaped the factor set. The sweep exists to
 *measure* them, not take them on faith:
 
-- **Flash attention (`-fa 1`)** reduces KV-cache bandwidth and helps gfx906. It is
-  also a precondition for a quantized KV cache in llama.cpp. → We fix it on and
-  treat KV-quant as a factor. (A future outer-block run can quantify `-fa 0/1`.)
+- **Flash attention (`-fa`)** is a precondition for a quantized KV cache in
+  llama.cpp — measured, not assumed: `-fa 0 -ctk q8_0` fails to create a context
+  while `-fa 1` with the same cache loads. → Under `--run` the box is **probed**
+  and the answer decides: `-fa 1` where the design carries quantized `kv_type`
+  levels (a silent decline there would mislabel rows rather than fail them), and
+  `-fa auto` otherwise — llama.cpp's own default.
+
+  This bullet used to read "reduces KV-cache bandwidth and **helps gfx906**", and
+  that is exactly how a measurement from the development box became everyone's
+  default (issue #20, [`constants-audit.md`](constants-audit.md) C-A). Whether FA
+  is *faster* anywhere is still unmeasured here: the one attempt was a cold row
+  against a hot one and was retracted.
 - **`-ngl` is the biggest lever**, but for MoE models "more layers on GPU" is not
   strictly monotonic — tensors differ. → `-ngl` is the widest-range factor.
 - **Don't chase context you don't need.** Large `-c`/depth mostly burns RAM and
@@ -191,18 +200,32 @@ larger than most factor effects the sweep is trying to resolve (`ngl 56→60` mo
 ~13%), so an uncontrolled search partly measures GPU temperature, and cross-pass numbers
 are not comparable — a naive merge of passes would crown pass 1's cool-start outlier.
 Randomized run order (already done) decorrelates drift from factors *within* a pass but
-does not remove the cross-pass offset. The implemented lever is a **"wait and watch"
-settle** (default on): capture the idle GPU temperature once before the sweep, then
-between runs poll the sensor (`rocm-smi`/`nvidia-smi`) and block until it falls back to
-within a few °C of that baseline, so every config is measured from a comparable thermal
-state. It is capped and plateau-aware — where a plateau means *cooling stalled*, not any
-small delta: a rising temperature (post-run heat soak) keeps the wait alive rather than
-exiting at the hottest moment, while an already-settled card returns at once so idle
-runs don't wait. It degrades to a fixed `--cooldown` when no sensor is present and is
-disabled with `--no-thermal-wait`. The baseline is captured **once, before any GPU
-work**, and handed to every `--iterate` child pass (internal `--thermal-baseline`) — a
-child re-capturing "idle" at the start of pass 2 would bake a hot card into the target
-and neuter the settle for that whole pass. The Morris screen (which decides what gets
+does not remove the cross-pass offset. The implemented lever is to measure every
+config at a **defined thermal state**, and since 2026-09-02 the default is
+`--thermal-mode warm`: before its measured reps, each config is preheated **with its own workload** until the GPU stops
+heating, then measured there. That is the *sustained* rate — inference runs on a hot
+card, so a number off an idle one is a burst figure. Warm means "at its own steady
+state", not "still hot from the last run": preheating under the config's own load is
+what makes rows comparable, where merely skipping the cooldown makes a config inherit
+its neighbour's heat and the result depend on execution order. Different configs
+plateau at different temperatures, which is the honest answer — one that heats harder
+throttles harder in deployment.
+
+`--thermal-mode idle` keeps the older behaviour for burst workloads: capture the idle
+GPU temperature once before the sweep, then between runs block until the sensor falls
+back within a few °C of that baseline (`--thermal-cap` bounds the wait). It degrades to
+a fixed `--cooldown` when no sensor is present, and `--no-thermal-wait` disables both.
+The idle baseline is captured **once, before any GPU work**, and handed to every
+`--iterate` child pass (internal `--thermal-baseline`) — a child re-capturing "idle" at
+the start of pass 2 would bake a hot card into the target and neuter the settle for that
+whole pass.
+
+Both directions detect a plateau with a **rolling window**, not a step-to-step delta,
+and that was measured rather than assumed: an MI50 holding steady under load oscillates
+99↔100 °C, so a 0.5 °C step test resets on every other poll and never converges. Three
+earlier defects in this machinery — a one-poll plateau, a 120 s cap shorter than the
+card takes to cool, and an "idle baseline" sampled off a hot card — each made the guard
+a silent no-op; see [`measurement-validity.md`](measurement-validity.md). The Morris screen (which decides what gets
 *dropped*), the confirmation run (whose prediction comes from settled numbers), and the
 ceiling probe all settle the same way, and every sweep row records its start
 temperature (`temp_c` in the CSV) so thermal comparability is checkable after the fact

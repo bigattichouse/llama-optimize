@@ -241,14 +241,20 @@ they cost **nothing**: an L125 holds 31 factors, so the design stays at 125 runs
 
 **Still assumed, and why it is not a one-liner:**
 
-- **`fa` (`FIXED_FA = 1`)** — the big one, and
-  [`constants-audit.md`](constants-audit.md) C-A has the analysis. Pinned from
-  gfx906 while llama.cpp's own default is `auto`, which decides per build. It
-  cannot simply be unpinned: `-fa` is a precondition for quantized KV, so letting
-  it fall to `auto` on a backend that declines FA would silently invalidate every
-  `q8_0` row. The honest fix is to probe whether FA is active and gate `kv_type`
-  on the answer — the same shape as the `ngl` launch probe, which is now built
-  and can be followed.
+- **`fa`** — **fixed 2026-09-02** (issue #20). Was `FIXED_FA = 1`, pinned from
+  gfx906 while llama.cpp's own default is `auto`. It could not simply be
+  unpinned: `-fa` is a precondition for quantized KV, so letting it fall to
+  `auto` on a backend that declines FA would silently invalidate every `q8_0`
+  row. So it is **probed** — the same shape as the `ngl` launch probe — and the
+  answer decides: `-fa 1` where quantized `kv_type` levels are in the design,
+  `-fa auto` where they are not, with the reason printed.
+
+  The detection is behavioural, since llama.cpp reports FA state in no log line
+  at any default verbosity: a quantized cache cannot be created without FA, so
+  `-fa auto -ctk q8_0` standing up *is* proof that `auto` resolved to on.
+
+  Still open: whether FA is *faster*. The one measurement here was a thermal
+  artifact and was retracted ([`constants-audit.md`](constants-audit.md) C-A).
 - **`load_mode`** — pinned to `mmap` where llama.cpp's default is `auto`. The
   reason is documented (every row should load the model the same way) and is
   defensible, but unlike the others this one is *not* free to sweep: `none` reads
