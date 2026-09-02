@@ -94,6 +94,24 @@ earlier.
 
 ### Added
 
+- **Shareable hardware/model fingerprints** ([issue #21]). Every sweep now writes
+  `<results>.fingerprint.json` beside its CSV: CPU model, cores and RAM; each GPU
+  with VRAM, backend and backend *version*; OS; llama.cpp build; the model's
+  basename, layer count, context and the architecture flags that gate every
+  conditional behaviour (`ssm_state`, `n_swa`, `n_nextn`, `n_experts`); and how
+  the sweep ran. `--fingerprint` prints it without running anything.
+
+  A results CSV is not interpretable by a stranger without the box that produced
+  it, and asking someone to reconstruct that later is asking them not to share.
+  The point is comparison across machines: findings like "flash attention is 33%
+  slower" or "partial `-ngl` segfaults on hybrid SSM models" are true on one card
+  and unknown everywhere else.
+
+  **No paths, no hostname, no username** — by construction and by test, asserted
+  on the serialised form. Nothing is uploaded: the tool prints an instruction and
+  the user decides. `community/` explains the format and how near a match has to
+  be to mean anything.
+
 - **`--thermal-mode warm` (now the default)** preheats each config with its own
   workload until the GPU stops heating, then measures it at that steady state.
   That is the **sustained** rate — what a deployment gets from a card that is
@@ -928,3 +946,4 @@ crash journal, `--resume`, `--iterate`, `--diff`, and a GPU-free `--selftest`.
 [Issue #16]: https://github.com/bigattichouse/llama-optimize/issues/16
 [Issue #15]: https://github.com/bigattichouse/llama-optimize/issues/15
 [Issue #18]: https://github.com/bigattichouse/llama-optimize/issues/18
+[issue #21]: https://github.com/bigattichouse/llama-optimize/issues/21

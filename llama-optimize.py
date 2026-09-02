@@ -23,6 +23,7 @@ import io
 import json
 import math
 import os
+import platform
 import random
 import re
 import shlex
@@ -363,6 +364,40 @@ def list_devices(binary: Path | None) -> list[dict]:
 
 
 _BACKEND_VERSION_CACHE: dict = {}
+
+
+def cpu_model_name() -> str | None:
+    """The CPU's marketing name, or None if it cannot be read.
+
+    Part of a result's identity, not a detail beside it: core *count* is already
+    recorded, but two 8-core machines a decade apart do not produce comparable
+    prefill numbers, and the CPU is the whole story for `ngl=0` rows.
+
+    A plain file read, no subprocess. `lscpu` would be tidier and is one more
+    thing to be missing in a container."""
+    try:
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith(("model name", "Model name")):
+                return line.split(":", 1)[1].strip() or None
+            # aarch64 has no "model name"; this is the closest stable analogue
+            if line.startswith("CPU part"):
+                return f"ARM {line.split(':', 1)[1].strip()}"
+    except (OSError, IndexError):
+        pass
+    return None
+
+
+def system_ram_mib() -> int | None:
+    """Total system RAM in MiB, or None. Sets the ceiling on what `nkvo=1` and
+    CPU-resident layers can do, so a row that offloads to host memory is not
+    comparable across machines without it."""
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) // 1024
+    except (OSError, IndexError, ValueError):
+        pass
+    return None
 
 
 def backend_version(backend: str) -> str | None:
@@ -5347,6 +5382,130 @@ def show_discards(rows: list[dict]) -> None:
         print(f"  run {r.get('run_id', '?')}: {r['implausible']}")
 
 
+# Bump when a field changes meaning or is removed. Adding a field does not need
+# a bump: a reader that does not know it ignores it, and one that does can use
+# it. These files will outlive several tool versions, which is the whole point
+# of writing them down.
+FINGERPRINT_SCHEMA = 1
+
+
+def fingerprint(cfg: Config) -> dict:
+    """The machine-readable identity of "where this measurement came from".
+
+    The report already *prints* a scope sentence (`result_scope`). This is the
+    same claim in a form another machine can compare, which is what makes a
+    corpus of shared sweeps possible: the useful question is never "is this box
+    identical to mine" — nobody's is — but "how close is it", and ranking that
+    needs structure rather than prose (issue #21).
+
+    **What is deliberately absent is as important as what is here.** No paths, no
+    hostname, no username. A model path leaks a directory layout and often a
+    login name; the basename and the quant are what actually condition the
+    result. Nothing here identifies a person, so the file can be shared without
+    reading it first — which is the only way sharing gets used.
+
+    Every field is best-effort: an unreadable sensor yields `None` rather than a
+    guess, for the same reason `backend_version` does. A fingerprint that
+    invents a plausible CPU is worse than one that admits it does not know."""
+    hw = cfg.hw or {}
+    # From the structured device list, not by re-parsing the display string:
+    # `vram_src` is built for a human and its shape is free to change.
+    devs = list_devices(cfg.llama_server or cfg.llama_bench)
+    gpus = []
+    for d in devs:
+        backend = re.sub(r"\d+$", "", str(d.get("id", ""))).strip() or None
+        gpus.append({
+            "name": str(d.get("name", "")).strip() or None,
+            "vram_mib": d.get("total_mib"),
+            "backend": backend,
+            "backend_version": backend_version(backend) if backend else None,
+        })
+    return {
+        "schema": FINGERPRINT_SCHEMA,
+        "tool_version": __version__,
+        "cpu": {
+            "model": cpu_model_name(),
+            "physical_cores": hw.get("phys"),
+            "logical_cores": hw.get("logical"),
+            "numa_nodes": hw.get("numa_nodes"),
+            "ram_mib": system_ram_mib(),
+        },
+        # A list, because multi-GPU is a real shape and a fingerprint that
+        # flattens two cards into one is not comparable to either.
+        "gpus": gpus,
+        # What the sweep actually budgeted against: summed across devices, and
+        # from llama.cpp rather than a vendor tool (see detect_vram_mib on why
+        # those disagree on APUs).
+        "vram_total_mib": hw.get("vram"),
+        "os": {
+            "system": platform.system() or None,
+            "release": platform.release() or None,
+            "machine": platform.machine() or None,
+        },
+        "llama_cpp": {
+            "build": llama_build(cfg.llama_server, cfg.llama_bench),
+        },
+        "model": {
+            # basename only: the path is the user's business, the file is not
+            "file": cfg.model.name,
+            "layers": hw.get("n_layers"),
+            "ctx_train": hw.get("n_ctx_train"),
+            # Architecture-conditional behaviour is most of what has been
+            # found on this box, so the flags that gate it travel with the
+            # fingerprint: `ssm_state` decides the ngl collapse, `n_swa` the
+            # prefix-reuse advice, `n_nextn` whether MTP is even possible, and
+            # `n_experts` whether ncmoe applies.
+            "ssm_state": hw.get("ssm_state"),
+            "n_swa": hw.get("n_swa"),
+            "n_nextn": hw.get("n_nextn"),
+            "n_experts": hw.get("n_experts"),
+        },
+        "sweep": {
+            "driver": cfg.driver,
+            "profile": cfg.profile,
+            "task": cfg.task or None,
+            "thermal_mode": getattr(cfg, "thermal_mode", None),
+        },
+    }
+
+
+def fingerprint_path(results: Path) -> Path:
+    """Where a sweep's fingerprint lands: beside its CSV, same stem.
+
+    Beside rather than inside, because the CSV is per-row and this is per-sweep,
+    and because the pair is what gets shared — `results.csv.gz` is meaningless
+    to a stranger without the box it came from."""
+    return Path(str(results) + ".fingerprint.json")
+
+
+def write_fingerprint(cfg: Config, results: Path) -> Path | None:
+    """Write the fingerprint next to the results. Returns the path, or None if
+    it could not be written — never fatal, because a sweep that measured fine
+    should not be failed by a metadata file."""
+    path = fingerprint_path(results)
+    try:
+        path.write_text(json.dumps(fingerprint(cfg), indent=2) + "\n")
+    except OSError:
+        return None
+    return path
+
+
+def share_hint(fp_path: Path, results: Path) -> str:
+    """What to tell the user once both files exist.
+
+    Deliberately an instruction rather than an upload. Nothing leaves this
+    machine without the user doing it themselves: the fingerprint carries no
+    personal data by construction, but "carries no personal data" is a claim the
+    user is entitled to check before it is published rather than after."""
+    return (f"\nfingerprint: {fp_path.name}\n"
+            f"  Share it with your results to let others compare against your "
+            f"hardware:\n"
+            f"    gzip -k {results.name}\n"
+            f"  then attach {fp_path.name} and {results.name}.gz to a report.\n"
+            f"  It records CPU/GPU/OS/model identity and no paths, hostname or "
+            f"user — readable in full before you post it.")
+
+
 def result_scope(cfg: Config) -> str:
     """The sentence every number below the header is conditioned on.
 
@@ -7351,6 +7510,43 @@ def selftest() -> bool:
         f2, b2, _ = pick_recommendations(cfg_v, [rows_v[3]])
         assert f2 is rows_v[3] and b2 is None
         assert pick_recommendations(cfg_v, []) == (None, None, None)
+
+        # --- fingerprint (issue #21): structured identity, no personal data ---
+        _fp_cfg = Config(model=Path("/home/someuser/private-dir/Model-Q5_K_M.gguf"),
+                         llama_bench=Path("/home/someuser/bin/llama-bench"),
+                         llama_server=Path("/home/someuser/bin/llama-server"),
+                         array="auto", ctx_floor=8192, driver="server",
+                         task="write a merge function")
+        _fp_cfg.hw = {"phys": 8, "logical": 16, "vram": 32752, "numa_nodes": 1,
+                      "n_layers": 64, "n_ctx_train": 262144, "ssm_state": 128,
+                      "n_swa": 0, "n_nextn": 0, "n_experts": 0}
+        _fp = fingerprint(_fp_cfg)
+        # The privacy guarantee, asserted rather than intended. A model path
+        # leaks a directory layout and usually a login name; the basename and
+        # quant are what actually condition the result. This is checked on the
+        # SERIALISED form, because a leak anywhere in the tree is a leak.
+        _blob = json.dumps(_fp)
+        assert "someuser" not in _blob, _blob
+        assert "private-dir" not in _blob, _blob
+        assert "/home/" not in _blob, _blob
+        assert socket.gethostname() not in _blob or not socket.gethostname()
+        assert _fp["model"]["file"] == "Model-Q5_K_M.gguf"
+        # ...and it carries what a reader needs to judge how close their box is
+        assert _fp["schema"] == FINGERPRINT_SCHEMA
+        assert _fp["cpu"]["physical_cores"] == 8 and _fp["cpu"]["ram_mib"]
+        assert _fp["vram_total_mib"] == 32752
+        assert _fp["os"]["system"] and _fp["llama_cpp"]["build"] is not None
+        # the architecture flags that gate every conditional behaviour found so
+        # far travel with it, or a near-match cannot be judged at all
+        for _k in ("ssm_state", "n_swa", "n_nextn", "n_experts", "layers"):
+            assert _k in _fp["model"], (_k, _fp["model"])
+        assert _fp["sweep"]["task"] == "write a merge function"
+        # it must survive a round trip: these files outlive tool versions
+        assert json.loads(json.dumps(_fp)) == _fp
+        # written beside the CSV, never inside it
+        assert fingerprint_path(Path("r.csv")).name == "r.csv.fingerprint.json"
+        _hint = share_hint(Path("r.csv.fingerprint.json"), Path("r.csv"))
+        assert "gzip" in _hint and "r.csv.gz" in _hint
 
         # thermal wait-and-watch: no baseline => immediate no-op (never blocks)
         assert wait_until_cool(None) is None
@@ -10519,6 +10715,13 @@ def main():
                          "numbers against thermal/run-to-run noise. Medians persist "
                          "to <results>.verify.json for --report-only; the CSV keeps "
                          "the raw sweep measurements")
+    ap.add_argument("--fingerprint", action="store_true",
+                    help="print this machine's fingerprint as JSON and exit — "
+                         "CPU, GPU(s) with backend version, OS, llama.cpp build "
+                         "and the model's architecture flags. Written beside the "
+                         "results of every sweep automatically; this is for "
+                         "inspecting it without running one. Carries no paths, "
+                         "hostname or user")
     ap.add_argument("--vram", action="store_true",
                     help="measure actual peak VRAM used per run (polls "
                          "rocm-smi/nvidia-smi); records vram_mib and draws the "
@@ -10770,6 +10973,12 @@ def main():
         if dropped:
             print(f"KV quality floor --min-kv {args.min_kv}: dropping {dropped} "
                   f"(keeping {kept})")
+
+    # --fingerprint: print the box's identity and exit. Before --report-only,
+    # because it is the cheaper question and answers without a CSV.
+    if args.fingerprint:
+        print(json.dumps(fingerprint(cfg), indent=2))
+        return
 
     # --report-only: rebuild the report from the results CSV and exit — no GPU
     if args.report_only:
@@ -11283,6 +11492,12 @@ def main():
         fh.close()
         journal.close()
     print(f"\nwrote {args.results}")
+    # The fingerprint travels with the CSV: a results file is not interpretable
+    # by a stranger without the box that produced it, and asking the user to
+    # reconstruct that later is asking them not to share (issue #21).
+    _fp = write_fingerprint(cfg, Path(args.results))
+    if _fp:
+        print(share_hint(_fp, Path(args.results)))
 
     all_rows = merge_result_rows(cfg, rows, args.merge_results)
 

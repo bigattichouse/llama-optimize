@@ -468,6 +468,34 @@ so it survives a crash — see below).
 
 ---
 
+## Sharing results (fingerprints)
+
+Every sweep writes `<results>.fingerprint.json` beside its CSV — the
+machine-readable version of the scope sentence the report already prints:
+
+```
+llama-optimize.py --run model.gguf --results mysweep.csv
+# -> mysweep.csv
+# -> mysweep.csv.fingerprint.json
+llama-optimize.py --fingerprint model.gguf     # just print it, run nothing
+```
+
+It records CPU model/cores/RAM, each GPU with VRAM + backend + backend
+*version*, OS, the llama.cpp build, the model's basename and the architecture
+flags that gate conditional behaviour, and how the sweep ran.
+
+**It contains no paths, no hostname and no username** — a model path leaks a
+directory layout and usually a login name, while the basename and quant are what
+condition the result. That is enforced by a test, not just intended. Nothing is
+uploaded: the tool prints an instruction and you decide.
+
+Why bother: a result is only meaningful with its scope, and the interesting
+findings are exactly the ones a single box cannot settle — flash attention 33%
+slower on one model and helpful on another, partial `-ngl` segfaulting on hybrid
+SSM models under ROCm, prefix reuse collapsing past an architecture-dependent
+depth. See [`community/`](community/) for the format and for how close a match
+has to be before it tells you anything.
+
 ## Recommended workflow (staged / iterative refinement)
 
 **Step 0 — check the setup before spending hours.** A full sweep on a 27B model is
@@ -740,6 +768,9 @@ python3 llama-optimize.py MODEL.gguf [options]
                      the physical context ceiling for the furthest-reaching config,
                      reported as PROBED CEILING with a ready command at ~90% of it)
   --no-shuffle       run in array order (default: randomized, see below)
+  --fingerprint      print this machine's identity as JSON and exit (CPU, GPU(s)
+                     with backend version, OS, llama.cpp build, model arch flags);
+                     written beside every sweep's results automatically
   --no-thermal-wait  disable thermal handling entirely (neither preheat nor settle)
   --thermal-mode M   warm (default) preheats each config with its own workload to
                      its thermal steady state = the SUSTAINED rate; idle settles
