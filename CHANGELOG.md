@@ -194,6 +194,20 @@ earlier.
   columns shrinks nothing and a screen-plus-tune split would cost 150 runs
   instead of 125.
 
+- **An unmeasured config was averaged into the main effects as a zero.** A
+  server-driver row whose reps never finished came back `tg=0.0` with status
+  `OK`. `measured_ok` kept it out of the picks, but `factor_level_means` filters
+  on `status == "OK"` alone — so the row was counted as a measured zero and
+  **halved the main effect of every factor level it touched**, which
+  `refine_factors` then used to decide what the next `--iterate` pass sweeps. The
+  picks stayed right while the analysis and the refinement quietly did not.
+  `err_rate` did not catch it either: a deadline break is not an exception.
+
+  Such a row is now `SLOW` (budget deliberately tightened by `--min-tgs`) or
+  `TIMEOUT` (it simply ran out), matching what the bench driver already did, with
+  the reason recorded and printed. Both routes covered: no rep finished, or every
+  surviving rep reported 0 t/s.
+
 - **The OOM pruner priced the wrong KV placement on every row.**
   `_fit_params_flags` emitted `--no-kv-offload` for `nkvo=0`, but `nkvo=1` is the
   level that puts the KV cache in system RAM — that is what both drivers emit for

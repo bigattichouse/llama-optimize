@@ -256,6 +256,35 @@ Rows already carry `tool_version` and `llama_build` for the same reason: a CSV
 outlives the terminal it was printed in, and the question it has to answer later
 is "what produced this, and on what".
 
+## Nothing measured is not the same as measured zero
+
+A server-driver config whose reps never finished came back `tg = 0.0` with status
+`OK`. That looks harmless — `measured_ok` requires a positive score, so the picks
+and the Pareto frontier already ignored it. But `factor_level_means` filters on
+`status == "OK"` alone, so an **unmeasured row was averaged in as a zero**:
+
+```
+rows: ngl=99 -> 40.0 t/s (measured), ngl=99 -> 0.0 (never ran)
+main effect reported for ngl=99: 20.0
+```
+
+Half the true value, and `refine_factors` reads the same means to decide what the
+next `--iterate` pass narrows to. The picks stayed right while the analysis and
+the refinement quietly did not — the worst shape a defect can have here, because
+nothing in the output looks wrong.
+
+Reproduced by tightening the budget (`--timeout 45` at depth 16384) so the reps
+cannot finish: `status=OK tg=0.0 err_rate=0.5`. Note `err_rate` does not catch it
+either — a deadline break is not an exception, so nothing was counted as failed.
+
+The server driver now names it the way the bench driver already did: **`SLOW`**
+when the budget was deliberately tightened by `--min-tgs`, **`TIMEOUT`** when it
+simply ran out, with the reason in `too_slow` and printed as it happens. Two ways
+in, both covered: no rep finished, or every surviving rep reported 0 t/s. Being
+non-`OK` is what keeps such a row out of the main effects, and `NO_RESULT_STATUS`
+already counts `TIMEOUT` toward the out-of-bounds detection above, so a level that
+can never finish gets reported as such rather than as a slow one.
+
 ## A crash is a measurement of a boundary
 
 A `SIGNAL` row is not a gap in the data. It says a parameter set is **out of

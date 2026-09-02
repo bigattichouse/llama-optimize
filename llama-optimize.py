@@ -4276,8 +4276,10 @@ class ServerSession:
                         "prompt_tok": prompt_tok,
                         "too_slow": (f"pp={pp:.1f} t/s is below --min-pps "
                                      f"{_min_pps:.1f}; decode not measured")}
+            cut_short = False
             for i in range(max(1, reps)):
                 if _expired(deadline):     # budget gone; report what we have
+                    cut_short = True
                     break
                 w0 = time.time()
                 try:
@@ -4323,7 +4325,19 @@ class ServerSession:
             hit = delivered_cache_hit(timings)
             self._warn_cache_miss(hit)
             self._warn_rejected_reps(kept, dropped)
-            return {"pp": pp, "tg": tg,
+            # Nothing was measured is NOT the same as measured zero. A config
+            # whose reps never finished used to come back tg=0.0 with status OK,
+            # which `measured_ok` keeps out of the picks but `factor_level_means`
+            # does not: an unmeasured row is averaged in as a zero and halves the
+            # main effect of every factor at its levels. Say so instead.
+            no_result = None
+            if not kept and not dropped:
+                no_result = ("the budget expired before any rep finished"
+                             if cut_short else
+                             "no rep returned a decode measurement")
+            elif kept and tg <= 0:
+                no_result = "every rep that survived reported 0 t/s"
+            return {"pp": pp, "tg": tg, "no_result": no_result,
                     # Only when NOTHING survived is the configuration itself
                     # unmeasurable; the reason is then built from the reps that
                     # failed, so the row still says what was rejected.
@@ -4519,6 +4533,16 @@ def measure_in_session(cfg: Config, f: dict, session, timeout: int) -> dict:
     # Below a floor the user set. A real measurement they have said they do not
     # want, so it keeps its numbers and is merely not OK — unlike IMPLAUSIBLE,
     # which zeroes them because they cannot be true (T1).
+    # A row that measured NOTHING is not a slow row and not a zero row: it is
+    # not a measurement. Left as OK it enters `factor_level_means` as a zero and
+    # drags down every factor level it touched — the picks are safe (`measured_ok`
+    # drops it) but the main-effects table and `--iterate`'s refinement are not.
+    # Named the same way the bench driver names it: SLOW when the budget was
+    # deliberately tightened by --min-tgs, TIMEOUT when it simply ran out.
+    if status == "OK" and m.get("no_result"):
+        status = "SLOW" if budget < timeout else "TIMEOUT"
+        res.update(status=status, too_slow=m["no_result"])
+        print(f"  !! no measurement: {m['no_result']} — recorded {status}, not OK")
     slow = m.get("too_slow") or (too_slow_reason(cfg, pp, tg)
                                  if status == "OK" else None)
     if status == "OK" and slow:
@@ -7795,6 +7819,61 @@ def selftest() -> bool:
             assert r_ok["status"] == "OK", r_ok
             assert r_ok["tg_tps"] == 600.0
             assert "draft_acc" not in r_ok and "spec_off" not in r_ok, r_ok
+
+            # --- nothing measured is not the same as measured zero ---
+            # A config whose reps never finished came back tg=0.0 with status
+            # OK. `measured_ok` keeps that out of the picks, but
+            # `factor_level_means` does not -- it filters on status == "OK", so
+            # an UNMEASURED row is averaged in as a zero and halves the main
+            # effect of every factor level it touched. The picks stayed right
+            # while the analysis and --iterate's refinement quietly did not.
+            _slow_seq = {"n": 0}
+
+            def _never_finishes(port, prompt, n_gen, timeout, cache=False):
+                _slow_seq["n"] += 1
+                if _slow_seq["n"] > 1:      # the warm request returns; reps do not
+                    time.sleep(0.4)
+                return {"content": "x",
+                        "timings": {"prompt_per_second": 444.1,
+                                    "predicted_per_second": 600.0,
+                                    "predicted_n": 128, "prompt_n": 8192,
+                                    "cache_n": 0}}
+
+            globals()["_completion"] = _never_finishes
+            _slow_cfg = SimpleNamespace(n_prompt=0, n_gen=128, parallel=1, reps=3,
+                                        measure_vram=False, factors={},
+                                        emit_mtp=False, ngram=False, hw={},
+                                        min_tgs=0.0, min_pps=0.0)
+            _buf_nm = io.StringIO()
+            with contextlib.redirect_stdout(_buf_nm):
+                # a budget that is gone before the first rep can run
+                r_nm = measure_in_session(_slow_cfg, {"n_depth": "8192"}, sess, 0)
+            assert r_nm["status"] != "OK", r_nm
+            assert r_nm["status"] in ("TIMEOUT", "SLOW"), r_nm
+            assert r_nm["tg_tps"] == 0.0, r_nm
+            assert "no measurement" in _buf_nm.getvalue(), _buf_nm.getvalue()
+            # a server that answers every rep with 0 t/s is the other way to
+            # produce no number, and it is not a slow config either -- it is a
+            # config that generated nothing while claiming success
+            def _zero_rate(port, prompt, n_gen, timeout, cache=False):
+                return {"content": "",
+                        "timings": {"prompt_per_second": 444.1,
+                                    "predicted_per_second": 0.0,
+                                    "predicted_n": 0, "prompt_n": 8192,
+                                    "cache_n": 0}}
+
+            globals()["_completion"] = _zero_rate
+            _buf_z = io.StringIO()
+            with contextlib.redirect_stdout(_buf_z):
+                r_z = measure_in_session(_slow_cfg, {"n_depth": "8192"}, sess, 30)
+            assert r_z["status"] != "OK", r_z
+            assert "0 t/s" in _buf_z.getvalue(), _buf_z.getvalue()
+
+            # ...and being non-OK is what keeps it out of the main effects
+            assert factor_level_means(
+                [{"status": "OK", "ngl": "99", "eff_tps": 40.0},
+                 {"status": r_nm["status"], "ngl": "99", "eff_tps": 0.0}],
+                "ngl") == {"99": 40.0}
 
             # --- the `agents` request shape reaches measure() (issue #11) ---
             # Every case above runs at reuse 1.0, the pre-4ffa97a shape where
