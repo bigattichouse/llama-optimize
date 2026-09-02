@@ -253,6 +253,46 @@ when it fails is indistinguishable from a guard that works, and all three of
 these failed silently for as long as they existed. A settle that gives up now
 says so, naming the temperature it gave up at.
 
+### Warm is the default, because that is where inference runs
+
+Fixing the settle raised a better question: *should the tool be cooling the card
+at all?* A number taken from an idle card is a **burst** figure. Sustained serving
+runs hot — on an MI50 the card reaches ~100 °C under load and throttles there, and
+that throttled rate is the rate a deployment actually gets. Settling to idle
+measures a state the workload never occupies.
+
+So `--thermal-mode warm` is the default: before any measured rep, each config is
+preheated **with its own workload** until the GPU stops heating, and measured at
+that steady state.
+
+The distinction that makes this work, and it is the whole distinction: **warm
+means "at its own thermal steady state", not "whatever the last run left
+behind".** Simply skipping the cooldown is what produces rows at 44 °C and 87 °C,
+because then a config inherits its neighbour's heat and the measurement depends
+on execution order. Preheating under the config's own load defines the state by
+the config instead, which is why the rows stay comparable.
+
+Two consequences worth stating plainly:
+
+- **Configs plateau at different temperatures, and that is the honest answer.** A
+  config that heats harder really does throttle harder in deployment. It is not
+  noise to be removed.
+- **A burst-fast config can lose a sustained comparison.** For a bursty agent
+  workload where the card really is cool at request time, that ranking is wrong
+  — which is why `--thermal-mode idle` still exists and still settles to the idle
+  baseline.
+
+The preheat reuses the *real* request rather than a cheaper stand-in, because
+heat is a property of the workload: a lighter warm-up would plateau somewhere
+else and hand back a steady state the measured reps do not share. If the preheat
+cap arrives before the card is flat, the row says so — it is a burst number
+wearing a sustained label, and that is exactly the kind of silent failure the
+section above is about.
+
+Warm mode also costs less wall-clock than it replaces: there is no idle baseline
+to establish and no multi-minute cooldown between runs, only a preheat that ends
+when the card is flat.
+
 A finding printed without its scope reads as a property of llama.cpp. It then
 gets adopted as a default and shipped to people whose hardware disagrees, which
 is precisely the history of `FIXED_FA = 1`: measured once, justified in

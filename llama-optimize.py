@@ -1034,16 +1034,41 @@ THERMAL_CAP_S = 600.0
 # against a 49°C target, and the next config was measured on a hot card -- the
 # confound the settle exists to remove (docs/measurement-validity.md).
 THERMAL_PLATEAU_POLLS = 4
+# How wide a window may span and still count as flat. Comparing each reading to
+# the one before it does not work at a plateau: an MI50 holding steady under load
+# was measured oscillating 99↔100°C, so a 0.5°C step test resets on every other
+# poll and never converges — the preheat ran to its cap every time while sitting
+# at the steady state it was waiting for. A window spans ~1°C at the plateau and
+# tens of degrees on the ramp, which separates them cleanly.
+THERMAL_FLAT_BAND_C = 2.0
 # Longest wait for the FIRST reading, before any run. Paid once per sweep and
 # only when the card is hot at launch — which on a shared box is common, and is
 # exactly when a single sample would be worst. 120s was not enough to get from
 # a post-run 100°C to idle: it returned 59°C and called it the baseline.
 IDLE_BASELINE_CAP_S = 300.0
+# Longest preheat before a measured config in `warm` mode. Backstop only: the
+# preheat normally ends when the card stops heating, not on the clock.
+THERMAL_WARMUP_CAP_S = 300.0
 # Set once from --thermal-cap. A process-wide setting rather than a parameter
 # threaded through probe_max_context, verify_picks and the confirmation run:
 # every one of them wants the same answer, and a cap that applies to some
 # settles and not others is worse than either value.
 THERMAL_CAP_ACTIVE = THERMAL_CAP_S
+
+
+def _plateaued(hist: list, settle_polls: int = THERMAL_PLATEAU_POLLS,
+               band: float = THERMAL_FLAT_BAND_C) -> bool:
+    """Has the temperature stopped moving? True once the last `settle_polls + 1`
+    readings span less than `band` degrees.
+
+    A window rather than a step-to-step comparison, because sensor noise at the
+    plateau is the same size as the step threshold — see THERMAL_FLAT_BAND_C.
+    Direction-agnostic on purpose: this answers "is it still moving", and both
+    `run_until_warm` and `idle_baseline_c` want that same question asked."""
+    if len(hist) <= settle_polls:
+        return False
+    w = hist[-(settle_polls + 1):]
+    return (max(w) - min(w)) < band
 
 
 def idle_baseline_c(cap_s: float = IDLE_BASELINE_CAP_S, poll_s: float = 3.0,
@@ -1065,23 +1090,58 @@ def idle_baseline_c(cap_s: float = IDLE_BASELINE_CAP_S, poll_s: float = 3.0,
     t = gpu_temp_c()
     if t is None:
         return None
-    t0, flat, warned = time.time(), 0, False
+    hist, t0, warned = [t], time.time(), False
     while time.time() - t0 < cap_s:
+        if _plateaued(hist, settle_polls):
+            break
+        if not warned and len(hist) > settle_polls:
+            print(f"  thermal: GPU is at {hist[-1]:.0f}°C and still cooling — "
+                  f"waiting for an idle reading before starting "
+                  f"(cap {cap_s:.0f}s)")
+            warned = True
         time.sleep(poll_s)
         nxt = gpu_temp_c()
         if nxt is None:
             break
-        # Only *falling* resets the count. A card that drifts up a little while
-        # idle is idle; one still shedding heat is not.
-        flat = 0 if t - nxt >= 0.5 else flat + 1
-        if not warned and flat == 0:
-            print(f"  thermal: GPU is at {t:.0f}°C and still cooling — waiting "
-                  f"for an idle reading before starting (cap {cap_s:.0f}s)")
-            warned = True
-        t = nxt
-        if flat >= settle_polls:
+        hist.append(nxt)
+    return hist[-1]
+
+
+def run_until_warm(work, cap_s: float = THERMAL_WARMUP_CAP_S,
+                   settle_polls: int = THERMAL_PLATEAU_POLLS
+                   ) -> tuple[str, float] | None:
+    """Apply `work` until the GPU stops heating, then return `(why, temp)`.
+
+    The mirror of `wait_until_cool`, and the reason `warm` is the default: real
+    inference runs on a hot card, so a number taken from a cold one is a burst
+    figure the deployment never sees. On this box the card reaches ~100 °C under
+    sustained load and throttles there — that throttled rate IS the sustained
+    rate, and measuring before it arrives measures something else.
+
+    What makes this comparable rather than a return of the bug it replaces:
+    every config is measured at *its own* thermal steady state, reached under
+    its own load. Simply not cooling between runs is the thing that produced
+    rows at 44 °C and 87 °C, because then a config inherits whatever the last
+    one left behind. Here each config is heated until its temperature is flat,
+    so the state is defined by the config rather than by its neighbour.
+
+    Note that different configs plateau at different temperatures, and that is
+    the honest answer, not a flaw: a config that heats harder really does
+    throttle harder when you deploy it. It does mean a fast burst can lose a
+    sustained comparison, which is why `--thermal-mode idle` still exists."""
+    t = gpu_temp_c()
+    if t is None:
+        return None
+    hist, t0 = [t], time.time()
+    while time.time() - t0 < cap_s:
+        work()
+        nxt = gpu_temp_c()
+        if nxt is None:
             break
-    return t
+        hist.append(nxt)
+        if _plateaued(hist, settle_polls):
+            return "warm", hist[-1]
+    return "cap", hist[-1]
 
 
 def resolve_thermal_baseline(args) -> None:
@@ -1093,8 +1153,13 @@ def resolve_thermal_baseline(args) -> None:
     and neuter the settle for that whole pass.
 
     It must be `idle_baseline_c`, not a bare `gpu_temp_c()` sample — see that
-    function for what a single sample on a busy box does to the settle."""
-    if args.run and not args.no_thermal_wait and args.thermal_baseline is None:
+    function for what a single sample on a busy box does to the settle.
+
+    Only `idle` mode needs one. `warm` defines its target by the load rather
+    than by the idle floor, so it neither takes a baseline nor pays the wait."""
+    if (args.run and not args.no_thermal_wait
+            and getattr(args, "thermal_mode", "warm") == "idle"
+            and args.thermal_baseline is None):
         args.thermal_baseline = idle_baseline_c()
 
 
@@ -1117,25 +1182,23 @@ def wait_until_cool(baseline_c: float | None, band: float = THERMAL_BAND_C,
         return None
     if cap_s is None:
         cap_s = THERMAL_CAP_ACTIVE
-    target, t0, prev = baseline_c + band, time.time(), None
-    tty, stalls, t = sys.stdout.isatty(), 0, None
+    target, t0 = baseline_c + band, time.time()
+    tty, hist, t = sys.stdout.isatty(), [], None
     why = "cap"
     while time.time() - t0 < cap_s:
         t = gpu_temp_c()
         if t is None:
             break
+        hist.append(t)
         if t <= target:
             why = "settled"
-        else:
-            stalls = stalls + 1 if (prev is not None and 0 <= prev - t < 0.5) else 0
-            if stalls >= THERMAL_PLATEAU_POLLS:
-                why = "plateau"
+        elif _plateaued(hist):
+            why = "plateau"
         if tty:
             print(f"\r  thermal: {t:>3.0f}°C  (settle ≤{target:.0f}°C)"
                   f"{'  ok' if why != 'cap' else '  cooling…'}   ", end="", flush=True)
         if why != "cap":
             break
-        prev = t
         time.sleep(poll_s)
     if tty:
         print()
@@ -1946,6 +2009,10 @@ class Config:
     # override these -- a probe or heuristic that widens an explicit pin is
     # overriding the user with a guess about what they meant.
     pinned_factors: set = field(default_factory=set)
+    # "warm" measures each config at its own thermal steady state (what a
+    # deployment actually runs at); "idle" settles back to the idle baseline
+    # first (a burst figure). See run_until_warm.
+    thermal_mode: str = "warm"
     min_tgs: float = 0.0        # abandon a config generating slower than this
     min_pps: float = 0.0        # ...or prefilling slower than this
     slow_grace: int = 60        # never judge a config on less than this many seconds
@@ -4675,6 +4742,31 @@ class ServerSession:
                         "prompt_tok": prompt_tok,
                         "too_slow": (f"pp={pp:.1f} t/s is below --min-pps "
                                      f"{_min_pps:.1f}; decode not measured")}
+            # Preheat to this config's own thermal steady state before any
+            # measured rep, so the number is the sustained rate rather than the
+            # burst rate off a cold card (--thermal-mode). Runs the SAME request
+            # the reps will run: heat is a property of the workload, so a
+            # cheaper stand-in would plateau somewhere else.
+            self.last_warm = None
+            if (getattr(self.cfg, "thermal_mode", "warm") == "warm"
+                    and not _expired(deadline)):
+                def _heat():
+                    try:
+                        _completion(self.port, prompt, n_gen,
+                                    _left(timeout, deadline), cache=True,
+                                    temp=_temp)
+                    except (urllib.error.URLError, OSError,
+                            json.JSONDecodeError):
+                        pass
+                got = run_until_warm(
+                    _heat, cap_s=min(THERMAL_WARMUP_CAP_S,
+                                     max(0.0, _left(timeout, deadline))))
+                if got:
+                    self.last_warm = got
+                    if got[0] == "cap":
+                        print(f"  thermal: still heating at {got[1]:.0f}°C when "
+                              f"the preheat cap ran out — this row may be a "
+                              f"burst number rather than a sustained one")
             cut_short = False
             for i in range(max(1, reps)):
                 if _expired(deadline):     # budget gone; report what we have
@@ -7277,6 +7369,7 @@ def selftest() -> bool:
                 class _TA:
                     run = True
                     no_thermal_wait = False
+                    thermal_mode = "idle"
                     thermal_baseline = None
                 globals()["gpu_temp_c"] = fake_temp(
                     [99.0, 90.0, 70.0, 50.0, 44.2, 44.1, 44.0, 43.9])
@@ -7289,9 +7382,46 @@ def selftest() -> bool:
                 assert _TA.thermal_baseline == 41.0
                 # --no-thermal-wait means no baseline at all
                 _TB = type("_TB", (), dict(run=True, no_thermal_wait=True,
+                                           thermal_mode="idle",
                                            thermal_baseline=None))
                 resolve_thermal_baseline(_TB)
                 assert _TB.thermal_baseline is None
+                # ...and neither does warm mode, which defines its target by the
+                # load rather than the idle floor, so it must not pay the wait
+                _TC = type("_TC", (), dict(run=True, no_thermal_wait=False,
+                                           thermal_mode="warm",
+                                           thermal_baseline=None))
+                resolve_thermal_baseline(_TC)
+                assert _TC.thermal_baseline is None
+
+                # run_until_warm is wait_until_cool's mirror: hold the load
+                # until the card stops HEATING, and report if the cap arrived
+                # first (that row is a burst number, not a sustained one).
+                _cycles = []
+                globals()["gpu_temp_c"] = fake_temp(
+                    [50.0, 70.0, 88.0, 99.0, 99.2, 99.3, 99.4, 99.5])
+                assert run_until_warm(lambda: _cycles.append(1),
+                                      cap_s=99) == ("warm", 99.5)
+                globals()["gpu_temp_c"] = fake_temp(
+                    [50.0, 60.0, 70.0, 80.0, 90.0, 99.0])
+                got_w = run_until_warm(lambda: None, cap_s=0)
+                assert got_w[0] == "cap", got_w
+                # a card drifting slightly DOWN at the plateau is still plateaued
+                globals()["gpu_temp_c"] = fake_temp(
+                    [99.0, 98.9, 98.8, 98.7, 98.6])
+                assert run_until_warm(lambda: None, cap_s=99)[0] == "warm"
+                # The real trace, sampled on an MI50 holding steady under load:
+                # it oscillates 99<->100. Comparing each reading to the previous
+                # one resets on every other poll and NEVER converges, so the
+                # preheat ran to its cap while sitting at the steady state it
+                # was waiting for. A window spans 1°C here and tens of degrees
+                # on the ramp.
+                globals()["gpu_temp_c"] = fake_temp(
+                    [99.0, 100.0, 99.0, 100.0, 99.0, 100.0, 100.0, 99.0])
+                assert run_until_warm(lambda: None, cap_s=99)[0] == "warm"
+                # ...and the ramp that precedes it is NOT mistaken for flat
+                globals()["gpu_temp_c"] = fake_temp([40.0, 55.0, 70.0, 85.0])
+                assert run_until_warm(lambda: None, cap_s=0)[0] == "cap"
         finally:
             globals()["gpu_temp_c"] = real_temp
 
@@ -7663,7 +7793,7 @@ def selftest() -> bool:
         class _A:  # minimal args stand-in for build_child_argv
             model = Path("m"); no_mtp = no_shuffle = no_thermal_wait = False
             thermal_baseline = seed = max_depth = None; timeout = 60; cooldown = 0
-            thermal_cap = THERMAL_CAP_S
+            thermal_cap = THERMAL_CAP_S; thermal_mode = "warm"
             confirm = full_ = html = None; no_probe = False; verify_picks = 2
             merge_results = []
         _av = build_child_argv(_A, replace(cfg_n, ngram_type="ngram-mod"),
@@ -8605,7 +8735,10 @@ def selftest() -> bool:
                                     "prompt_ms": 18000.0 if warm else 1800.0,
                                     "cache_n": 0 if warm else 7373}}
 
-            sess.cfg = SimpleNamespace(prefix_reuse=0.9)      # the agents shape
+            # thermal_mode=idle: this is about request ACCOUNTING, and a warm
+            # preheat deliberately sends extra requests (covered separately).
+            sess.cfg = SimpleNamespace(prefix_reuse=0.9,      # the agents shape
+                                       thermal_mode="idle")
             globals()["_completion"] = _recording
             r_shape = measure_in_session(fake_cfg, {"n_depth": "8192"}, sess, 30)
             assert len(seen) == 2, seen                       # warm + one rep
@@ -8614,6 +8747,24 @@ def selftest() -> bool:
             assert 0.85 <= float(r_shape["reuse"]) <= 0.95, r_shape
             # the server's delivered reuse rides along with the requested one
             assert r_shape["cache_hit"] == 0.9, r_shape
+
+            # ...and in warm mode the SAME request is repeated first, until the
+            # card stops heating, so the measured reps run at the config's own
+            # steady state rather than off a cold card. A cheaper stand-in
+            # workload would plateau somewhere else, so the preheat must reuse
+            # the real one.
+            _real_gt = gpu_temp_c
+            try:
+                seen.clear()
+                globals()["gpu_temp_c"] = fake_temp(
+                    [50.0, 70.0, 90.0, 99.0, 99.1, 99.2, 99.3, 99.4])
+                sess.cfg = SimpleNamespace(prefix_reuse=0.9, thermal_mode="warm")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    measure_in_session(fake_cfg, {"n_depth": "8192"}, sess, 30)
+                assert len(seen) > 2, seen          # warm + preheat + rep
+                assert seen[1] == seen[0], "preheat must reuse the real request"
+            finally:
+                globals()["gpu_temp_c"] = _real_gt
 
             # --- and the bound is right for that shape (issue #11) ---
             # A request that is mostly prefill: 0.35s on the wall, 0.30s of it
@@ -9592,6 +9743,7 @@ def build_child_argv(args, cfg: Config, factors: dict, results_path: Path,
             "--parallel", str(cfg.parallel), "--score", cfg.score,
             "--timeout", str(args.timeout),
             "--cooldown", str(args.cooldown),
+            "--thermal-mode", str(args.thermal_mode),
             "--thermal-cap", str(args.thermal_cap),
             "--spec-draft-n-max", str(cfg.spec_draft_n_max),
             "--llama-bench", str(cfg.llama_bench),
@@ -9996,6 +10148,13 @@ def main():
     ap.add_argument("--confirm", action="store_true",
                     help="after the sweep, run the predicted-optimal config to "
                          "verify the model's prediction (implied by --full)")
+    ap.add_argument("--thermal-mode", choices=("warm", "idle"), default="warm",
+                    help="'warm' (default) preheats each config until the GPU "
+                         "stops heating and measures it at that steady state — "
+                         "what sustained inference actually runs at. 'idle' "
+                         "settles back to the idle baseline between runs "
+                         "instead, measuring burst performance. Neither is "
+                         "applied under --no-thermal-wait")
     ap.add_argument("--thermal-cap", type=float, default=THERMAL_CAP_S,
                     metavar="SECS",
                     help=f"longest wait for the GPU to settle back toward its "
@@ -10384,6 +10543,7 @@ def main():
         draft_model=args.draft_model,
         mmproj=args.mmproj,
         levels=max(2, args.levels),
+        thermal_mode=("off" if args.no_thermal_wait else args.thermal_mode),
         min_tgs=max(0.0, args.min_tgs),
         min_pps=max(0.0, args.min_pps),
         slow_grace=max(1, args.tgs_timeout),
@@ -10774,6 +10934,11 @@ def main():
         print(f"thermal    : idle baseline {thermal_baseline:.0f}°C — settle to "
               f"≤{thermal_baseline + THERMAL_BAND_C:.0f}°C between runs "
               f"(cap {THERMAL_CAP_ACTIVE:.0f}s; --no-thermal-wait to disable)")
+    elif thermal_wait and args.thermal_mode == "warm" and gpu_temp_c() is not None:
+        print(f"thermal    : warm — each config is preheated with its own "
+              f"workload until the GPU stops heating, then measured at that "
+              f"steady state (cap {THERMAL_WARMUP_CAP_S:.0f}s/config). That is "
+              f"the sustained rate; --thermal-mode idle measures burst instead")
     elif thermal_wait:
         print("thermal    : no GPU temp sensor — "
               + (f"using fixed --cooldown {args.cooldown:.0f}s between runs"

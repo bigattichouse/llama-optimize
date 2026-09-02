@@ -430,19 +430,36 @@ so it survives a crash — see below).
 - **Beware thermal drift.** GPUs (notably the MI50) throttle under sustained load,
   so throughput drifts *down* over a long sweep — the same config can measure 40%+
   slower late in the run than early. Two defaults fight it: **execution order is
-  randomized** (`--seed` to reproduce, `--no-shuffle` to disable), and between runs
-  the tool **waits for the GPU to fall back near its idle temperature** (baseline
-  captured once, up front; `--no-thermal-wait` disables it, `--cooldown` is the
-  fixed fallback when no sensor is readable). Each row records its start temp in
-  the CSV (`temp_c`) so you can check comparability afterwards. For steadier
-  numbers use `--full` (more reps). If `--confirm` reports a large predicted-vs-
-  actual gap, suspect either interactions *or* thermal drift.
+  randomized** (`--seed` to reproduce, `--no-shuffle` to disable), and each config
+  is measured at a **defined thermal state** rather than whatever the previous run
+  left behind. Each row records its start temp in the CSV (`temp_c`) so you can
+  check comparability afterwards. For steadier numbers use `--full` (more reps).
+  If `--confirm` reports a large predicted-vs-actual gap, suspect either
+  interactions *or* thermal drift.
 
-  This is not theoretical, and `--no-thermal-wait` is how you walk into it. A
-  flash-attention comparison run here with the settle disabled read as a **33%
-  loss**; `temp_c` showed the two rows were taken at 44 °C and 91 °C. Re-run hot
-  and order-randomised, the difference was **1.03x** — nothing. Read `temp_c`
-  before believing any comparison.
+  **`--thermal-mode warm` (default)** preheats each config with its own workload
+  until the GPU stops heating, then measures it there. That is the **sustained**
+  rate — what a deployment gets from a card that is already hot, throttling
+  included. **`--thermal-mode idle`** instead settles back toward the idle
+  baseline between runs, measuring **burst** performance, which is the right
+  question for a bursty agent workload where the card really is cool at request
+  time (`--thermal-cap` bounds the wait, `--cooldown` is the fixed fallback with
+  no sensor). `--no-thermal-wait` disables both.
+
+  Warm is the default because inference does not run on an idle card. What makes
+  it safe is that it means "at its own steady state", not "still hot from the last
+  run" — the latter is a confound, and preheating under the config's own load is
+  what removes it. Different configs plateau at different temperatures, and that
+  is the honest answer: one that heats harder really does throttle harder.
+
+  This is not theoretical, and it is not only `--no-thermal-wait` that walks you
+  into it. A flash-attention comparison run here with the settle disabled read as
+  a **33% loss**; `temp_c` showed the two rows were taken at 44 °C and 91 °C.
+  Re-run hot and order-randomised, the difference was **1.03x** — nothing.
+  Separately, an EAGLE3 draft head read as **+12%** against a baseline that
+  happened to be measured 43 °C hotter — with the settle *enabled*, which is how
+  three separate bugs in it came to light. At matched temperature it was
+  **1.00x**. Read `temp_c` before believing any comparison.
 
 ---
 
@@ -718,8 +735,11 @@ python3 llama-optimize.py MODEL.gguf [options]
                      the physical context ceiling for the furthest-reaching config,
                      reported as PROBED CEILING with a ready command at ~90% of it)
   --no-shuffle       run in array order (default: randomized, see below)
-  --no-thermal-wait  disable the default settle between runs (waits until GPU temp
-                     falls back near its idle baseline; keeps runs comparable)
+  --no-thermal-wait  disable thermal handling entirely (neither preheat nor settle)
+  --thermal-mode M   warm (default) preheats each config with its own workload to
+                     its thermal steady state = the SUSTAINED rate; idle settles
+                     back toward the idle baseline first = the BURST rate
+  --thermal-cap S    longest settle wait in idle mode (default 600s)
   --parallel N       concurrent streams for the server driver
   --profile P        workload profile: single | agents | multi (default: single)
   --quick            fast screen: 1 rep/config (noisier, ~1/3 the time)
