@@ -9,8 +9,8 @@ design docs it points at.
 Everything is committed and pushed to `main` (through `877fbf3`), the working
 tree is clean, `--selftest` passes, and no GPU work is running.
 
-**Six issues closed: #11, #14, #15, #16, #18, #19.** Five open: #3, #5, #17, #20,
-#21.
+**Seven issues closed: #11, #14, #15, #16, #18, #19, #21.** Four open: #3, #5,
+#17, #20 — three of them blocked on hardware or on someone else's data.
 
 ## What landed
 
@@ -188,13 +188,27 @@ context). What remains is whether the pin itself is right, and the honest versio
 needs a constrained relation between `fa` and `kv_type` rather than a level
 filter.
 
-### 4. The fingerprint (#21)
+### 4. ~~The fingerprint (#21)~~ — shipped; matching is the follow-up
 
-Most of it already exists — `device_label`, `backend_version`, `model_hw`,
-`cfg.hw` — so it is largely serialisation plus a schema version. JSON, because
-`--selftest` promises stdlib-only. It is also the only route to answering the
-questions this box cannot: every architecture-conditional behaviour found this
-session was measured on one card, one backend, one quant.
+Every sweep writes `<results>.fingerprint.json`; `--fingerprint` prints it
+without running anything. `community/README.md` carries the format and the
+match-distance table.
+
+**Not built, deliberately: fingerprint *matching*.** The issue calls ranking
+"how close is this box to mine" the actual product, and it is — but it needs a
+corpus to be useful and there is none yet, and the ranking rules are a guess
+until real near-misses exist to test them against. The format had to come first.
+The distance table in `community/README.md` is the sketch to implement when
+there is something to match.
+
+Two decisions worth not re-litigating:
+
+- **`gpus` is a list**, built from `list_devices` rather than by re-parsing
+  `vram_src`. Multi-GPU is a real shape, the display string is free to change,
+  and a fingerprint that flattens two cards into one is comparable to neither.
+- **Privacy is asserted on the serialised JSON**, not on the dict, because a
+  leak anywhere in the tree is a leak. Mutating `cfg.model.name` to the full
+  path fails `--selftest`.
 
 ## Blocked, and on what
 

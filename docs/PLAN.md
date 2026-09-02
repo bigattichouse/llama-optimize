@@ -159,12 +159,11 @@ needs two non-identical GPUs and by construction cannot be tested here.
   **Note the retraction** in [`constants-audit.md`](constants-audit.md) C-A — the
   "33% slower" measurement was a cold row against a hot one, and the question is
   still open rather than answered.
-- **Issue #21 — shareable fingerprints.** Mostly serialisation now: `device_label`,
-  `backend_version`, `model_hw` and `cfg.hw` already hold the values, and the
-  report prints them. JSON with a schema version, because `--selftest` promises
-  stdlib-only. It is the only route to answering the questions this box cannot —
-  every architecture-conditional behaviour found this session was measured on one
-  card, one backend, one quant.
+- **Issue #21 — shareable fingerprints. Done** (2026-09-02). Every sweep writes
+  `<results>.fingerprint.json`; `--fingerprint` prints it standalone;
+  `community/` holds the format and the match-distance table. What remains is
+  **matching** — ranking how close another box is — which is the part with real
+  value and which needs a corpus before its rules can be anything but a guess.
 - **Issue #17 — `ngl` and `ncmoe` on MoE models.** Partly dissolved: on a *hybrid*
   MoE, `ngl` is now `[0, 99]` (#18) so the two no longer compete for the offload
   axis. Still open for a dense-attention MoE, which this box does not have.

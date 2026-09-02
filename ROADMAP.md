@@ -31,13 +31,20 @@ Worst case on an L125 at `--n-gen 256 --reps 3`: **41.7h → 3.5h** with
 Remaining: nothing reports, after a sweep, how much time the floors actually
 saved — that number would be the honest way to tune the advice.
 
-## 0b. Shareable fingerprints — idea, not yet designed
+## 0b. Shareable fingerprints — the format shipped; matching has not
 
-[Issue #21](https://github.com/bigattichouse/llama-optimize/issues/21). The
-report now prints what a result is conditioned on — quant, model, card, backend
-and version, capacity, cores. The idea is to make that **shareable and
-comparable**: a structured fingerprint plus the gzipped results CSV, collected
-somewhere the next person can search before spending four hours sweeping.
+[Issue #21](https://github.com/bigattichouse/llama-optimize/issues/21).
+**Done 2026-09-02:** every sweep writes `<results>.fingerprint.json` beside its
+CSV, `--fingerprint` prints it without running anything, and
+[`community/`](community/README.md) documents the format, the contribution flow
+and how close a match has to be before it means anything.
+
+**Still open, and it is the half with the value: matching.** Ranking "how close
+is this box to mine" needs a corpus to be useful, and its rules are guesswork
+until real near-misses exist to test them against — same card on ROCm 6 vs 7 is
+*probably* worth flagging, but nobody here has measured whether it changes a
+winner. The distance table in `community/README.md` is the sketch; implement it
+when there is something to match against.
 
 *"See if the community posted sweeps"* would invert the tool's cost. Today every
 user pays a full sweep to learn what their hardware does; a corpus turns the
