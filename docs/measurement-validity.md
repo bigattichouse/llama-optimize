@@ -268,6 +268,21 @@ Bracketed rather than guessed, on `Qwen3.6-35B-A3B` (MI50 32GB / ROCm, llama.cpp
 | filler, deep | 13,058 | **1** | **`eos`** | 0.00 |
 | filler, deep **+ task block** | 15,401 (cached) | 128 | `limit` | 26.1 t/s |
 
+Verified again with the tool's *own* prompt battery (varied sentences, not the
+single repeated line the first probe used) at both temperatures, because "the
+model just stops" deserves the scepticism it got:
+
+| tool prompt | `predicted_n` | `stop_type` |
+|---|---|---|
+| depth 4096, no task, temp 0 | 128 | `limit` |
+| depth 4096, no task, temp 0.7 | 128 | `limit` |
+| depth 16384, no task, temp 0 | **1** | **`eos`** |
+| depth 16384, no task, temp 0.7 | **1** | **`eos`** |
+| depth 16384, `--task code`, temp 0 | 128 | `limit` |
+
+Depth is the variable and `--task` is the fix. Sampling temperature is ruled out,
+so it is not a greedy-decoding artifact.
+
 **The model emits EOS as its first token.** `truncated = 0`, so it is not context
 overflow, and the deadline is not involved. Given thousands of tokens of repeated
 filler and no instruction, the model decides the document is finished — which is
