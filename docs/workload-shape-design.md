@@ -501,14 +501,42 @@ your own instruction. The task is recorded in the results CSV and printed in the
 report's scope line, because two sweeps with different tasks measured different
 things and their numbers do not compare.
 
-### Still unmeasured, and possibly larger
+### Sampling is part of the workload, not a knob beside it
 
-Sampling. The tool sends `temperature: 0`; the reporter's command used
-`--temp 1.0 --top-p 0.95 --top-k 20`. Greedy output is more predictable, so temp 0
-should *inflate* acceptance — plausibly a large part of the same 45-vs-31 gap and
-entirely independent of content. The tool also sends a raw completion where their
-run used `--jinja` with a chat template and a reasoning format. Neither has been
-measured; both are cheap to test and neither needs new machinery.
+Nobody generates code at temperature 1.0 or roleplays at 0.0, and the difference
+is not cosmetic: **greedy output is the most predictable output there is, so
+temperature drives speculative acceptance directly.** Measuring everything at 0
+flatters every drafter.
+
+So each preset carries the temperature its content is normally generated at —
+`code*` 0.0, `reasoning` 0.6, `roleplay` 0.9 — `--temp` overrides, and free-form
+`--task` text falls back to the greedy default. Like the instructions, these are
+opinions meant to be argued with.
+
+The default stays 0.0 with no preset, and that is a deliberate compromise rather
+than a judgement: moving it would move every number the tool has produced. It is
+said out loud in the header instead, alongside what is being generated.
+
+**Still unmeasured:** whether temperature explains much of the reporter's
+45-vs-31 gap. It is now expressible (`--temp`), so it is a measurement rather
+than a change. Also unaddressed: `top_p`/`top_k`, which the reporter also set,
+and the fact that the tool sends a raw completion where their run used `--jinja`
+with a chat template and a reasoning format. That last one is a different output
+distribution again, and no flag reaches it.
+
+### Silence is not a neutral default
+
+Running without `--task` measures prose, and that used to happen without saying
+so. It now announces itself:
+
+```
+task       : none — the model continues filler prose at temp 0.0.
+             Speculative results will describe PROSE, not your work. Set
+             --task code|code:sql|reasoning|roleplay|'your own instruction'
+```
+
+and the setup interview asks for the workload **first**, listing the presets with
+their temperatures, because it is the question whose default is most misleading.
 
 ## Open questions
 

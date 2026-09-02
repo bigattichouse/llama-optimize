@@ -1770,6 +1770,8 @@ class Config:
     # acceptance is a property of the OUTPUT, and without this the output is
     # always more filler prose (issue #11).
     task: str | None = None
+    # explicit --temp; None means "let the task decide, else the greedy default"
+    temperature: float | None = None
     env_factor_names: set = field(default_factory=set)  # factors that set env vars
     # Throughput floors: a config below them is a real measurement the user has
     # said they do not want, so waiting for it to finish buys nothing (T1).
@@ -3297,11 +3299,14 @@ class Intent:
     levels: int = 5                 # cost dial (see --levels)
     min_tgs: float = 0.0            # slowest result worth deploying
     reps: str = "standard"          # quick | standard | full
+    task: str | None = None         # what the model should GENERATE (--task)
 
 
 def intent_args(intent: Intent) -> list[str]:
     """The CLI arguments an Intent implies. Pure — no I/O, no hardware."""
     args: list[str] = []
+    if intent.task:
+        args += ["--task", intent.task]
     if intent.ctx:
         args += ["--ctx-size", str(int(intent.ctx))]
     if intent.levels != 5:
@@ -3355,25 +3360,43 @@ def ask_intent(n_ctx_train: int | None) -> Intent:
     """Interview the user. Raises _Abort if they bail out."""
     it = Intent()
     print()
-    print("Setup — four questions, then it prints the command it would run.")
+    print("Setup — five questions, then it prints the command it would run.")
     print("(Enter accepts the default; Ctrl-C to skip and use defaults.)")
     print()
+    # Asked FIRST because it is the question whose default is most misleading.
+    # With no answer the model generates a continuation of filler prose, and
+    # every speculative number then describes prose rather than the user's work
+    # (issue #11: a reporter saw 31 t/s where the sweep said 45).
+    print("1. What do you use it for? Speculative decoding drafts OUTPUT tokens,")
+    print("   so what the model GENERATES changes the numbers — measuring code")
+    print("   and measuring roleplay give different answers on the same box.")
+    _opts = ["code", "code:sql", "code:js", "code:cpp", "code:web",
+             "reasoning", "roleplay"]
+    for _o in _opts:
+        _t = TASK_PRESETS[_o]
+        print(f"     {_o:<10} temp {_t['temp']:.1f}  {_t['task'][:52]}...")
+    print("     (or type your own instruction, or blank for none)")
+    it.task = _ask("workload", "code") or None
+    if it.task is None:
+        print("   -> no task: the model will continue filler prose, so any")
+        print("      speculative result describes prose. --task changes it.")
+    print()
     native = f" (this model trains to {n_ctx_train})" if n_ctx_train else ""
-    print(f"1. Context{native}. If you always serve at one size, give it —")
+    print(f"2. Context{native}. If you always serve at one size, give it —")
     print("   pinning context is the single biggest saving, and tuning at a")
     print("   size you never use is the most common way to waste a sweep.")
     it.ctx = _ask_int("context you serve at, blank to sweep a range", "")
     print()
-    print("2. Speed floor. Configs below this are abandoned rather than waited")
+    print("3. Speed floor. Configs below this are abandoned rather than waited")
     print("   out — the main reason sweeps take all night.")
     it.min_tgs = _ask_float("slowest generation t/s worth deploying, blank for none", "")
     print()
-    print("3. How much of the space to search.")
+    print("4. How much of the space to search.")
     print("   coarse = 3 levels/knob (~27 runs), full = 5 (~125 runs).")
     coarse = _ask("coarse or full", "coarse").lower().startswith("c")
     it.levels = 3 if coarse else 5
     print()
-    print("4. Repeats per config. More reps = less noise, proportionally longer.")
+    print("5. Repeats per config. More reps = less noise, proportionally longer.")
     it.reps = _ask("quick / standard / full", "standard").lower()
     if it.reps not in ("quick", "standard", "full"):
         it.reps = "standard"
@@ -3782,28 +3805,66 @@ TASK_TEMPLATE = "\n\n### Task\n{task}\n\n### Response\n"
 # scores. The point is that speculative acceptance is a property of the generated
 # text, so a handful of representative shapes beats one prose default — and any
 # of them can be replaced by passing your own instruction instead.
+# Each preset carries its own temperature, because sampling is part of the
+# workload rather than a knob beside it. Nobody generates code at 1.0 or
+# roleplay at 0.0, and the choice is not cosmetic here: temperature drives
+# speculative ACCEPTANCE. Greedy output is the most predictable output there is,
+# so measuring everything at 0 flatters every drafter (issue #11).
+#
+# The temperatures are opinions, like the instructions, and are meant to be
+# argued with or replaced by `--temp`.
 TASK_PRESETS = {
-    "code": "Write a complete, working program that plays tic-tac-toe against "
-            "the user on the command line. Include the full source.",
-    "code:sql": "Write the SQL for a reporting schema: tables for customers, "
-                "orders and line items, then a query returning each customer's "
-                "monthly spend for the last year with running totals.",
-    "code:js": "Write a single-file JavaScript module that implements a virtual "
-               "scrolling list: rendering only visible rows, recycling nodes, "
-               "and handling resize. Include the full source.",
-    "code:cpp": "Write a C++ header-only implementation of a lock-free "
-                "single-producer single-consumer ring buffer, with the memory "
-                "ordering justified in comments.",
-    "code:web": "Write a complete single-page web app — HTML, CSS and JS in one "
-                "file — that renders a sortable, filterable table of a few "
-                "hundred rows.",
-    "reasoning": "A train leaves station A at 14:05 travelling at 78 km/h. A "
-                 "second leaves station B, 340 km away, at 14:40 travelling at "
-                 "94 km/h toward A. Work out where and when they meet, showing "
-                 "every step, then check the answer a different way.",
-    "roleplay": "You're a bartender on a space station, telling a story about "
-                "your childhood on the planet below before first contact.",
+    "code": {"temp": 0.0, "task":
+             "Write a complete, working program that plays tic-tac-toe against "
+             "the user on the command line. Include the full source."},
+    "code:sql": {"temp": 0.0, "task":
+                 "Write the SQL for a reporting schema: tables for customers, "
+                 "orders and line items, then a query returning each customer's "
+                 "monthly spend for the last year with running totals."},
+    "code:js": {"temp": 0.0, "task":
+                "Write a single-file JavaScript module that implements a virtual "
+                "scrolling list: rendering only visible rows, recycling nodes, "
+                "and handling resize. Include the full source."},
+    "code:cpp": {"temp": 0.0, "task":
+                 "Write a C++ header-only implementation of a lock-free "
+                 "single-producer single-consumer ring buffer, with the memory "
+                 "ordering justified in comments."},
+    "code:web": {"temp": 0.0, "task":
+                 "Write a complete single-page web app — HTML, CSS and JS in one "
+                 "file — that renders a sortable, filterable table of a few "
+                 "hundred rows."},
+    # thinking-mode models are usually run warm; 0.6 is Qwen3's own
+    # recommendation for that mode and a reasonable stand-in for the class
+    "reasoning": {"temp": 0.6, "task":
+                  "A train leaves station A at 14:05 travelling at 78 km/h. A "
+                  "second leaves station B, 340 km away, at 14:40 travelling at "
+                  "94 km/h toward A. Work out where and when they meet, showing "
+                  "every step, then check the answer a different way."},
+    "roleplay": {"temp": 0.9, "task":
+                 "You're a bartender on a space station, telling a story about "
+                 "your childhood on the planet below before first contact."},
 }
+
+# What a bare `--task 'my own text'` is measured at, and what the tool has always
+# used. Greedy, and therefore the most generous setting a drafter can be given:
+# kept as the default only because changing it would move every number the tool
+# has ever produced, and said out loud in the header instead.
+DEFAULT_TEMPERATURE = 0.0
+
+
+def effective_temperature(cfg) -> float:
+    """The sampling temperature this sweep should measure at.
+
+    Explicit `--temp` wins; otherwise a preset's own temperature; otherwise the
+    greedy default the tool has always used. Greedy is the most generous setting
+    a drafter can be given -- the output is as predictable as it will ever be --
+    so it is kept as the default only because moving it would move every number
+    the tool has produced, and is said out loud in the header instead."""
+    explicit = getattr(cfg, "temperature", None)
+    if explicit is not None:
+        return float(explicit)
+    from_task = task_temperature(getattr(cfg, "task", None))
+    return DEFAULT_TEMPERATURE if from_task is None else from_task
 
 
 def resolve_task(task: str | None) -> str | None:
@@ -3816,7 +3877,21 @@ def resolve_task(task: str | None) -> str | None:
     against."""
     if task is None:
         return None
-    return TASK_PRESETS.get(task.strip().lower(), task)
+    preset = TASK_PRESETS.get(task.strip().lower())
+    return preset["task"] if preset else task
+
+
+def task_temperature(task: str | None) -> float | None:
+    """The temperature a preset is normally generated at, or None for free text.
+
+    Separate from `resolve_task` because the caller has to be able to tell "this
+    preset asked for 0.9" from "nothing asked for anything", so an explicit
+    `--temp` can win over the preset while the preset still wins over the
+    default."""
+    if task is None:
+        return None
+    preset = TASK_PRESETS.get(task.strip().lower())
+    return None if preset is None else float(preset["temp"])
 
 
 def task_block(task: str | None) -> str:
@@ -4122,11 +4197,12 @@ def raise_for_server_error(body):
     return body
 
 
-def _completion(port: int, prompt, n_gen: int, timeout: int, cache: bool = False) -> dict:
+def _completion(port: int, prompt, n_gen: int, timeout: int, cache: bool = False,
+                temp: float = DEFAULT_TEMPERATURE) -> dict:
     body = json.dumps({
         "prompt": prompt,
         "n_predict": n_gen,
-        "temperature": 0,
+        "temperature": temp,
         "cache_prompt": cache,
         "timings_per_token": False,
     }).encode()
@@ -4370,6 +4446,10 @@ class ServerSession:
         # then gets prompts of the requested SIZE from the very first config
         # rather than from the second (docs/constants-audit.md C-B, issue #11).
         self.calibrate(_left(timeout, deadline))
+        # sampling belongs to the workload: a preset carries the temperature its
+        # content is normally generated at, --temp overrides, and the historical
+        # greedy default applies to anything else (issue #11)
+        _temp = effective_temperature(self.cfg)
         prompts = prompt_battery(prompt_len, n_req, reuse,
                                  chars_per_token=getattr(self, "cpt", None),
                                  task=getattr(self.cfg, "task", None))
@@ -4386,7 +4466,8 @@ class ServerSession:
             prompt_tok = 0
             try:
                 warm = _completion(self.port, prompt, n_gen,
-                                   _left(timeout, deadline), cache=True)
+                                   _left(timeout, deadline), cache=True,
+                                   temp=_temp)
                 wt = warm.get("timings", {})
                 pp = wt.get("prompt_per_second", 0.0) or 0.0
                 # What the prompt ACTUALLY became. `n_depth` records what was
@@ -4431,7 +4512,8 @@ class ServerSession:
                 w0 = time.time()
                 try:
                     r = _completion(self.port, prompts[(i + 1) % len(prompts)],
-                                    n_gen, _left(timeout, deadline), cache=True)
+                                    n_gen, _left(timeout, deadline), cache=True,
+                                    temp=_temp)
                 except (urllib.error.URLError, OSError, json.JSONDecodeError):
                     n_err += 1
                     continue
@@ -7926,18 +8008,91 @@ def selftest() -> bool:
         assert all(p.endswith(task_block("Do the thing.")) for p in _tp1), _tp1[0][-40:]
         assert len(set(_tp1)) == 1, "reuse 1.0 must still be identical requests"
 
+        # ...and it reaches the wire. Stubbing _completion would skip the body
+        # entirely, so the HTTP layer is stubbed instead and the JSON inspected:
+        # a temperature that is resolved correctly and then not sent is the same
+        # bug as not resolving it.
+        _sent = []
+        _real_urlopen = urllib.request.urlopen
+
+        class _Resp:
+            def __enter__(self_): return self_
+            def __exit__(self_, *a): return False
+            def read(self_):
+                return json.dumps({"content": "x", "timings": {
+                    "prompt_per_second": 444.1, "predicted_per_second": 600.0,
+                    "predicted_n": 128, "prompt_n": 8192, "cache_n": 0}}).encode()
+
+        try:
+            def _cap(req, timeout=None):
+                _sent.append(json.loads(req.data))
+                return _Resp()
+
+            urllib.request.urlopen = _cap
+            _completion(1, "hello", 8, 5, temp=0.7)
+            assert _sent[-1]["temperature"] == 0.7, _sent[-1]
+            _completion(1, "hello", 8, 5)
+            assert _sent[-1]["temperature"] == DEFAULT_TEMPERATURE, _sent[-1]
+
+            # every request of a measurement uses the SAME temperature -- a warm
+            # request at one and the reps at another would compare two workloads
+            _sent.clear()
+            _sess_t = ServerSession.__new__(ServerSession)
+            _sess_t.port, _sess_t.ok, _sess_t.err = 1, True, ""
+            _sess_t._calibrated = True
+            _sess_t.cpt = 4.0
+            _sess_t.cfg = SimpleNamespace(prefix_reuse=0.0, task="roleplay",
+                                          temperature=None, min_pps=0.0)
+            _sess_t.measure(64, 8, 1, 2, 30)
+            assert len(_sent) >= 3, _sent               # warm + reps
+            assert {b["temperature"] for b in _sent} == {0.9}, \
+                {b["temperature"] for b in _sent}
+        finally:
+            urllib.request.urlopen = _real_urlopen
+
+        # sampling is resolved with an explicit --temp winning over a preset,
+        # and a preset over the historical greedy default
+        assert effective_temperature(SimpleNamespace(task="code:sql",
+                                                     temperature=None)) == 0.0
+        assert effective_temperature(SimpleNamespace(task="roleplay",
+                                                     temperature=None)) == 0.9
+        assert effective_temperature(SimpleNamespace(task="roleplay",
+                                                     temperature=0.2)) == 0.2
+        assert effective_temperature(SimpleNamespace(task=None,
+                                                     temperature=None)) \
+            == DEFAULT_TEMPERATURE
+        assert effective_temperature(SimpleNamespace(task="my own words",
+                                                     temperature=None)) \
+            == DEFAULT_TEMPERATURE
+        # --temp 0 is a choice, not an absence: it must not fall through
+        assert effective_temperature(SimpleNamespace(task="roleplay",
+                                                     temperature=0.0)) == 0.0
+
+        # the interview asks for the workload, and it becomes the flag
+        assert intent_args(Intent(task="roleplay"))[:2] == ["--task", "roleplay"]
+        assert "--task" not in intent_args(Intent())
+
         # a preset expands, anything else is used verbatim, and None stays None
-        assert resolve_task("roleplay") == TASK_PRESETS["roleplay"]
-        assert resolve_task("code:sql") == TASK_PRESETS["code:sql"]
-        assert resolve_task("  ROLEPLAY ") == TASK_PRESETS["roleplay"]   # forgiving
+        assert resolve_task("roleplay") == TASK_PRESETS["roleplay"]["task"]
+        assert resolve_task("code:sql") == TASK_PRESETS["code:sql"]["task"]
+        assert resolve_task("  ROLEPLAY ") == TASK_PRESETS["roleplay"]["task"]
         assert resolve_task("Implement chess in brainfuck") \
             == "Implement chess in brainfuck"
         assert resolve_task(None) is None
         assert task_block(None) == "" and task_block("   ") == ""
         # every preset says what to DO -- a corpus in the prompt would change
         # prefill and leave the output as prose, which is the whole failure mode
-        for _name, _txt in TASK_PRESETS.items():
-            assert len(_txt) > 40, _name
+        for _name, _spec in TASK_PRESETS.items():
+            assert len(_spec["task"]) > 40, _name
+            assert 0.0 <= _spec["temp"] <= 2.0, _name
+        # sampling is part of the workload: nobody writes code at 1.0 or
+        # roleplays at 0.0, and temperature drives speculative acceptance
+        assert task_temperature("code:sql") == 0.0
+        assert task_temperature("roleplay") > 0.5
+        assert task_temperature("reasoning") > 0.0
+        # free text asks for nothing, so the default applies
+        assert task_temperature("Implement chess in brainfuck") is None
+        assert task_temperature(None) is None
 
         # delivered cache hit: what the server reused, not what we asked for
         assert delivered_cache_hit([{"cache_n": 7373, "prompt_n": 819}]) == 0.9
@@ -8027,7 +8182,7 @@ def selftest() -> bool:
         _real_completion = _completion
         try:
             def _fake(per_second, draft=None):
-                def f(port, prompt, n_gen, timeout, cache=False):
+                def f(port, prompt, n_gen, timeout, cache=False, **_kw):
                     time.sleep(0.02)
                     t = {"prompt_per_second": 444.1,
                          "predicted_per_second": per_second,
@@ -8063,7 +8218,7 @@ def selftest() -> bool:
             # while the analysis and --iterate's refinement quietly did not.
             _slow_seq = {"n": 0}
 
-            def _never_finishes(port, prompt, n_gen, timeout, cache=False):
+            def _never_finishes(port, prompt, n_gen, timeout, cache=False, **_kw):
                 _slow_seq["n"] += 1
                 if _slow_seq["n"] > 1:      # the warm request returns; reps do not
                     time.sleep(0.4)
@@ -8089,7 +8244,7 @@ def selftest() -> bool:
             # a server that answers every rep with 0 t/s is the other way to
             # produce no number, and it is not a slow config either -- it is a
             # config that generated nothing while claiming success
-            def _zero_rate(port, prompt, n_gen, timeout, cache=False):
+            def _zero_rate(port, prompt, n_gen, timeout, cache=False, **_kw):
                 return {"content": "",
                         "timings": {"prompt_per_second": 444.1,
                                     "predicted_per_second": 0.0,
@@ -8129,7 +8284,7 @@ def selftest() -> bool:
             # is issue #11 and is not settled here.)
             seen = []
 
-            def _recording(port, prompt, n_gen, timeout, cache=False):
+            def _recording(port, prompt, n_gen, timeout, cache=False, **_kw):
                 seen.append(prompt)
                 time.sleep(0.02)
                 # the warm request prefills the lot; the reps hit the cache for
@@ -8163,7 +8318,7 @@ def selftest() -> bool:
             # ~366 t/s and an honest 1500 reads as impossible; against the
             # decode it is actually a claim about, it is fine.
             def _prefill_heavy(per_second, prompt_ms=300.0, pps=444.1):
-                def f(port, prompt, n_gen, timeout, cache=False):
+                def f(port, prompt, n_gen, timeout, cache=False, **_kw):
                     time.sleep(0.35)
                     t = {"prompt_per_second": pps,
                          "predicted_per_second": per_second,
@@ -8213,7 +8368,7 @@ def selftest() -> bool:
             _seq = {"i": 0}
 
             def _per_rep(rates):
-                def f(port, prompt, n_gen, timeout, cache=False):
+                def f(port, prompt, n_gen, timeout, cache=False, **_kw):
                     time.sleep(0.05)
                     i = _seq["i"]
                     _seq["i"] += 1
@@ -8281,7 +8436,7 @@ def selftest() -> bool:
             _sizes = []
 
             def _tokenizer(chars_per_token):
-                def f(port, prompt, n_gen, timeout, cache=False):
+                def f(port, prompt, n_gen, timeout, cache=False, **_kw):
                     _sizes.append(len(prompt))
                     time.sleep(0.01)
                     return {"content": "x",
@@ -8357,7 +8512,7 @@ def selftest() -> bool:
             # would not load". Those are different configs to deploy.
             _calls = {"n": 0}
 
-            def _flaky(port, prompt, n_gen, timeout, cache=False):
+            def _flaky(port, prompt, n_gen, timeout, cache=False, **_kw):
                 _calls["n"] += 1
                 if _calls["n"] % 4 == 0:          # every 4th request fails
                     raise OSError("simulated request failure")
@@ -8381,7 +8536,7 @@ def selftest() -> bool:
             assert error_note(r_part), r_part
 
             # every request failing IS an error: there is no measurement
-            def _dead(port, prompt, n_gen, timeout, cache=False):
+            def _dead(port, prompt, n_gen, timeout, cache=False, **_kw):
                 raise OSError("server gone")
             globals()["_completion"] = _dead
             r_dead = measure_in_session(par_cfg, {"n_depth": "0"}, sess, 30)
@@ -8395,7 +8550,7 @@ def selftest() -> bool:
 
             # an error payload is a failure, not a zero-time measurement, and
             # the raise it produces is what measure_in_session turns into ERROR
-            def _err(port, prompt, n_gen, timeout, cache=False):
+            def _err(port, prompt, n_gen, timeout, cache=False, **_kw):
                 return raise_for_server_error(
                     {"error": {"message": "context shift is disabled"}})
             globals()["_completion"] = _err
@@ -9643,6 +9798,15 @@ def main():
                          "measured benefit depends on what is generated — "
                          "without this the output is filler prose and the "
                          "numbers describe prose. Server driver only")
+    ap.add_argument("--temp", type=float, default=None, dest="temperature",
+                    metavar="T",
+                    help="sampling temperature for the measured requests. "
+                         "Defaults to the --task preset's own (code 0.0, "
+                         "reasoning 0.6, roleplay 0.9) or 0.0 with no preset. "
+                         "It is not a tuning knob — it is part of the workload: "
+                         "greedy output is the most predictable output there is, "
+                         "so temperature drives how much speculative decoding "
+                         "appears to buy")
     ap.add_argument("--prefix-reuse", type=float, default=None, metavar="PCT",
                     help="workload SHAPE: percent of each prompt that is a "
                          "prefix shared across requests (0-100). Describes your "
@@ -9894,6 +10058,7 @@ def main():
         # request shape, from the profile unless --prefix-reuse says otherwise
         prefix_reuse=prefix_reuse,
         task=args.task,
+        temperature=args.temperature,
         ngram=args.ngram,
         ngram_type=args.ngram_type,
         ngram_keep=args.ngram_keep,
@@ -10182,11 +10347,19 @@ def main():
                 "CHANGELOG" if cfg.prefix_reuse >= 1.0 else
                 "  (set --prefix-reuse to match your traffic)")
         print(f"workload   : {shape}{warn}")
+        _tmp = effective_temperature(cfg)
         if cfg.task:
             _t = resolve_task(cfg.task)
-            print(f"task       : {_t[:88] + ('...' if len(_t) > 88 else '')}")
-            print("             (the model GENERATES this kind of content — "
-                  "speculative results depend on it)")
+            print(f"task       : {_t[:84] + ('...' if len(_t) > 84 else '')}")
+            print(f"             temp {_tmp:.1f} — the model GENERATES this, and "
+                  "speculative results depend on it")
+        else:
+            print(f"task       : none — the model continues filler prose at temp "
+                  f"{_tmp:.1f}.")
+            print("             Speculative results will describe PROSE, not your "
+                  "work. Set")
+            print("             --task code|code:sql|reasoning|roleplay|'your own "
+                  "instruction'")
     print("objective  : " + ("eff (effective t/s: blends pp + tg)"
                              if cfg.score == "eff" else
                              "tg (generation t/s; pp reported, not scored)"))

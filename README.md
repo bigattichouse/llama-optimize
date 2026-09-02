@@ -1011,9 +1011,17 @@ python3 llama-optimize.py model-UD.gguf --run --driver server \
   prose. A reporter measuring real work saw 31 t/s where the sweep said 45.
   Either your own text (`--task 'Implement chess in brainfuck'`) or a preset —
   `code`, `code:sql`, `code:js`, `code:cpp`, `code:web`, `reasoning`, `roleplay`.
-  The presets are examples, not standards; the task is recorded in the CSV and
+  Each preset also carries the **temperature** its content is normally generated
+  at (`code*` 0.0, `reasoning` 0.6, `roleplay` 0.9), because sampling is part of
+  the workload rather than a knob beside it: greedy output is the most
+  predictable output there is, so temperature drives how much speculative
+  decoding appears to buy. `--temp` overrides. The presets and their
+  temperatures are examples, not standards; the task is recorded in the CSV and
   printed with the results, because two sweeps with different tasks measured
   different things. Server driver only.
+
+  Running *without* `--task` says so rather than measuring prose silently, and
+  the setup interview asks for the workload first.
 - **Describe your traffic with `--prefix-reuse`** — how much of each prompt is a
   prefix shared across requests (0–100). It is an input, not a tuned knob: an
   agent stack with a fixed system prompt sits near 90, independent requests at 0.
