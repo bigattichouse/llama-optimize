@@ -9,13 +9,18 @@ Every number this tool prints is conditioned on a quant, a model, a card, a
 backend *and its version*, and the thermal state it was taken in. That is not
 pedantry — it is the difference between a useful result and a misleading one:
 
-- Flash attention measured **33% slower** on Mistral-Small-24B Q8_0 on an MI50,
-  and the same box has seen it *help* on other models.
 - Partial `-ngl` **segfaults** on hybrid SSM models under ROCm — but only bare;
-  `--spec-type draft-eagle3` lifts the whole dead band.
-- Prefix reuse collapses past a depth that varies by architecture.
+  `--spec-type draft-eagle3` or `draft-dflash` lifts the whole dead band, and
+  no other flag tried does.
+- Prefix reuse collapses past a depth that varies by architecture: 0% past the
+  window on SWA (fixable with `--swa-full`), 87% → 43% → 0% at 4k/8k/16k on a
+  hybrid recurrent model, where no knob helps.
+- A deep prompt of filler alone makes one model emit **EOS as its first token**,
+  so the row measures no decode at all unless `--task` is set.
 - An EAGLE3 head drafted at 47% acceptance and bought **1.00x** — on one head,
   against one target, on one card.
+- Whether flash attention helps is *unknown here*: the one measurement anyone
+  made was a thermal artifact and was retracted, which is itself the point.
 
 Each of those would be settled in a week by three people with different cards,
 and cannot be settled on any single box. That is what this directory is for.

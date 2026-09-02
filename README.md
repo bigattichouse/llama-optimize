@@ -171,11 +171,20 @@ lossier levels so the tool never recommends a KV type that degrades output over 
 context. Pass `--min-kv any` to explore the full `f16, q8_0, q5_1, q4_1, q4_0` ladder
 (quantizing the KV cache buys context at some quality cost).
 
-**Fixed** (not swept): flash-attention on (`-fa 1` — a near-certain win on gfx906 and
-a *precondition* for quantized KV cache, so sweeping it would structurally fail every
-`fa=0` × KV-quant row) and mmap on (bench `-mmp 1`; the server default). Sweep fa
-explicitly with `--factor fa=0,1` — the quantized KV levels are dropped for you,
-with a note saying which, since `-fa off` cannot create a context with them. Also not swept by default: CPU
+**Derived, not swept: flash attention.** Under `--run` the tool probes the box
+(three launches) and decides. A design carrying quantized `kv_type` levels pins
+`-fa 1`, because those levels *require* FA and a silent decline would not fail
+loudly — it would produce rows labelled `kv_type=q8_0` whose cache was never
+quantized. An f16-only design gets `-fa auto`, llama.cpp's own default, and the
+printed reason names which way `auto` resolved on your backend. It used to be
+hard-pinned to `-fa 1` on the grounds that it "helps gfx906", which is the
+development box generalised to everyone (issue #20).
+
+Sweep it explicitly with `--factor fa=0,1` — a hand pin always wins, and the
+quantized KV levels are dropped for you, with a note saying which, since
+`-fa off` cannot create a context with them.
+
+**Fixed** (not swept): mmap on (bench `-mmp 1`; the server default). Also not swept by default: CPU
 affinity masks (`cpu_mask`/`cpu_range` — no universal levels), RoPE/YaRN scaling
 (extends context by *changing model behavior*, a quality tradeoff, not a perf knob),
 and `parallel` (a property of your workload — set it via `--use-case`/`--parallel`).
@@ -490,10 +499,10 @@ condition the result. That is enforced by a test, not just intended. Nothing is
 uploaded: the tool prints an instruction and you decide.
 
 Why bother: a result is only meaningful with its scope, and the interesting
-findings are exactly the ones a single box cannot settle — flash attention 33%
-slower on one model and helpful on another, partial `-ngl` segfaulting on hybrid
-SSM models under ROCm, prefix reuse collapsing past an architecture-dependent
-depth. See [`community/`](community/) for the format and for how close a match
+findings are exactly the ones a single box cannot settle — partial `-ngl`
+segfaulting on hybrid SSM models under ROCm (and only when no hidden-state draft
+head is named), prefix reuse collapsing past an architecture-dependent depth, an
+EAGLE3 head that drafts at 47% acceptance and buys nothing. See [`community/`](community/) for the format and for how close a match
 has to be before it tells you anything.
 
 ## Recommended workflow (staged / iterative refinement)
@@ -909,13 +918,23 @@ Levels are rendered from the model's layer count; a build without `-ncffn` simpl
 gets the three `-ot` levels under the same factor name, so results stay
 comparable across a llama.cpp upgrade.
 
-**² Flash attention is fixed on unless swept.** It is a precondition for
-quantized KV — measured: `-fa off -ctk q8_0` fails to create a context, `-fa on`
-with the same cache loads. Sweep it with `--factor fa=0,1`; the quantized
-`kv_type` levels are dropped for you, with a note naming them, so no row in the
-design is unlaunchable. Note the pin itself is still an assumption chosen on one
-GPU — whether `fa=on` is *faster* on your hardware is not something the default
-sweep asks (`docs/constants-audit.md` C-A).
+**² Flash attention is probed, then held, unless swept.** It is a precondition
+for quantized KV — measured on this build: `-fa 0 -ctk q8_0` fails to create a
+context while `-fa 1` with the same cache loads. So under `--run` the tool asks
+the box (three launches) and pins `-fa 1` when the design carries quantized
+`kv_type` levels, or emits `-fa auto` — llama.cpp's own default — when it does
+not, printing which way `auto` resolved here.
+
+That probe is behavioural, because there is nothing to read: llama.cpp reports FA
+state in no log line at any default verbosity. Since a quantized cache cannot be
+created without FA, `-fa auto -ctk q8_0` standing up *is* proof that `auto`
+resolved to on.
+
+Sweep it with `--factor fa=0,1`; the quantized `kv_type` levels are dropped for
+you, with a note naming them, so no row in the design is unlaunchable. **Whether
+`fa=on` is *faster* on your hardware is still not something the default sweep
+asks** — the one measurement made here was a thermal artifact and was retracted
+(`docs/constants-audit.md` C-A).
 
 **³ The MTP surface is swept when the model ships an MTP/NextN head.** Such
 models also auto-switch to the server driver, so the effect is measured rather
@@ -1051,11 +1070,19 @@ python3 llama-optimize.py model-UD.gguf --run --driver server \
   including MTP/spec dials, ngram parameters, `-ot` placement, CPU affinity,
   and env vars (`--env`); MoE/MTP/ngram knobs auto-enabled by model or --ngram.
 - **Trustworthy measurement** — realistic prompts, warmup + rep averaging,
-  **randomized run order** + a default **thermal settle** between runs (wait for
-  the GPU to return near its idle temp; `--cooldown` as the sensorless fallback),
-  with each row's start temp recorded (`temp_c`); **pick verification**
-  (`--verify-picks`, default on) re-measures the final picks and reports medians
-  with the observed spread, so the headline number isn't one lucky rep.
+  **randomized run order**, and each config measured at a defined thermal state:
+  `--thermal-mode warm` (default) preheats it with its own workload to its
+  steady state, which is what sustained serving actually runs at, while
+  `--thermal-mode idle` settles back to the idle baseline for burst figures
+  (`--cooldown` is the sensorless fallback). The temperature the reps *ran at* is
+  recorded per row (`temp_c`). **Pick verification** (`--verify-picks`, default
+  on) re-measures the final picks and reports medians with the observed spread,
+  so the headline number isn't one lucky rep.
+- **Shareable fingerprints** — every sweep writes `<results>.fingerprint.json`
+  beside its CSV (CPU, GPU(s) with backend *version*, OS, llama.cpp build, the
+  model's architecture flags, how the sweep ran); `--fingerprint` prints it
+  standalone. No paths, hostname or username, enforced by test. Nothing uploads.
+  See [`community/`](community/).
 - **Changelog with result advisories** — [`CHANGELOG.md`](CHANGELOG.md) carries an
   **Affects existing results** section per release: when a fix changes what past
   measurements *mean*, it says so and whether to re-run. Results CSVs are stamped
@@ -1067,6 +1094,9 @@ python3 llama-optimize.py model-UD.gguf --run --driver server \
   prose. A reporter measuring real work saw 31 t/s where the sweep said 45.
   Either your own text (`--task 'Implement chess in brainfuck'`) or a preset —
   `code`, `code:sql`, `code:js`, `code:cpp`, `code:web`, `reasoning`, `roleplay`.
+  It is also what keeps *deep* rows measurable at all: given thousands of tokens
+  of filler and no instruction, a model may emit **EOS as its first token** and
+  the row measures no decode whatsoever (measured at 16k on Qwen3.6-35B-A3B).
   Each preset also carries the **temperature** its content is normally generated
   at (`code*` 0.0, `reasoning` 0.6, `roleplay` 0.9), because sampling is part of
   the workload rather than a knob beside it: greedy output is the most
