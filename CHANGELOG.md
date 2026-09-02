@@ -120,6 +120,14 @@ earlier.
 
 ### Fixed
 
+- **`temp_c` recorded the temperature *before* the run, not the one it ran at.**
+  Harmless until warm mode, which puts a preheat in between: a validation sweep
+  recorded 45 °C and 89 °C for two rows that both measured at the ~99 °C plateau.
+  The one column that exists to check thermal comparability was reporting a 44 °C
+  confound the preheat had already removed. It is now sampled after the preheat,
+  immediately before the first measured rep, falling back to the old
+  pre-measurement sample for drivers that do not report one.
+
 - **The thermal settle had three ways of silently not settling**, all found by
   reading `temp_c` on a comparison that had the settle *enabled*: two rows at
   44 °C and 87 °C, a 12% apparent effect, no warning anywhere.

@@ -4773,6 +4773,15 @@ class ServerSession:
                         print(f"  thermal: still heating at {got[1]:.0f}°C when "
                               f"the preheat cap ran out — this row may be a "
                               f"burst number rather than a sustained one")
+            # The temperature the measured reps actually ran at. Sampled
+            # here, after any preheat, because the caller's pre-measurement
+            # sample answers a different question in warm mode: it reports what
+            # the PREVIOUS run left behind, which is precisely what the preheat
+            # exists to make irrelevant. A validation sweep recorded 45 °C and
+            # 89 °C for two rows that both measured at the ~99 °C plateau —
+            # the column that exists to check comparability reporting a 44 °C
+            # confound that was not there.
+            self.meas_temp = gpu_temp_c()
             cut_short = False
             for i in range(max(1, reps)):
                 if _expired(deadline):     # budget gone; report what we have
@@ -4845,6 +4854,7 @@ class ServerSession:
                     "draft": _draft_totals(timings),
                     "err_rate": n_err / (max(1, reps) + 1),
                     "reuse": self.last_reuse,
+                    "meas_temp": self.meas_temp,
                     "cache_hit": hit}
         # Concurrency: realistic serving — every request prefills; aggregate over
         # the streams. Warmup once, then average per-round throughput over reps.
@@ -5002,6 +5012,7 @@ def measure_in_session(cfg: Config, f: dict, session, timeout: int) -> dict:
         status = "ERROR"
     res = {"status": status, "pp_tps": pp, "tg_tps": tg,
            "err_rate": round(err_rate, 4),
+           "meas_temp": m.get("meas_temp"),
            # what the battery ACTUALLY shared, not what was asked for (F6)
            "reuse": m.get("reuse", ""),
            # and what the SERVER actually reused of it, which is a different
@@ -8795,6 +8806,30 @@ def selftest() -> bool:
                     globals()["run_until_warm"] = _real_warm
                 assert _caps and _caps[0] < 30.0 * 0.9, _caps
                 assert _caps[0] <= THERMAL_WARMUP_CAP_S, _caps
+
+                # The recorded temperature must be the one the measured reps
+                # RAN at, i.e. after the preheat. Sampling before it answers a
+                # different question in warm mode -- what the PREVIOUS run left
+                # behind, which is exactly what the preheat makes irrelevant. A
+                # validation sweep recorded 45 °C and 89 °C for two rows that
+                # both measured at the ~99 °C plateau, so the one column that
+                # exists to check comparability reported a 44 °C confound that
+                # was not there.
+                seen.clear()
+                globals()["gpu_temp_c"] = fake_temp(
+                    [45.0, 60.0, 75.0, 90.0, 99.0, 99.1, 99.2, 99.3, 99.4])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    _r_t = measure_in_session(fake_cfg, {"n_depth": "8192"},
+                                              sess, 30)
+                assert _r_t["meas_temp"] is not None and _r_t["meas_temp"] > 90, _r_t
+                # ...and idle mode, which has no preheat, still reports a number
+                sess.cfg = SimpleNamespace(prefix_reuse=0.9, thermal_mode="idle")
+                globals()["gpu_temp_c"] = fake_temp([61.0] * 6)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    _r_i = measure_in_session(fake_cfg, {"n_depth": "8192"},
+                                              sess, 30)
+                assert _r_i["meas_temp"] == 61.0, _r_i
+                sess.cfg = SimpleNamespace(prefix_reuse=0.9, thermal_mode="warm")
             finally:
                 globals()["gpu_temp_c"] = _real_gt
 
@@ -11147,8 +11182,7 @@ def main():
                             journal_write(journal, "OK", "run", rid)  # close journal
                             print(f"{prefix} -> SKIP_PRED (predicted OOM, skipped)")
                             continue
-                    temp0 = gpu_temp_c()   # start temp: thermal comparability is
-                    #                        checkable in the CSV, not assumed
+                    temp0 = gpu_temp_c()   # fallback only; see below
                     if cfg.driver == "server":
                         res = with_ticker(
                             prefix, args.timeout,
@@ -11157,8 +11191,19 @@ def main():
                     else:
                         res = run_with_progress(cfg, f, args.timeout, prefix)
                     res["eff_tps"] = objective_tps(cfg, res["pp_tps"], res["tg_tps"])
+                    # `temp_c` is the temperature the measured reps RAN at, not
+                    # the one before them. In warm mode those differ by the whole
+                    # preheat: a validation sweep recorded 45 °C and 89 °C for
+                    # two rows that both measured at the ~99 °C plateau, so the
+                    # one column that exists to check comparability was
+                    # reporting a 44 °C confound the preheat had removed.
+                    # temp0 remains the fallback for drivers that do not report
+                    # one (bench) and for a box with no readable sensor.
+                    meas_t = res.pop("meas_temp", None)
+                    if meas_t is None:
+                        meas_t = temp0
                     row = {"run_id": rid, **f, **derived_abs_cols(cfg, f), **res,
-                           "temp_c": f"{temp0:.0f}" if temp0 is not None else "",
+                           "temp_c": f"{meas_t:.0f}" if meas_t is not None else "",
                            **stamp}
                     rows.append(row)
                     writer.writerow(row)   # incremental save: survive a crash/kill
