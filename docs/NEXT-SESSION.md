@@ -141,20 +141,37 @@ request against that model, reading `predicted_n` from the server's own timings.
 If it is 0, the model emitted EOS immediately and the tool is reporting honestly;
 if it is non-zero, the rate is being lost between the server and the row.
 
-### 2. Validate `--thermal-mode warm` on real hardware — GPU, ~25 min
+### 2. ~~Validate `--thermal-mode warm`~~ — done, and it found a fourth defect
 
-Warm is now the **default** and has never completed a sweep under the code that
-ships. The one warm run that did finish predates the plateau fix and burned its
-full 300 s cap on every config.
+Validated 2026-09-02 on `Qwen3.6-27B-Q5_K_M`, MI50 32GB / ROCm:
 
-The fix it needs to exercise: plateau detection is a rolling **window**, because
-an MI50 holding steady under load was measured oscillating **99↔100 °C** — a
-step-to-step 0.5 °C test resets on every other poll and never converges. Unit
-tests cover the trace; nothing has confirmed it against the card.
+```
+cap warnings: 0
+  spec_type=none    tg=8.78  pp=139.9  temp=94   secs=423
+  spec_type=eagle3  tg=9.00  pp= 95.8  temp=94   secs=432
+  temp spread: 0 °C
+```
 
-What to check: that `run_until_warm` returns `warm` rather than `cap`, that the
-preheat is a fraction of a run rather than a multiple of it, and that two rows of
-one sweep land within a few degrees of each other in `temp_c`.
+**The mechanism passed.** Zero preheat-cap warnings, so the rolling-window
+plateau rule detects the measured 99↔100 °C oscillation on real hardware; row
+time fell 617 s → ~430 s because the preheat stops at the plateau instead of
+running to its cap.
+
+**The first attempt failed on its own instrument**, which is worth keeping. It
+recorded 45 °C and 89 °C — a 44 °C spread — for two rows that both measured at
+the plateau. `temp0` was sampled before `measure_in_session`, and that function
+now contains the preheat, so in warm mode `temp_c` reported what the *previous*
+run left behind: exactly what the preheat makes irrelevant. The one column whose
+job is checking comparability was manufacturing a confound that was not there.
+Now sampled after the preheat, immediately before the first measured rep.
+
+That is the fourth defect of one shape in this session: **a guard that reports
+nothing when it fails is indistinguishable from a guard that works.** Warm mode
+exposed it; the cold-settle path would have hidden it indefinitely, because
+without a preheat the two sampling points agree.
+
+Note the sustained numbers sit slightly below the burst ones measured earlier at
+59–64 °C (9.09 / 9.06) — which is the point of the mode, not a discrepancy.
 
 ### 3. Re-measure `fa` properly (#20)
 
