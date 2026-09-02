@@ -117,29 +117,30 @@ conditionally are reported as such.
 
 ## Do these first
 
-### 1. `tg=0.00` at depth 16384 — narrowed to the model, root cause still open
+### 1. ~~`tg=0.00` at depth 16384~~ — root-caused, and it makes `--task` load-bearing
 
-Both deep rows of the `fa` sweep did it: `pp` fine (88.7 / 98.0), `secs` 639–689,
-decode never produced a number.
+**The model emits EOS as its first token.** Measured on `Qwen3.6-35B-A3B`
+(MI50 32GB / ROCm) by reading the server's counters:
 
-**The reporting half is fixed and tested.** That shape now sets `no_result`
-("every rep that survived reported 0 t/s") and the row is no longer recorded `OK`
-— `_zero_rate` in `--selftest` covers it. So it can no longer poison a main effect
-silently.
+| prompt | `prompt_n` | `predicted_n` | `stop_type` | rate |
+|---|---|---|---|---|
+| filler, shallow | 2,347 | 128 | `limit` | 27.1 t/s |
+| filler, deep | 13,058 | **1** | **`eos`** | 0.00 |
+| filler, deep **+ task block** | 15,401 (cached) | 128 | `limit` | 26.1 t/s |
 
-**What it is not.** The per-config deadline was the leading suspect and is ruled
-out: `secs` 639 against a 1200 s budget, `err_rate=0.0`, `rejected_reps=0` — all
-three reps returned successfully and reported zero. Nor is it the tool's deep
-prompt construction: the same sweep shape at `n_depth=16384` on
-`gemma-3-270m-it-Q8_0`, CPU-only, measured **53.9 tg t/s** (`scratchpad/deep0.csv`).
+`truncated = 0`, so not context overflow. Given thousands of tokens of repeated
+filler and no instruction, the model decides the document is finished. The row
+was honest — there was no decode to measure.
 
-**What is left.** It is specific to `Qwen3.6-35B-A3B` (`qwen35moe`, recurrent) at
-depth on ROCm. `cache_hit=0.0` on those rows says every rep re-prefilled all
-17060 tokens, which matches the known recurrent reuse loss past a depth boundary
-— but that explains the 639 s, not the zero. Needs one GPU repro: a single deep
-request against that model, reading `predicted_n` from the server's own timings.
-If it is 0, the model emitted EOS immediately and the tool is reporting honestly;
-if it is non-zero, the rate is being lost between the server and the row.
+**So `--task` is not only about content realism: it is what keeps deep rows
+measurable.** Sweeps predating it are the exposed ones. `ended_at_eos` now names
+this case and points at `--task`, separately from the generic zero, because a
+slow config is a tuning problem while a finished prompt is not.
+
+Ruled out, recorded so they are not re-suspected: the per-config deadline (`secs`
+639 against a 1200 s budget, `err_rate=0.0`, `rejected_reps=0`) and the tool's own
+deep prompt construction (same shape at `n_depth=16384` on gemma-3-270m,
+CPU-only, 53.9 tg t/s).
 
 ### 2. ~~Validate `--thermal-mode warm`~~ — done, and it found a fourth defect
 
