@@ -1027,34 +1027,125 @@ def predict_fits(cfg: "Config", f: dict, driver: str) -> bool | None:
 # comparable thermal state (the MI50 throttles ~1.8× cool-vs-hot, a swing bigger
 # than most factor effects — see docs/DESIGN.md). Capped so it can never hang.
 THERMAL_BAND_C = 5.0
-THERMAL_CAP_S = 120.0
+THERMAL_CAP_S = 600.0
+# How many consecutive polls of near-zero cooling count as a plateau. One is not
+# enough: at a 3s poll, "cooled less than 0.5°C" is still 10°C/min, a rate a hot
+# card passes through on its way down. Bailing there ended the settle at 87°C
+# against a 49°C target, and the next config was measured on a hot card -- the
+# confound the settle exists to remove (docs/measurement-validity.md).
+THERMAL_PLATEAU_POLLS = 4
+# Longest wait for the FIRST reading, before any run. Paid once per sweep and
+# only when the card is hot at launch — which on a shared box is common, and is
+# exactly when a single sample would be worst. 120s was not enough to get from
+# a post-run 100°C to idle: it returned 59°C and called it the baseline.
+IDLE_BASELINE_CAP_S = 300.0
+# Set once from --thermal-cap. A process-wide setting rather than a parameter
+# threaded through probe_max_context, verify_picks and the confirmation run:
+# every one of them wants the same answer, and a cap that applies to some
+# settles and not others is worse than either value.
+THERMAL_CAP_ACTIVE = THERMAL_CAP_S
+
+
+def idle_baseline_c(cap_s: float = IDLE_BASELINE_CAP_S, poll_s: float = 3.0,
+                    settle_polls: int = THERMAL_PLATEAU_POLLS) -> float | None:
+    """The GPU's idle temperature, measured rather than assumed.
+
+    A single instantaneous sample is only the idle temperature if the card
+    happens to be idle, and on a shared box it usually is not — a previous
+    sweep, someone else's training run, or the tail of the last pass. Taking one
+    anyway produced `idle baseline 99°C — settle to ≤104°C`: a target no run can
+    ever exceed, so the thermal settle silently stopped settling and every row
+    was measured on a hot card while claiming to be comparable.
+
+    So: watch until the reading stops falling. An idle card is flat and this
+    returns almost immediately; a cooling card is falling and this waits for it.
+    No threshold for "too hot to be idle" is needed, which is the point —
+    that number is a property of the card, the cooler and the room, and this
+    box is not entitled to guess it for anyone else."""
+    t = gpu_temp_c()
+    if t is None:
+        return None
+    t0, flat, warned = time.time(), 0, False
+    while time.time() - t0 < cap_s:
+        time.sleep(poll_s)
+        nxt = gpu_temp_c()
+        if nxt is None:
+            break
+        # Only *falling* resets the count. A card that drifts up a little while
+        # idle is idle; one still shedding heat is not.
+        flat = 0 if t - nxt >= 0.5 else flat + 1
+        if not warned and flat == 0:
+            print(f"  thermal: GPU is at {t:.0f}°C and still cooling — waiting "
+                  f"for an idle reading before starting (cap {cap_s:.0f}s)")
+            warned = True
+        t = nxt
+        if flat >= settle_polls:
+            break
+    return t
+
+
+def resolve_thermal_baseline(args) -> None:
+    """Fill in `args.thermal_baseline` once, before any GPU work.
+
+    Captured here and threaded through child passes via `--thermal-baseline`:
+    `--ctx-scan`, `--screen` and pass 1 all heat the card, and a child capturing
+    its own "idle" at the start of pass 2 would bake a hot GPU into the target
+    and neuter the settle for that whole pass.
+
+    It must be `idle_baseline_c`, not a bare `gpu_temp_c()` sample — see that
+    function for what a single sample on a busy box does to the settle."""
+    if args.run and not args.no_thermal_wait and args.thermal_baseline is None:
+        args.thermal_baseline = idle_baseline_c()
 
 
 def wait_until_cool(baseline_c: float | None, band: float = THERMAL_BAND_C,
-                    cap_s: float = THERMAL_CAP_S, poll_s: float = 3.0) -> None:
-    """Watch GPU temperature; return once it is within `band` °C of the idle
-    `baseline_c`, or it plateaus (cooling stalls), or `cap_s` elapses. No-op
-    when there's no baseline or no readable sensor. A *rising* temperature is
-    not a plateau: right after a run the sensor often keeps climbing for a few
-    seconds (heat soak), and bailing then would exit at the hottest moment."""
+                    cap_s: float | None = None, poll_s: float = 3.0
+                    ) -> tuple[str, float] | None:
+    """Watch GPU temperature until it is within `band` °C of the idle
+    `baseline_c`. No-op when there's no baseline or no readable sensor.
+
+    Returns `(why, last_temp)` where `why` is `settled`, `plateau` or `cap` — the
+    caller needs it, because a settle that gave up while the card was still hot
+    means the next config is NOT thermally comparable to the last one, and that
+    is worth saying out loud rather than leaving in a CSV column.
+
+    A *rising* temperature is not a plateau: right after a run the sensor often
+    keeps climbing for a few seconds (heat soak), and bailing then would exit at
+    the hottest moment. Neither is a single slow poll — see
+    THERMAL_PLATEAU_POLLS."""
     if baseline_c is None:
-        return
+        return None
+    if cap_s is None:
+        cap_s = THERMAL_CAP_ACTIVE
     target, t0, prev = baseline_c + band, time.time(), None
-    tty = sys.stdout.isatty()
+    tty, stalls, t = sys.stdout.isatty(), 0, None
+    why = "cap"
     while time.time() - t0 < cap_s:
         t = gpu_temp_c()
         if t is None:
             break
-        settled = t <= target or (prev is not None and 0 <= prev - t < 0.5)
+        if t <= target:
+            why = "settled"
+        else:
+            stalls = stalls + 1 if (prev is not None and 0 <= prev - t < 0.5) else 0
+            if stalls >= THERMAL_PLATEAU_POLLS:
+                why = "plateau"
         if tty:
             print(f"\r  thermal: {t:>3.0f}°C  (settle ≤{target:.0f}°C)"
-                  f"{'  ok' if settled else '  cooling…'}   ", end="", flush=True)
-        if settled:
+                  f"{'  ok' if why != 'cap' else '  cooling…'}   ", end="", flush=True)
+        if why != "cap":
             break
         prev = t
         time.sleep(poll_s)
     if tty:
         print()
+    if t is None:
+        return None
+    if why != "settled":
+        print(f"  thermal: gave up at {t:.0f}°C, target ≤{target:.0f}°C "
+              f"({'cooling stalled' if why == 'plateau' else 'hit the time cap'})"
+              f" — this run is not thermally comparable to a cold one")
+    return why, t
 
 
 class VRAMSampler:
@@ -1611,6 +1702,49 @@ def ngl_levels(n_layers: int | None, levels: int = 5,
     return lv
 
 
+def ngl_display(ngl, n_layers) -> str:
+    """How to say `-ngl N` out loud, given the model's real layer count.
+
+    `99` is the level the sweep uses for full offload because it is the spelling
+    that was verified (llama.cpp clamps it), but printing "99/64 layers on GPU"
+    reads as a bug in the tool rather than as a clamp."""
+    try:
+        n, nl = int(ngl), int(n_layers)
+    except (TypeError, ValueError):
+        return f"{ngl}/{n_layers} layers on GPU"
+    if n >= nl:
+        return f"all {nl} layers on GPU"
+    return f"{n}/{nl} layers on GPU"
+
+
+def probe_ngl_wanted(cfg, run: bool) -> bool:
+    """Whether to spend launches finding out which -ngl levels load.
+
+    Only where the answer is unknowable from here (a recurrent/hybrid model,
+    issue #18), only on the server driver, and only under --run so plan-only
+    keeps its promise to touch no GPU.
+
+    And never over an explicit pin. `--factor ngl=99` is the user answering this
+    question themselves; a probe that widens it back out to the full span is
+    overriding them with a guess about what they meant. That shipped broken --
+    a run pinned to `ngl=99` swept 48/53/59/64 instead, so the rows varied in
+    the very factor that had been held fixed to isolate something else."""
+    return bool(run and getattr(cfg, "ngl_recurrent", False)
+                and cfg.driver == "server" and cfg.factors.get("ngl")
+                and "ngl" not in cfg.pinned_factors)
+
+
+# Factors whose level changes whether a given `-ngl` loads at all, so a probe
+# that fixes them at one level answers a different question than the sweep asks.
+# Measured, not assumed: on Qwen3.6-27B-Q5_K_M (`qwen35`, ROCm, llama.cpp
+# 6c84c7d5d) `-ngl 5` and `-ngl 53` segfault bare, and both load under
+# `--spec-type draft-eagle3` or `draft-dflash` -- the two heads that reuse the
+# target's hidden states -- while `draft-simple`, `draft-mtp` and three
+# `ngram-*` types all still die. Output was verified correct in the rescued
+# configuration, so it is a real operating point and not a crash deferred.
+LOAD_SENSITIVE_FACTORS = ("spec_type",)
+
+
 def probe_loadable_ngl(cfg: "Config", candidates: list, n_ctx: int,
                        timeout: int) -> tuple[list, list]:
     """Which `-ngl` levels actually load on THIS box. Returns (loadable, dead).
@@ -1626,16 +1760,37 @@ def probe_loadable_ngl(cfg: "Config", candidates: list, n_ctx: int,
     cost is dominated by reading the weights (usually already in page cache after
     the first) and nothing is measured — this only asks whether the process
     stands up. Levels that fail are reported, never silently dropped: if the
-    answer is surprising, that is the finding."""
-    loadable, dead = [], []
+    answer is surprising, that is the finding.
+
+    A level is dead only if it loads under NO level of the load-sensitive
+    factors. Probing one assignment and believing it was wrong: measured on
+    Qwen3.6-27B-Q5_K_M (`qwen35`, ROCm, build 6c84c7d5d), `-ngl 53` segfaults
+    bare and loads under `--spec-type draft-eagle3`, so which answer the probe
+    got depended on which `spec_type` level happened to sort first. The two
+    mistakes are not symmetric — a wrong "dead" deletes the axis silently, while
+    a wrong "live" costs a run that the sweep then records as SIGNAL and
+    `dead_levels` reports. So the retry buys the cheap direction."""
+    base = {k: v[0] for k, v in cfg.factors.items() if v}
+    # Retried only for candidates that failed, so a sweep with no load-sensitive
+    # factor swept costs exactly what it did before.
+    alts = [{}] + [{name: lv}
+                   for name in LOAD_SENSITIVE_FACTORS
+                   for lv in cfg.factors.get(name, [])[1:]]
+    loadable, dead, conditional = [], [], []
     for lv in candidates:
-        session = ServerSession(cfg, {**{k: v[0] for k, v in cfg.factors.items()
-                                         if v}, "ngl": str(lv)}, n_ctx, timeout)
-        try:
-            (loadable if getattr(session, "ok", False) else dead).append(lv)
-        finally:
-            session.close()
-    return loadable, dead
+        for i, alt in enumerate(alts):
+            session = ServerSession(cfg, {**base, **alt, "ngl": str(lv)},
+                                    n_ctx, timeout)
+            try:
+                ok = bool(getattr(session, "ok", False))
+            finally:
+                session.close()
+            if ok:
+                if i:
+                    conditional.append((lv, alt))
+                break
+        (loadable if ok else dead).append(lv)
+    return loadable, dead, conditional
 
 
 def full_offload_fits(cfg: "Config", depths: list, kv_levels: list,
@@ -1787,6 +1942,10 @@ class Config:
     # the un-collapsed ngl span, kept so a run-time probe can restore levels the
     # conservative default dropped (issue #18)
     ngl_candidates: list = field(default_factory=list)
+    # Factor names the user set by hand with --factor. Nothing derived may
+    # override these -- a probe or heuristic that widens an explicit pin is
+    # overriding the user with a guess about what they meant.
+    pinned_factors: set = field(default_factory=set)
     min_tgs: float = 0.0        # abandon a config generating slower than this
     min_pps: float = 0.0        # ...or prefilling slower than this
     slow_grace: int = 60        # never judge a config on less than this many seconds
@@ -4290,6 +4449,12 @@ def speculation_requested(cfg, f: dict) -> bool:
             return True
     elif cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0:
         return True                        # fixed on, not swept
+    elif getattr(cfg, "draft_model", None):
+        # A head handed to us on the command line. Last in the chain, not a
+        # separate check: with `spec_type` swept, a `none` row means the user
+        # turned the head off for that row, and a draft model on disk does not
+        # override that.
+        return True
     if "ngram" in f:
         if str(f["ngram"]) not in ("none", "", "0"):
             return True
@@ -4307,8 +4472,14 @@ def spec_cols_wanted(cfg) -> bool:
     factor design already rejects (docs/multi-gpu-design.md, M1)."""
     if cfg.driver != "server":
         return False
+    # A supplied draft model counts, and used to be missed: an EAGLE3 head ran
+    # with draft_acc/draft_cov/spec_off absent from the CSV entirely, so there
+    # was no way to tell whether it had drafted a single token -- the one thing
+    # you want to know about a draft head.
     return bool((cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0) or cfg.ngram
-                or "mtp" in cfg.factors or "ngram" in cfg.factors)
+                or getattr(cfg, "draft_model", None)
+                or "mtp" in cfg.factors or "ngram" in cfg.factors
+                or "spec_type" in cfg.factors)
 
 
 def draft_cols(cfg, f: dict, draft: dict) -> dict:
@@ -6294,6 +6465,34 @@ def selftest() -> bool:
         # a model too small to carve a top quarter from keeps the even span
         assert ngl_levels(3, 5, fits=True) == ngl_levels(3, 5)
 
+        # `-ngl 99` is a clamp, not 99 real layers: say so rather than printing
+        # "99/64 layers on GPU", which reads as a bug in the tool.
+        assert ngl_display("99", 64) == "all 64 layers on GPU"
+        assert ngl_display("64", 64) == "all 64 layers on GPU"
+        assert ngl_display("53", 64) == "53/64 layers on GPU"
+        assert ngl_display("0", 64) == "0/64 layers on GPU"
+        assert ngl_display("32", "?") == "32/? layers on GPU"   # unknown count
+
+        # --- the load probe never overrides an explicit --factor pin ---
+        # This shipped broken. A run pinned to `--factor ngl=99` to isolate a
+        # draft head swept 48/53/59/64 instead, because the probe re-expanded
+        # the pin from the un-collapsed candidate span. The rows then varied in
+        # the one factor that had been held fixed.
+        _pc = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
+                     ctx_floor=8192, driver="server")
+        _pc.factors = {"ngl": ["0", "48", "99"]}
+        _pc.ngl_recurrent = True
+        assert probe_ngl_wanted(_pc, run=True)
+        _pc.pinned_factors.add("ngl")
+        assert not probe_ngl_wanted(_pc, run=True)
+        # a pin on some OTHER factor is not a pin on ngl
+        _pc.pinned_factors = {"kv_type"}
+        assert probe_ngl_wanted(_pc, run=True)
+        # and the pre-existing gates still hold
+        assert not probe_ngl_wanted(_pc, run=False)      # plan-only touches no GPU
+        _pc.ngl_recurrent = False
+        assert not probe_ngl_wanted(_pc, run=True)       # only where it is unknowable
+
         # --- a crash is a measurement of a boundary (segfaults are data) ---
         # A Taguchi array visits each level beside DIFFERENT partners, so "every
         # row at this level failed" is evidence about the level. One failure is
@@ -6376,14 +6575,44 @@ def selftest() -> bool:
             # a box where the fused op is fine: everything comes back
             _StubSession.loads = {0, 10, 20, 30, 40, 99}
             assert probe_loadable_ngl(cfg_pr, [0, 10, 20, 30, 40, 99], 512, 5) \
-                == ([0, 10, 20, 30, 40, 99], [])
+                == ([0, 10, 20, 30, 40, 99], [], [])
             # this box: the measured dead band drops out, the rest stays
             _StubSession.loads = {0, 99}
-            live, dead = probe_loadable_ngl(cfg_pr, [0, 10, 20, 30, 40, 99], 512, 5)
+            live, dead, cond = probe_loadable_ngl(cfg_pr, [0, 10, 20, 30, 40, 99],
+                                                  512, 5)
             assert live == [0, 99] and dead == [10, 20, 30, 40], (live, dead)
+            assert cond == []
             # nothing loads at all: the caller must not be handed an empty grid
             _StubSession.loads = set()
-            assert probe_loadable_ngl(cfg_pr, [0, 99], 512, 5) == ([], [0, 99])
+            assert probe_loadable_ngl(cfg_pr, [0, 99], 512, 5) == ([], [0, 99], [])
+
+            # A level that loads under ONE spec_type and not another is live,
+            # and is reported as conditional rather than quietly kept. Probing
+            # a single assignment got this wrong in both directions depending
+            # on which level sorted first: measured on Qwen3.6-27B-Q5_K_M
+            # (qwen35, ROCm), -ngl 53 segfaults bare and loads under
+            # --spec-type draft-eagle3.
+            class _SpecSession:
+                def __init__(self, cfg, f, n_ctx, timeout):
+                    self.ok = (int(f["ngl"]) in (0, 99)
+                               or f.get("spec_type") == "draft-eagle3")
+
+                def close(self):
+                    pass
+
+            globals()["ServerSession"] = _SpecSession
+            cfg_sp = Config(model=Path("q.gguf"), llama_bench=Path("b"),
+                            llama_server=Path("s"), array="auto", ctx_floor=8192,
+                            driver="server")
+            cfg_sp.factors = {"ngl": ["0", "99"], "threads": ["4"],
+                              "spec_type": ["none", "draft-eagle3"]}
+            live, dead, cond = probe_loadable_ngl(cfg_sp, [0, 53, 99], 512, 5)
+            assert live == [0, 53, 99] and dead == [], (live, dead)
+            assert cond == [(53, {"spec_type": "draft-eagle3"})], cond
+            # ...and with the rescuing level absent from the sweep, it is dead
+            cfg_sp.factors["spec_type"] = ["none"]
+            live, dead, cond = probe_loadable_ngl(cfg_sp, [0, 53, 99], 512, 5)
+            assert live == [0, 99] and dead == [53] and cond == []
         finally:
             globals()["ServerSession"] = _real_sess
 
@@ -6713,6 +6942,24 @@ def selftest() -> bool:
                         ctx_floor=8192, driver="bench", hw=dict(hw_d))
         cfg_bn.factors = build_factors(cfg_bn)
         assert not spec_cols_wanted(cfg_bn)      # bench cannot speculate
+        # A --draft-model head speculates even on a model with no NextN block
+        # and no ngram. This shipped broken: an EAGLE3 run on Qwen3.6-27B
+        # (n_nextn=0) wrote every row with the draft columns MISSING, so there
+        # was no way to see whether the head had drafted a single token.
+        cfg_dm = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
+                        ctx_floor=8192, driver="server",
+                        hw={**hw_d, "n_nextn": 0}, draft_model=Path("d.gguf"))
+        cfg_dm.factors = build_factors(cfg_dm)
+        assert spec_cols_wanted(cfg_dm)
+        # ...and the same head must register as "speculation was requested", so
+        # a run that drafts nothing is flagged rather than silently accepted.
+        assert draft_cols(cfg_dm, {"ngl": "32"}, {}) == {"spec_off": 1}
+        assert draft_cols(cfg_dm, {"ngl": "32"},
+                          {"drafted": 40, "accepted": 30,
+                           "generated": 50})["draft_acc"] == 0.75
+        # ...but `spec_type=none` is the user switching the head off for that
+        # row, and a draft model sitting on disk does not override it.
+        assert speculation_requested(cfg_dm, {"spec_type": "none"}) is False
         # A telemetry column is never mistaken for a factor column by the report.
         assert "draft_acc" in RESULT_COLS and "spec_off" in RESULT_COLS
         # llama-bench has no --fit; emitting one makes it exit non-zero, which
@@ -6972,6 +7219,11 @@ def selftest() -> bool:
 
         # thermal wait-and-watch: no baseline => immediate no-op (never blocks)
         assert wait_until_cool(None) is None
+        # --thermal-cap is honoured by settles that never see `args`
+        # (probe_max_context, verify_picks, the confirmation run), so it is
+        # resolved from the module setting rather than a defaulted parameter.
+        import inspect as _insp
+        assert _insp.signature(wait_until_cool).parameters["cap_s"].default is None
         # a RISING temperature (post-run heat soak) is not a plateau (regression:
         # `prev - t < 0.5` was true for negatives, exiting at the hottest moment);
         # a genuine stall (cooling < 0.5°C/poll) or reaching baseline+band settles.
@@ -6982,13 +7234,64 @@ def selftest() -> bool:
             return lambda: (calls.append(1), next(it, seq[-1]))[1]
         try:
             with contextlib.redirect_stdout(io.StringIO()):
-                globals()["gpu_temp_c"] = fake_temp([60.0, 62.0, 61.9, 55.0])
-                wait_until_cool(40.0, band=5.0, cap_s=99, poll_s=0)
-                assert len(calls) == 3   # rode out the rise; exited on the stall
+                # a rise then a genuine stall: four consecutive near-zero drops
+                globals()["gpu_temp_c"] = fake_temp(
+                    [60.0, 62.0, 61.9, 61.8, 61.7, 61.6])
+                assert wait_until_cool(40.0, band=5.0, cap_s=99,
+                                       poll_s=0) == ("plateau", 61.6)
+                assert len(calls) == 6   # rode out the rise, then 4 stalled polls
                 calls.clear()
                 globals()["gpu_temp_c"] = fake_temp([60.0, 50.0, 44.0])
-                wait_until_cool(40.0, band=5.0, cap_s=99, poll_s=0)
+                assert wait_until_cool(40.0, band=5.0, cap_s=99,
+                                       poll_s=0) == ("settled", 44.0)
                 assert len(calls) == 3   # cooled to <= baseline+band and settled
+                calls.clear()
+                # ...and a card cooling steadily but slowly is NOT a plateau.
+                # One poll under 0.5°C used to end the settle, which at a 3s
+                # poll is 10°C/min -- a rate a hot card passes straight through.
+                # It ended a real settle at 87°C against a 49°C target and the
+                # next config was measured hot.
+                globals()["gpu_temp_c"] = fake_temp(
+                    [87.0, 86.7, 86.3, 85.0, 70.0, 50.0, 44.0])
+                assert wait_until_cool(40.0, band=5.0, cap_s=99,
+                                       poll_s=0) == ("settled", 44.0)
+
+                # The idle baseline is MEASURED, not sampled once. Sampling
+                # produced "idle baseline 99°C — settle to ≤104°C" when the card
+                # was still hot from the previous run: a target nothing can
+                # exceed, so the settle silently stopped settling and every row
+                # was measured hot while claiming to be comparable.
+                globals()["gpu_temp_c"] = fake_temp(
+                    [99.0, 90.0, 80.0, 70.0, 55.0, 45.0, 44.8, 44.6, 44.4, 44.2])
+                assert idle_baseline_c(cap_s=99, poll_s=0) == 44.2  # waited
+                globals()["gpu_temp_c"] = fake_temp([44.0] * 6)
+                assert idle_baseline_c(cap_s=99, poll_s=0) == 44.0  # already idle
+                # drifting slightly UP is idle, not still cooling
+                globals()["gpu_temp_c"] = fake_temp(
+                    [44.0, 44.3, 44.6, 44.9, 45.2])
+                assert idle_baseline_c(cap_s=99, poll_s=0) == 45.2
+
+                # ...and main() must actually USE it. Testing the function
+                # alone let the real defect through: the call site sampled
+                # gpu_temp_c() directly and no test noticed.
+                class _TA:
+                    run = True
+                    no_thermal_wait = False
+                    thermal_baseline = None
+                globals()["gpu_temp_c"] = fake_temp(
+                    [99.0, 90.0, 70.0, 50.0, 44.2, 44.1, 44.0, 43.9])
+                resolve_thermal_baseline(_TA)
+                assert _TA.thermal_baseline is not None
+                assert _TA.thermal_baseline < 50.0, _TA.thermal_baseline
+                # already set (threaded from the parent pass) => left alone
+                _TA.thermal_baseline = 41.0
+                resolve_thermal_baseline(_TA)
+                assert _TA.thermal_baseline == 41.0
+                # --no-thermal-wait means no baseline at all
+                _TB = type("_TB", (), dict(run=True, no_thermal_wait=True,
+                                           thermal_baseline=None))
+                resolve_thermal_baseline(_TB)
+                assert _TB.thermal_baseline is None
         finally:
             globals()["gpu_temp_c"] = real_temp
 
@@ -7360,6 +7663,7 @@ def selftest() -> bool:
         class _A:  # minimal args stand-in for build_child_argv
             model = Path("m"); no_mtp = no_shuffle = no_thermal_wait = False
             thermal_baseline = seed = max_depth = None; timeout = 60; cooldown = 0
+            thermal_cap = THERMAL_CAP_S
             confirm = full_ = html = None; no_probe = False; verify_picks = 2
             merge_results = []
         _av = build_child_argv(_A, replace(cfg_n, ngram_type="ngram-mod"),
@@ -9288,6 +9592,7 @@ def build_child_argv(args, cfg: Config, factors: dict, results_path: Path,
             "--parallel", str(cfg.parallel), "--score", cfg.score,
             "--timeout", str(args.timeout),
             "--cooldown", str(args.cooldown),
+            "--thermal-cap", str(args.thermal_cap),
             "--spec-draft-n-max", str(cfg.spec_draft_n_max),
             "--llama-bench", str(cfg.llama_bench),
             "--llama-server", str(cfg.llama_server),
@@ -9691,6 +9996,13 @@ def main():
     ap.add_argument("--confirm", action="store_true",
                     help="after the sweep, run the predicted-optimal config to "
                          "verify the model's prediction (implied by --full)")
+    ap.add_argument("--thermal-cap", type=float, default=THERMAL_CAP_S,
+                    metavar="SECS",
+                    help=f"longest wait for the GPU to settle back toward its "
+                         f"idle baseline between runs (default "
+                         f"{THERMAL_CAP_S:.0f}). The settle also exits early "
+                         f"once cooling stalls, so this is a backstop; lower it "
+                         f"to trade thermal comparability for wall-clock")
     ap.add_argument("--cooldown", type=float, default=0,
                     help="fixed seconds to pause between runs so the GPU can cool "
                          "(fallback when no temp sensor; default 0)")
@@ -9945,6 +10257,8 @@ def main():
                          "configs using more than (vram - headroom) are skipped "
                          "(default: 512)")
     args = ap.parse_args()
+    globals()["THERMAL_CAP_ACTIVE"] = max(
+        0.0, float(getattr(args, "thermal_cap", THERMAL_CAP_S)))
     # Q1: a bare invocation on a terminal is someone finding out what this does.
     # Anything more specific than that — a flag they chose, a non-sweep action,
     # or a redirected stdout (a script) — is left exactly as it was.
@@ -10112,6 +10426,7 @@ def main():
         if lvl_errors:
             ap.error("--factor " + "; ".join(lvl_errors))
         cfg.factors[name] = levels
+        cfg.pinned_factors.add(name)
 
     # Overrides can pin a gate to a value that makes its knobs inert -- most of
     # all `--factor mtp=0`, which turns speculation off while leaving four
@@ -10191,8 +10506,7 @@ def main():
     # child passes via --thermal-baseline — a child capturing its own "idle" at
     # the start of pass 2 would bake a hot GPU into the target and neuter the
     # settle for that whole pass.
-    if args.run and not args.no_thermal_wait and args.thermal_baseline is None:
-        args.thermal_baseline = gpu_temp_c()
+    resolve_thermal_baseline(args)
 
     # --ctx-scan: probe the physical ceiling first, then make the context axis
     # fractions of it, so the sweep spans the full usable range on THIS hardware.
@@ -10255,15 +10569,15 @@ def main():
     # ngl_levels) and only under --run, so plan-only keeps its promise to touch no
     # GPU. What loads is a property of the model, the backend and the build, and
     # none of those is knowable from here (issue #18).
-    if (args.run and getattr(cfg, "ngl_recurrent", False)
-            and cfg.driver == "server" and cfg.factors.get("ngl")):
+    if probe_ngl_wanted(cfg, bool(args.run)):
         cands = sorted({int(x) for x in
                         (getattr(cfg, "ngl_candidates", None) or cfg.factors["ngl"])}
                        | {int(x) for x in cfg.factors["ngl"]})
         probe_ctx = cfg.n_prompt + cfg.n_gen + 256
         print(f"probing which of -ngl {', '.join(map(str, cands))} load on this "
               f"box (recurrent model; {len(cands)} launches)...", flush=True)
-        live, dead = probe_loadable_ngl(cfg, cands, probe_ctx, args.timeout)
+        live, dead, conditional = probe_loadable_ngl(cfg, cands, probe_ctx,
+                                                     args.timeout)
         if live:
             cfg.factors["ngl"] = [str(x) for x in live]
             if dead:
@@ -10271,6 +10585,10 @@ def main():
                       f"dropped; sweeping {', '.join(map(str, live))}")
             else:
                 print(f"  all {len(live)} load — sweeping the full span")
+            for lv, alt in conditional:
+                why = ", ".join(f"{k}={v}" for k, v in alt.items())
+                print(f"  -ngl {lv} loads only with {why} — rows at other "
+                      f"levels of that factor may still abort")
         else:
             print("  none loaded; leaving the grid alone so the sweep records "
                   "what happens rather than deciding for you")
@@ -10377,10 +10695,14 @@ def main():
             print(f"  {_note}")
     if getattr(cfg, "ngl_recurrent", False):
         print("  note: ngl is 0 or 99 only — this model has recurrent (SSM) "
-              "memory, and every partial offload core-dumped llama-server when "
+              "memory, and partial offload core-dumped llama-server when "
               "measured (issue #18), so those levels would abort rather than "
-              "produce a number. Measured on qwen35/qwen35moe + ROCm; if partial "
-              "offload works for you, --factor ngl=0,16,32,48,64 restores it.")
+              "produce a number. Measured on qwen35/qwen35moe + ROCm; whether "
+              "it happens to you depends on the model, the backend and the "
+              "build, so --run probes the real levels instead of trusting this. "
+              "It also depends on the OTHER flags: on Qwen3.6-27B-Q5_K_M the "
+              "same -ngl 53 that core-dumps bare loads fine under --spec-type "
+              "draft-eagle3. --factor ngl=0,16,32,48,64 sweeps them anyway.")
     elif getattr(cfg, "ngl_biased", False):
         print(f"  note: ngl levels bias to full offload — every layer fits in "
               f"VRAM at depth {max(int(d) for d in cfg.factors['n_depth'])}. "
@@ -10451,7 +10773,7 @@ def main():
     if thermal_wait and thermal_baseline is not None:
         print(f"thermal    : idle baseline {thermal_baseline:.0f}°C — settle to "
               f"≤{thermal_baseline + THERMAL_BAND_C:.0f}°C between runs "
-              f"(cap {THERMAL_CAP_S:.0f}s; --no-thermal-wait to disable)")
+              f"(cap {THERMAL_CAP_ACTIVE:.0f}s; --no-thermal-wait to disable)")
     elif thermal_wait:
         print("thermal    : no GPU temp sensor — "
               + (f"using fixed --cooldown {args.cooldown:.0f}s between runs"
@@ -10608,7 +10930,7 @@ def main():
                         continue
                     nl = cfg.hw.get("n_layers") or "?"
                     prefix = (f"[{i}/{len(runs)}] run {rid}: "
-                              f"{f['ngl']}/{nl} layers on GPU, {f['threads']} threads, "
+                              f"{ngl_display(f['ngl'], nl)}, {f['threads']} threads, "
                               f"{f['kv_type']} KV cache, {f['n_depth']}-token context, "
                               f"ubatch {f['ubatch']}")
                     journal_write(journal, "TRY", "run", rid, json.dumps(f))  # durable

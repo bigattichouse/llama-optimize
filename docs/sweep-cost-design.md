@@ -220,13 +220,16 @@ pruner uses, so the two cannot disagree about what fits. It answers True / False
 ### Recurrent models: two levels, not five (issue #18)
 
 A separate reason the `ngl` grid can be wrong, and a harder one — those rows do
-not merely lose, they **abort**. On a hybrid SSM model every *partial* offload
-core-dumps `llama-server`, right after:
+not merely lose, they **abort**. On a hybrid SSM model a *partial* offload
+core-dumps `llama-server` shortly after `llama threadpool init`, before the slots
+are set up.
 
-```
-resolve_fused_ops: layer 0 is assigned to device CPU but fused Gated Delta Net
-  (chunked) is assigned to device ROCm0 (usually due to missing support)
-```
+> **Correction (2026-09-02).** Earlier revisions of this section named
+> `resolve_fused_ops: layer 0 is assigned to device CPU but fused Gated Delta Net
+> (chunked) is assigned to device ROCm0` as the cause, because the crash follows
+> it. It is not. That warning and its `set to disabled` follow-up appear
+> **identically in launches that load fine**; llama.cpp is reporting a fallback
+> it took successfully. Post hoc, not propter hoc — the crash is later.
 
 Mapped on `Qwen3.6-35B-A3B` (`qwen35moe`, 40 blocks, `-ncmoe 40`):
 
@@ -248,7 +251,29 @@ first pass chose `99` over `n_layers` on the reasoning that the output tensor wa
 an untested boundary; that guess was right, and is now measured.
 
 Confirmed on a second model of the same family: `Qwen3.6-27B-Q5_K_M` (`qwen35`,
-dense, 64 blocks) dies at `-ngl 5` and `-ngl 40`.
+dense, 64 blocks) dies at `-ngl 5`, `-ngl 40` and `-ngl 53`.
+
+**But the map above is the *bare* map, and the dead band is not a property of
+`-ngl` alone.** On `Qwen3.6-27B-Q5_K_M`, the same `-ngl 53` that core-dumps bare
+loads and generates correctly under `--spec-type draft-eagle3`:
+
+| added to the crashing launch | `-ngl 53` |
+|---|---|
+| *(nothing)* | segfault |
+| `--spec-type draft-eagle3` — even with **no** `-md` | **loads** |
+| `--spec-type draft-dflash` | **loads** |
+| `--spec-type draft-simple`, `draft-mtp` | segfault |
+| `--spec-type ngram-mod`, `ngram-simple`, `ngram-cache`, `ngram-map-k` | segfault |
+| `-md <head>` alone, `-ngld 0/1`, `-ctk q8_0`, `-ub 512`, `-t 8`, `--no-repack`, `--op-offload`, `--fit off`, `--fit` on, `--load-mode mmap` | segfault |
+
+The two survivors are the heads that reuse the target's hidden states. This was
+checked for *correctness*, not just liveness — the rescued server answers "The
+capital of France is Paris" at 6.8 t/s, against 18.8 t/s at full offload. Partial
+offload on this model is slow, not broken, and `-ngl 5` is rescued by the same
+flag.
+
+For this quant, of this model, on this hardware: `Qwen3.6-27B-Q5_K_M`, MI50 32GB
+(ROCm), llama.cpp `6c84c7d5d`.
 
 So on `ssm_state > 0` the grid is `[0, 99]`: the only two placements that
 execute. Three of five default levels would otherwise be recorded as `SIGNAL`,
@@ -261,6 +286,23 @@ candidate level, checks whether the server stands up, and keeps the ones that do
 against the model it was measured on: given `0, 30, 33, 37, 40, 99` it returns
 `0, 99` and reports the four that died. On a backend where the fused op is fine,
 it returns all six and the layers-for-context axis survives intact.
+
+**And it asks under more than one assignment.** The table above means the probe
+cannot fix every other factor at one level and call the answer general: with
+`spec_type` swept, probing `none` would report `-ngl 53` dead when the `eagle3`
+rows would have run it. So a candidate is dead only if it fails under **every**
+level of `LOAD_SENSITIVE_FACTORS`, retried only for the ones that failed — a
+sweep with no such factor costs exactly what it did before. The two errors are
+again asymmetric: a wrong "dead" deletes the axis silently, while a wrong "live"
+costs one run that is recorded as `SIGNAL` and reported by `dead_levels`. Levels
+rescued this way are printed as such, because "loads only with
+`spec_type=eagle3`" is a different claim from "loads".
+
+**A probe never overrides `--factor`.** `--factor ngl=99` is the user answering
+this question themselves. This shipped broken: a run pinned to `ngl=99` to
+isolate a draft head swept `48/53/59/64` instead, because the probe re-expanded
+the pin from the un-collapsed candidate span, and the rows then varied in the one
+factor that had been held fixed.
 
 That matters because which levels load is a property of the model, the backend
 and the build, and none of those is knowable from the machine this was written

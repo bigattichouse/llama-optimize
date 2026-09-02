@@ -222,6 +222,37 @@ That is why `temp_c` is a column and not a log line, and why the thermal settle 
 on by default. A between-run swing here has been measured at ~27%, which is larger
 than most effects the sweep is looking for.
 
+### The settle had three ways of silently not settling
+
+All three were found on 2026-09-02 by reading `temp_c` on a comparison that had
+the settle **enabled**: two rows at 44 °C and 87 °C, a 12% apparent effect, and
+no warning anywhere. The guard was on and doing nothing.
+
+1. **The plateau rule gave up after one slow poll.** "Cooled by less than 0.5 °C
+   since the last poll" ended the wait — but at a 3 s poll that is 10 °C/min, a
+   rate a hot card passes straight *through* on its way down. It now takes four
+   consecutive stalled polls (`THERMAL_PLATEAU_POLLS`), so a card cooling
+   steadily is waited out and only a genuine stall exits early.
+
+2. **The 120 s cap was shorter than an MI50 takes to shed a run.** Raised to
+   600 s and exposed as `--thermal-cap`, because it is a wall-clock/comparability
+   trade and the tool is not entitled to make it silently. With the plateau rule
+   fixed the cap is a backstop rather than the usual exit.
+
+3. **The "idle baseline" was one instantaneous sample.** Taken while the card was
+   still hot from the previous sweep, it printed `idle baseline 99°C — settle to
+   ≤104°C`: a target nothing can ever exceed, so every subsequent run was
+   recorded as thermally settled while running at 100 °C. `idle_baseline_c` now
+   *measures* it — watching until the reading stops falling, which returns at
+   once on an idle card and waits on a cooling one. No "too hot to be idle"
+   threshold is involved, deliberately: that number is a property of the card,
+   the cooler and the room.
+
+The shared lesson is the one this section is about. A guard that reports nothing
+when it fails is indistinguishable from a guard that works, and all three of
+these failed silently for as long as they existed. A settle that gives up now
+says so, naming the temperature it gave up at.
+
 A finding printed without its scope reads as a property of llama.cpp. It then
 gets adopted as a default and shipped to people whose hardware disagrees, which
 is precisely the history of `FIXED_FA = 1`: measured once, justified in

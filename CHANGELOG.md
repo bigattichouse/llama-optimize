@@ -25,6 +25,22 @@ earlier.
 
 ### ⚠️ Affects existing results
 
+- **Any comparison between two rows measured at different temperatures.** The
+  thermal settle was on by default and had three independent ways of giving up
+  without saying so (see *Fixed*), so `--no-thermal-wait` was never the only way
+  to get thermally incomparable rows. A between-run swing on this box has been
+  measured at ~27%, larger than most effects a sweep is looking for, so a
+  confounded pair can invert a ranking rather than merely blur it.
+
+  **Re-read first, re-run only if it matters.** `temp_c` was recorded on every
+  row throughout, so this is checkable without the GPU: if the rows behind a
+  conclusion differ by more than a few degrees, the difference between them is
+  not attributable to the factor. A worked example is in this session's own
+  results — EAGLE3 read as +12% against a baseline measured 43 °C hotter.
+
+  Sweeps whose rows are all within a few degrees of each other are unaffected,
+  and that is the common case on an idle card with the settle working.
+
 - **Main-effects tables from server-driver sweeps may understate a factor.** A
   config whose reps never finished was recorded as `OK` with `tg=0.0`, and
   `factor_level_means` averages `OK` rows — so an unmeasured row counted as a
@@ -77,6 +93,49 @@ earlier.
   needed for it alone.
 
 ### Fixed
+
+- **The thermal settle had three ways of silently not settling**, all found by
+  reading `temp_c` on a comparison that had the settle *enabled*: two rows at
+  44 °C and 87 °C, a 12% apparent effect, no warning anywhere.
+
+  - The plateau rule ended the wait after **one** poll that cooled by less than
+    0.5 °C — at a 3 s poll that is 10 °C/min, a rate a hot card passes straight
+    through. Now four consecutive stalled polls.
+  - The 120 s cap was shorter than an MI50 takes to shed a run. Raised to 600 s
+    and exposed as `--thermal-cap`, since it is a wall-clock/comparability trade
+    the tool should not make silently.
+  - The "idle baseline" was a single instantaneous sample, so a card still hot
+    from the previous sweep produced `idle baseline 99°C — settle to ≤104°C`, a
+    target nothing can exceed. `idle_baseline_c` now measures it by watching
+    until the reading stops falling.
+
+  A settle that gives up now names the temperature it gave up at.
+
+- **A `--factor ngl=` pin was overridden by the load probe.** On a recurrent
+  model under `--run`, `probe_loadable_ngl` rebuilt its candidate list from the
+  *un-collapsed* level span, so an explicit pin was widened back out: a run
+  pinned to `ngl=99` to isolate a draft head swept `48, 53, 59, 64` instead, and
+  the rows varied in the one factor that had been held fixed. A probe now never
+  runs on a factor the user set by hand.
+
+- **Speculative telemetry was missing whenever the draft head came from
+  `--draft-model`.** `spec_cols_wanted` recognised a NextN head and `--ngram` but
+  not a draft model on the command line, so an EAGLE3 run on a model with
+  `n_nextn=0` wrote every row with `draft_acc`, `draft_cov` and `spec_off`
+  **absent from the CSV** — no way to tell whether the head had drafted a single
+  token, which is the one thing you want to know about a draft head. The
+  `spec_off` guard was blind in the same place, so a draft head that never ran
+  was silently accepted rather than flagged. `spec_type=none` still means off for
+  that row: a draft model on disk does not override an explicit level.
+
+- **The `-ngl` load probe drew a general conclusion from one assignment.** It
+  fixed every other factor at its first level, but whether a level loads depends
+  on them: on `Qwen3.6-27B-Q5_K_M` (`qwen35`, MI50 32GB / ROCm, llama.cpp
+  `6c84c7d5d`) `-ngl 53` core-dumps bare and loads under `--spec-type
+  draft-eagle3`, so the verdict depended on which `spec_type` level sorted first.
+  A level is now dead only if it fails under every level of
+  `LOAD_SENSITIVE_FACTORS`, retried only where it failed, and levels that load
+  conditionally are reported as such.
 
 - **The wall-clock validity check (I5) rejected honest deep-context runs.**
   Reported as [issue #11]. A server's self-reported `tg` covers decode alone, but
@@ -268,14 +327,19 @@ earlier.
 
 - **On hybrid SSM models, three of five `ngl` levels aborted the server.**
   [Issue #18]. Mapped on `qwen35moe`: `-ngl` 0, 1, 2 run; **3 through n_layers all
-  segfault**; `n_layers + 1` and above run. Every death is the same one, right
-  after "layer 0 is assigned to device CPU but fused Gated Delta Net (chunked) is
-  assigned to device ROCm0". Note `-ngl n_layers` *dies* while `n_layers + 1`
+  segfault**; `n_layers + 1` and above run. Note `-ngl n_layers` *dies* while `n_layers + 1`
   lives — at the layer count the output tensor takes the last slot and block 0 is
   left on the CPU, which is the straddle that crashes. The grid is now `[0, 99]`
   on models with `{arch}.ssm.state_size`, with the reason printed and the override
   named. The CPU anchor stays: if the model does not fit, the OOM pruner drops the
   `99` row and CPU-only really is the only placement that runs.
+
+  **Superseded in two ways, 2026-09-02** — see *Fixed*, above. The
+  `resolve_fused_ops` warning this entry originally named as the cause is not
+  one: it appears identically, `set to disabled` and all, in launches that load
+  fine. And the map is the *bare* map — `--spec-type draft-eagle3` or
+  `draft-dflash` lifts the whole dead band on `Qwen3.6-27B-Q5_K_M`, generating
+  correctly at `-ngl 5` and `-ngl 53`.
 
 - **The `ngl` grid spent its slowest rows where the answer could not be.**
   [Issue #14]. `ngl_levels` spanned `0 .. n_layers` evenly and never asked
