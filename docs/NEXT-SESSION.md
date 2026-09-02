@@ -117,15 +117,29 @@ conditionally are reported as such.
 
 ## Do these first
 
-### 1. `tg=0.00` with status `OK` at depth 16384 — free, and the right shape
+### 1. `tg=0.00` at depth 16384 — narrowed to the model, root cause still open
 
-Both rows of the last `fa` sweep did it: `pp` measured fine (88.7 / 98.0),
-`secs` 639–689, and decode never produced a number. `measured_ok` stops it
-poisoning a pick, so nothing is *wrong* in the report — but something silently did
-not measure, which is the defect class this whole session was about. Leading
-suspect is the per-config deadline (`slow_budget_secs`) cutting the reps at depth,
-which would mean deep-context rows quietly stop reporting decode. Investigable
-from `scratchpad/fadepth.csv` and the log; no GPU needed.
+Both deep rows of the `fa` sweep did it: `pp` fine (88.7 / 98.0), `secs` 639–689,
+decode never produced a number.
+
+**The reporting half is fixed and tested.** That shape now sets `no_result`
+("every rep that survived reported 0 t/s") and the row is no longer recorded `OK`
+— `_zero_rate` in `--selftest` covers it. So it can no longer poison a main effect
+silently.
+
+**What it is not.** The per-config deadline was the leading suspect and is ruled
+out: `secs` 639 against a 1200 s budget, `err_rate=0.0`, `rejected_reps=0` — all
+three reps returned successfully and reported zero. Nor is it the tool's deep
+prompt construction: the same sweep shape at `n_depth=16384` on
+`gemma-3-270m-it-Q8_0`, CPU-only, measured **53.9 tg t/s** (`scratchpad/deep0.csv`).
+
+**What is left.** It is specific to `Qwen3.6-35B-A3B` (`qwen35moe`, recurrent) at
+depth on ROCm. `cache_hit=0.0` on those rows says every rep re-prefilled all
+17060 tokens, which matches the known recurrent reuse loss past a depth boundary
+— but that explains the 639 s, not the zero. Needs one GPU repro: a single deep
+request against that model, reading `predicted_n` from the server's own timings.
+If it is 0, the model emitted EOS immediately and the tool is reporting honestly;
+if it is non-zero, the rate is being lost between the server and the row.
 
 ### 2. Validate `--thermal-mode warm` on real hardware — GPU, ~25 min
 
