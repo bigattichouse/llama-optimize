@@ -379,6 +379,139 @@ the set is now **exactly** at L27's cap of thirteen. One more three-level factor
 tips it to L81: 27 runs to 81, a 3x jump for one column. "Free" is true today and
 should be re-checked before the next factor is added, not assumed.
 
+## C3 — the time around the measurement (2026-10-14)
+
+A code review (no GPU) of where a server-driver config spends its wall clock
+found that the measured reps are the minority of it, and that the floors did
+not deliver what `--tgs-timeout` reads like: a config is not judged after 60s,
+it is judged when `n_gen x (reps+1) / min_tgs` runs out — 512s at
+`--n-gen 256 --reps 3 --min-tgs 2`. Five items, cheapest-to-trust first. None of
+them has been timed on hardware yet; the savings below are arithmetic from the
+code, not measurements.
+
+### C3a — the preheat sampled once per request, so it could not end early
+
+`run_until_warm` read the sensor once per `work()` call and needed
+`THERMAL_PLATEAU_POLLS + 1` readings to see a plateau. So every warm-mode config
+paid **at least five full, unmeasured requests** before its three measured ones —
+including a config that inherited a card already sitting at its plateau from
+the previous config in the same session. For a slow config those five requests
+were most of its budget (bounded only by the one-third cap).
+
+Fix: the load runs in a worker thread and the sensor is polled on a clock, at
+the same 3s cadence `wait_until_cool` and `idle_baseline_c` already use. The
+plateau test is unchanged (`_plateaued`, same window, same band), so a card on
+its ramp is still not mistaken for a flat one; a card already at its plateau is
+now released after ~12s of load instead of after five requests. The in-flight
+request is always allowed to finish before the reps start, because a preheat
+request still holding the slot would queue the first rep behind it.
+
+What this does not change: a config is still heated under *its own* request,
+and the window that defines "flat" is the same one that was tuned against the
+MI50 99↔100°C oscillation.
+
+### C3b — the warm request already answers `--min-tgs`
+
+The single-stream path sends one warm request (`n_gen` tokens) before anything
+else, and `prompt_per_second` from it is already checked against `--min-pps`.
+Its `predicted_per_second` was thrown away. It is checked now, **before** the
+preheat.
+
+Why the cold number is a safe basis for rejection: throttling only lowers the
+rate, so a card that cannot reach the floor cold will not reach it hot. Two
+conditions keep that argument honest:
+
+- **A margin** (`WARM_TG_EXIT_FRACTION = 0.75`): the warm request is a single
+  sample, and the observed run-to-run spread is 5–27% (the `--verify-picks`
+  motivation). Only a config below three quarters of the floor exits here; one
+  near the floor is measured as before and judged on its median.
+- **Not under speculation.** At reuse 1.0 the reps repeat the warm prompt, so a
+  self-speculative head (ngram-cache and friends) accepts far more on the reps
+  than on the first sight of the prompt ([`ngram-design.md`](ngram-design.md)).
+  The warm rate is then not a bound on the rep rate, and the check is skipped.
+
+### C3c — defect: the floor budget had no room for prefill
+
+`slow_budget_secs` counted decode tokens only. Two ways that produced a false
+`SLOW` — a config the floor should keep, recorded as below it:
+
+- **Depth.** `llama-bench -d D` re-fills the context before every rep of both
+  of its tests, and the server's warm request fills it once. At
+  `--n-gen 64 --reps 3 --min-tgs 10` the budget was 60s (the grace floor); a
+  32k-deep row prefilling at 400 t/s needs 80s before it decodes a token.
+- **Concurrency.** Under `--parallel`/`concurrency` the server driver's `tg` is
+  the *aggregate* over the streams, and each round generates `par x n_gen`
+  tokens. A config exactly at the floor needs `par` times the budget it was
+  given.
+
+Fix: the budget is `decode_tokens / min_tgs + prefill_tokens / prefill_floor`,
+with both token counts derived per driver and per row (depth, `par`). The
+prefill floor is `--min-pps` when set, and otherwise `--min-tgs` itself — a
+prefill slower than the decode floor is not a configuration anyone is looking
+for, and batched prefill below decode speed has not been seen on any backend
+this tool has run on. Without a prefill floor the deep rows now get roughly
+their full `--timeout`; that is the honest cost of not having said how slow a
+prefill may be, and C3b is what still exits them early on decode.
+
+### C3d — a level that has only ever been slow stops being run
+
+`SLOW` rows carry no weight in the analysis: `measured_ok` keeps only `OK`
+rows, so they enter neither the main effects nor the picks. Running a third
+`ngl=0` row on a model where the first two were `SLOW` therefore buys nothing
+the report uses, and on a large model it is the most expensive row in the
+design.
+
+So once a level has at least `--slow-skip N` (default 2) rows, **all** `SLOW`,
+and some *other* level of the same factor has produced an `OK` row, the
+remaining rows at that level are recorded as `SKIP_SLOW` without being run. The
+rule is `dead_levels` — already trusted to name a level from balanced evidence —
+applied during the sweep instead of after it. Conditions, each for a reason:
+
+- **Measured, never estimated** (SC5): only rows that ran and came back `SLOW`
+  count. `SKIP_SLOW` rows are not evidence, or one skip would beget the next.
+- **At least two rows, at different partners.** The orthogonal array puts each
+  level beside different settings of every other factor, and the execution
+  order is shuffled, so two rows are two different combinations. One `SLOW` row
+  is a combination; two are starting to be a level.
+- **Some other level is OK.** If every level of a factor is slow, the box is
+  below the floor, not the level — the same exclusion `show_dead_levels` makes.
+- **Only where the factor could act.** Rows where the factor was inert or gated
+  off (`is_active` / `is_inert`) carry no evidence about its level.
+
+The risk is a level that is slow only next to particular partners (an `ngl`
+level slow only with `nkvo=1`). That costs the rows that would have shown it,
+which are rows the analysis was going to drop anyway. The status names why each
+row was skipped, and `--slow-skip 0` turns it off.
+
+### C3e — a predicted OOM still started a server
+
+On the server driver the OOM prediction ran per row, *after* the group's
+`ServerSession` had been launched. A group whose every pending row is
+`SKIP_PRED` or `SKIP_SLOW` now launches nothing.
+
+Test coverage is partial: `pre_skip` is unit-tested, but the selftest has no
+harness that drives the main sweep loop, so the group-level call site itself
+is checked only by reading it.
+
+### C3f — defect: refinement passes ran without the floors
+
+Found while wiring `--slow-skip` through. `build_child_argv` builds each
+`--iterate` / `--screen` pass's command line explicitly, and never forwarded
+`--min-tgs`, `--min-pps` or `--tgs-timeout`. Every pass after the first ran
+unbounded at `--timeout`. They are forwarded now, with `--slow-skip`.
+
+Note what C3d does across passes: each child pass starts with an empty `rows`
+list, so a level retired in pass 1 is run again (twice) in pass 2 before it can
+be retired there. Refinement narrows the levels anyway, so this is left as is.
+
+### Not done here: streaming
+
+C3b judges on the warm request, which still runs to `n_gen`. Judging after
+`--tgs-timeout` seconds of decode regardless of `n_gen` — the literal reading of
+the flag — needs a streamed `/completion` so tokens can be counted as they
+arrive. It is the larger change (the request path every test fake replaces) and
+is left as the next item.
+
 ## Invariants
 
 - **SC1 — a narrowing that changes nothing must not look like one that does.**
@@ -393,8 +526,22 @@ should be re-checked before the next factor is added, not assumed.
   estimate being wrong.** The `ngl` grid biases toward full offload only on a
   positive fit verdict, and keeps `ngl=0` regardless, because a wrong "fits"
   would otherwise delete every row that could still have measured something.
+- **SC6 — a time saving says when it is a bet.** C3a, C3c and C3e never change
+  which rows reach `measured_ok`, and C3b only exits rows that are below the
+  floor with a margin. C3d is the exception: a skipped row *might* have come
+  back `OK` beside different partners. That is why it waits for measured
+  evidence, records `SKIP_SLOW` rather than `SLOW` (nothing was measured), and
+  has an off switch.
+- **SC7 — a floor's budget covers every token the config is asked to process**,
+  prefill and every concurrent stream included. A budget that omits work the
+  config must do turns a fast config into a false `SLOW`.
 
 ## Open
+
+- [ ] Streamed decode so `--tgs-timeout` judges after N seconds regardless of
+      `n_gen` (C3, "Not done here").
+- [ ] Time C3a–C3e on hardware: preheat seconds per config before/after, and
+      how many rows `SKIP_SLOW` removes on a large model with the `ngl=0` anchor.
 
 - [ ] `--levels` does not reach the 2-level arrays below L16 (`poll`,
       `batch_ratio` and `ffn_place` thin to 2, but `kv_type` is already floored

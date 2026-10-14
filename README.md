@@ -606,6 +606,13 @@ are excluded from the picks, but you can still see what they did. `--min-pps`
 does the same for prefill, and on the server driver it is decided as soon as
 warm-up returns, so a failing config never pays for its decode reps at all.
 
+On the server driver the warm-up request also answers `--min-tgs`: a config
+decoding under three quarters of the floor is recorded `SLOW` before it is
+preheated or measured. And once two rows at one level of a factor (say
+`ngl=0`) have both been `SLOW` while another level was fine, the rest of that
+level's rows are recorded `SKIP_SLOW` without being run — `--slow-skip N` sets
+the count, `0` turns it off.
+
 Then start small and widen:
 
 ```bash
@@ -758,6 +765,10 @@ python3 llama-optimize.py MODEL.gguf [options]
   --min-pps TPS      as --min-tgs, for prefill. On the server driver it is
                      decided as soon as warm-up returns, so a failing config
                      never pays for its decode reps
+  --slow-skip N      with a floor set: once N rows at one level of a factor have
+                     all been SLOW while another level was OK, record the rest
+                     of that level SKIP_SLOW instead of running it (default 2;
+                     0 = never)
   --tgs-timeout SECS never judge a config on less than this (default 60), so a
                      small --n-gen cannot derive a budget that measures model
                      load instead of throughput

@@ -1088,6 +1088,11 @@ IDLE_BASELINE_CAP_S = 300.0
 # Longest preheat before a measured config in `warm` mode. Backstop only: the
 # preheat normally ends when the card stops heating, not on the clock.
 THERMAL_WARMUP_CAP_S = 300.0
+# Sensor cadence during the preheat — the same 3s the settle and the idle
+# baseline poll at, so the plateau window means the same span of time in all
+# three. A global so the selftest can shorten it without threading a parameter
+# through every measurement path.
+THERMAL_POLL_S = 3.0
 # Set once from --thermal-cap. A process-wide setting rather than a parameter
 # threaded through probe_max_context, verify_picks and the confirmation run:
 # every one of them wants the same answer, and a cap that applies to some
@@ -1147,8 +1152,8 @@ def idle_baseline_c(cap_s: float = IDLE_BASELINE_CAP_S, poll_s: float = 3.0,
 
 
 def run_until_warm(work, cap_s: float = THERMAL_WARMUP_CAP_S,
-                   settle_polls: int = THERMAL_PLATEAU_POLLS
-                   ) -> tuple[str, float] | None:
+                   settle_polls: int = THERMAL_PLATEAU_POLLS,
+                   poll_s: float | None = None) -> tuple[str, float] | None:
     """Apply `work` until the GPU stops heating, then return `(why, temp)`.
 
     The mirror of `wait_until_cool`, and the reason `warm` is the default: real
@@ -1167,20 +1172,51 @@ def run_until_warm(work, cap_s: float = THERMAL_WARMUP_CAP_S,
     Note that different configs plateau at different temperatures, and that is
     the honest answer, not a flaw: a config that heats harder really does
     throttle harder when you deploy it. It does mean a fast burst can lose a
-    sustained comparison, which is why `--thermal-mode idle` still exists."""
+    sustained comparison, which is why `--thermal-mode idle` still exists.
+
+    The load runs in a worker thread and the sensor is read on a clock, every
+    `poll_s` — the cadence `wait_until_cool` and `idle_baseline_c` use. It used to
+    be read once per `work()` call, so the window needed five full requests to
+    fill: every config paid five unmeasured requests even when it inherited a
+    card already at its plateau, and on a slow config those were most of its
+    budget (docs/sweep-cost-design.md C3a). The plateau test is unchanged.
+
+    The in-flight request always finishes before this returns: a preheat request
+    still holding the slot would queue the first measured rep behind it."""
+    if poll_s is None:
+        poll_s = THERMAL_POLL_S
     t = gpu_temp_c()
     if t is None:
         return None
     hist, t0 = [t], time.time()
-    while time.time() - t0 < cap_s:
-        work()
-        nxt = gpu_temp_c()
-        if nxt is None:
-            break
-        hist.append(nxt)
-        if _plateaued(hist, settle_polls):
-            return "warm", hist[-1]
-    return "cap", hist[-1]
+    if cap_s <= 0:
+        return "cap", t
+    stop = threading.Event()
+
+    def load():
+        while not stop.is_set():
+            try:
+                work()
+            except Exception:              # a failing load cannot heat anything
+                break
+
+    worker = threading.Thread(target=load, daemon=True)
+    worker.start()
+    why = "cap"
+    try:
+        while time.time() - t0 < cap_s and worker.is_alive():
+            time.sleep(poll_s)
+            nxt = gpu_temp_c()
+            if nxt is None:
+                break
+            hist.append(nxt)
+            if _plateaued(hist, settle_polls):
+                why = "warm"
+                break
+    finally:
+        stop.set()
+        worker.join()
+    return why, hist[-1]
 
 
 def resolve_thermal_baseline(args) -> None:
@@ -2129,6 +2165,7 @@ class Config:
     min_tgs: float = 0.0        # abandon a config generating slower than this
     min_pps: float = 0.0        # ...or prefilling slower than this
     slow_grace: int = 60        # never judge a config on less than this many seconds
+    slow_skip: int = 2          # SLOW rows that retire a level (C3d); 0 = never
 
 
 def effective_tps(n_prompt: int, n_gen: int, pp: float, tg: float) -> float:
@@ -3571,21 +3608,89 @@ def fmt_dur(secs: float) -> str:
 # llama-bench, where nothing can be observed mid-run: the bound is arithmetic,
 # not instrumentation.
 # ---------------------------------------------------------------------------
-def slow_budget_secs(cfg, timeout: int) -> int:
+def budget_tokens(cfg, prompt_tokens: int = 0, par: int = 1,
+                  depth: int = 0) -> tuple[int, int]:
+    """(decode, prefill) tokens one config is asked to process, per driver.
+
+    Every token the config must handle has to be in the budget, or a config
+    that meets the floor is recorded as below it (SC7, docs/sweep-cost-design.md
+    C3c). Both counts take +1 rep: the server driver sends a warm request before
+    its reps, llama-bench a warmup run, and slack is the safe direction (P3)."""
+    reps = max(1, getattr(cfg, "reps", 1))
+    n_gen = getattr(cfg, "n_gen", 0)
+    if getattr(cfg, "driver", "bench") == "server":
+        # `tg` is aggregate over the streams under concurrency, so a round
+        # generates par x n_gen tokens; and every concurrent request prefills.
+        # Single-stream reps at reuse < 1.0 re-prefill too — counted in full,
+        # because the reuse actually delivered is not known until they run.
+        p = max(1, par)
+        return n_gen * (reps + 1) * p, prompt_tokens * (reps + 1) * p
+    # llama-bench -d D re-fills the context before every rep of BOTH tests.
+    # `-p n_prompt` itself is not added: the +1 rep of decode slack has always
+    # covered it unless prefill runs under ~4x the decode floor, and pricing it
+    # at the floor would have erased the saving at depth 0, where most rows sit.
+    return n_gen * (reps + 1), 2 * depth * (reps + 1)
+
+
+def slow_budget_secs(cfg, timeout: int, prompt_tokens: int = 0, par: int = 1,
+                     depth: int = 0) -> int:
     """Seconds to allow one config, given the throughput floor (0 ⇒ --timeout).
 
     `slow_grace` is a floor on the floor: with a small `n_gen` the derived bound
     can be a couple of seconds, and judging a config on that measures model load
-    and scheduler noise rather than its throughput."""
+    and scheduler noise rather than its throughput.
+
+    Prefill is priced at `prefill_floor` — --min-pps when set, otherwise
+    --min-tgs: a prefill slower than the decode floor is not a configuration
+    anyone is looking for. Leaving it out entirely was the C3c defect — a deep
+    row spent the decode budget prefilling and came back SLOW having decoded
+    nothing.
+
+    On the server driver this bounds the warm request and the preheat; the reps
+    then get their own deadline from `rest_budget_secs`, priced at the prefill
+    rate the warm request actually measured."""
     min_tgs = float(getattr(cfg, "min_tgs", 0.0) or 0.0)
     if min_tgs <= 0:
         return int(timeout)
-    reps = max(1, getattr(cfg, "reps", 1))
-    # +1 covers the warm/prefill request the server driver sends before its reps;
-    # on bench it is slack, and slack is the safe direction here (P3).
-    tokens = getattr(cfg, "n_gen", 0) * (reps + 1)
-    derived = tokens / min_tgs
+    decode, prefill = budget_tokens(cfg, prompt_tokens, par, depth)
+    derived = decode / min_tgs + prefill / prefill_floor(cfg)
     return int(max(getattr(cfg, "slow_grace", 60), min(float(timeout), derived)))
+
+
+def prefill_floor(cfg) -> float:
+    """Slowest prefill a floor-bounded budget allows for (0 ⇒ no floor)."""
+    min_pps = float(getattr(cfg, "min_pps", 0.0) or 0.0)
+    return min_pps if min_pps > 0 else float(getattr(cfg, "min_tgs", 0.0) or 0.0)
+
+
+def warm_budget_secs(cfg, prompt_tokens: int) -> float | None:
+    """Seconds one single-stream request may take and still meet the floors, or
+    None when no --min-tgs is set. A warm request that cannot finish inside this
+    has answered the question for the whole config (C3b)."""
+    min_tgs = float(getattr(cfg, "min_tgs", 0.0) or 0.0)
+    if min_tgs <= 0:
+        return None
+    secs = prompt_tokens / prefill_floor(cfg) + getattr(cfg, "n_gen", 0) / min_tgs
+    return max(float(getattr(cfg, "slow_grace", 60)), secs)
+
+
+def rest_budget_secs(cfg, timeout: int, reps: int, prompt_tokens: int,
+                     reuse: float, pp: float) -> float | None:
+    """Seconds the single-stream reps may take, set AFTER the warm request and
+    the preheat, or None when no --min-tgs is set.
+
+    A fresh deadline rather than what is left of the config's: the preheat
+    spends from the same budget, and a config exactly at the floor used to lose
+    its last rep to it and come back SLOW. Re-prefill is priced at the `pp` the
+    warm request measured, which is known by now; at reuse 1.0 there is none."""
+    min_tgs = float(getattr(cfg, "min_tgs", 0.0) or 0.0)
+    if min_tgs <= 0:
+        return None
+    reps = max(1, reps)
+    secs = reps * getattr(cfg, "n_gen", 0) / min_tgs
+    if pp > 0:
+        secs += reps * max(0.0, 1.0 - reuse) * prompt_tokens / pp
+    return min(float(timeout), max(float(getattr(cfg, "slow_grace", 60)), secs))
 
 
 def too_slow_reason(cfg, pp: float, tg: float) -> str | None:
@@ -3614,6 +3719,22 @@ def _left(timeout: int, deadline: float | None) -> int:
 
 def _expired(deadline: float | None) -> bool:
     return deadline is not None and time.time() >= deadline
+
+
+def _timed_out(e: BaseException) -> bool:
+    """Did a request fail by running out of time, as opposed to failing?
+    urllib raises the bare TimeoutError mid-read and wraps it in URLError when
+    the timeout lands during connect."""
+    return (isinstance(e, TimeoutError)
+            or isinstance(getattr(e, "reason", None), TimeoutError))
+
+
+# How far under --min-tgs the warm request must decode before it alone decides
+# the config (C3b). It is one sample against a judgement normally made on the
+# median of the reps, and run-to-run spread has been observed at 5-27% (the
+# --verify-picks motivation), so only a clear miss exits here; a config near the
+# floor is measured as before.
+WARM_TG_EXIT_FRACTION = 0.75
 
 
 # ---------------------------------------------------------------------------
@@ -3828,7 +3949,7 @@ def run_one(cfg: Config, f: dict, timeout: int):
     # llama-bench is one opaque process: nothing can be watched mid-run, so a
     # throughput floor has to act as a shorter deadline. A config that would
     # MEET the floor finishes inside it, so hitting it is itself the finding.
-    budget = slow_budget_secs(cfg, timeout)
+    budget = slow_budget_secs(cfg, timeout, depth=int(f.get("n_depth", 0) or 0))
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=budget,
                               env=run_env(cfg, f))
@@ -4771,7 +4892,8 @@ class ServerSession:
             probe, r.get("timings", {}).get("prompt_n"))
         return self.cpt
 
-    def measure(self, prompt_len, n_gen, par, reps, timeout, deadline=None):
+    def measure(self, prompt_len, n_gen, par, reps, timeout, deadline=None,
+                spec=False):
         """Measure one config. Returns a dict:
 
             pp, tg      throughput (prefill / decode)
@@ -4815,12 +4937,20 @@ class ServerSession:
             # re-prefills the differing suffix. `wall` below therefore covers
             # prefill as well as decode at any reuse < 1.0 — see issue #11.
             prompt_tok = 0
+            # One request's worth of the floors: a warm request that cannot
+            # finish inside it cannot meet them, so waiting out the rest of the
+            # config's budget on it buys nothing (C3b).
+            warm_cap = warm_budget_secs(self.cfg, prompt_len)
+            warm_timeout = _left(timeout, deadline)
+            if warm_cap is not None:
+                warm_timeout = max(1, int(min(warm_timeout, warm_cap)))
+            warm_tg = 0.0
             try:
-                warm = _completion(self.port, prompt, n_gen,
-                                   _left(timeout, deadline), cache=True,
-                                   temp=_temp)
+                warm = _completion(self.port, prompt, n_gen, warm_timeout,
+                                   cache=True, temp=_temp)
                 wt = warm.get("timings", {})
                 pp = wt.get("prompt_per_second", 0.0) or 0.0
+                warm_tg = wt.get("predicted_per_second", 0.0) or 0.0
                 # What the prompt ACTUALLY became. `n_depth` records what was
                 # asked for, and the two are not the same number whenever the
                 # tokenizer is not 4 chars/token — the row should carry the one
@@ -4834,7 +4964,15 @@ class ServerSession:
                 self.cpt = (getattr(self, "cpt", None)
                             or calibrate_chars_per_token(prompt,
                                                          wt.get("prompt_n")))
-            except (urllib.error.URLError, OSError, json.JSONDecodeError):
+            except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
+                if warm_cap is not None and _timed_out(e):
+                    return {"pp": 0.0, "tg": 0.0, "problem": None, "draft": {},
+                            "err_rate": 0.0, "reuse": self.last_reuse,
+                            "prompt_tok": 0,
+                            "too_slow": (f"the warm request did not finish "
+                                         f"within {warm_timeout}s, the time the "
+                                         f"floors allow one request; reps not "
+                                         f"measured")}
                 pp, n_err = 0.0, n_err + 1
             samples, timings = [], []
             # Prefill the rep cannot avoid, priced client-side, for servers that
@@ -4855,6 +4993,22 @@ class ServerSession:
                         "prompt_tok": prompt_tok,
                         "too_slow": (f"pp={pp:.1f} t/s is below --min-pps "
                                      f"{_min_pps:.1f}; decode not measured")}
+            # ...and so is a decode floor, with a margin, BEFORE the preheat
+            # pays for anything. A cold card is at least as fast as a hot one
+            # (throttling only lowers the rate), so a cold miss by this much is
+            # a miss. Not under speculation: at reuse 1.0 the reps repeat the
+            # warm prompt and a self-speculative head accepts far more on them,
+            # so the warm rate is no bound on the rep rate (C3b).
+            _min_tgs = float(getattr(self.cfg, "min_tgs", 0.0) or 0.0)
+            if (_min_tgs > 0 and not spec
+                    and 0 < warm_tg < _min_tgs * WARM_TG_EXIT_FRACTION):
+                return {"pp": pp, "tg": warm_tg, "problem": None, "draft": {},
+                        "err_rate": 0.0, "reuse": self.last_reuse,
+                        "prompt_tok": prompt_tok,
+                        "too_slow": (f"warm request decoded at {warm_tg:.1f} "
+                                     f"t/s, under {WARM_TG_EXIT_FRACTION:g} x "
+                                     f"--min-tgs {_min_tgs:.1f}; reps not "
+                                     f"measured")}
             # Preheat to this config's own thermal steady state before any
             # measured rep, so the number is the sustained rate rather than the
             # burst rate off a cold card (--thermal-mode). Runs the SAME request
@@ -4895,6 +5049,12 @@ class ServerSession:
             # the column that exists to check comparability reporting a 44 °C
             # confound that was not there.
             self.meas_temp = gpu_temp_c()
+            # The reps' own deadline, from now: the preheat must not be able to
+            # spend the time a config exactly at the floor needs for its reps.
+            rest = rest_budget_secs(self.cfg, timeout, reps, prompt_len,
+                                    self.last_reuse, pp)
+            if rest is not None:
+                deadline = time.time() + rest
             cut_short = False
             for i in range(max(1, reps)):
                 if _expired(deadline):     # budget gone; report what we have
@@ -5135,9 +5295,11 @@ def measure_in_session(cfg: Config, f: dict, session, timeout: int) -> dict:
     try:
         # One deadline for the whole config — launch is already behind us, so
         # this covers the warm request and every rep together (T1).
-        budget = slow_budget_secs(cfg, timeout)
+        budget = slow_budget_secs(cfg, timeout, prompt_tokens=prompt_len,
+                                  par=par)
         m = session.measure(prompt_len, cfg.n_gen, par, cfg.reps, timeout,
-                            deadline=time.time() + budget)
+                            deadline=time.time() + budget,
+                            spec=speculation_requested(cfg, f))
     except (urllib.error.URLError, OSError, json.JSONDecodeError):
         status = "ERROR"
     finally:
@@ -5802,6 +5964,57 @@ def dead_levels(rows: list[dict], factor: str, min_rows: int = 2) -> dict:
     return out
 
 
+def slow_skip_reason(factors, rows: list[dict], f: dict,
+                     min_rows: int = 2) -> str | None:
+    """Why this assignment need not be run, given the rows measured so far, or
+    None (docs/sweep-cost-design.md C3d).
+
+    A level qualifies once at least `min_rows` rows at it came back SLOW and
+    none came back any other way, AND some other level of the same factor has
+    produced a measured OK row. SLOW rows never reach `measured_ok`, so another
+    row at that level buys nothing the analysis uses — on a large model it is
+    the most expensive row in the design. The OK elsewhere is what makes it
+    evidence about the level rather than about the box. Only rows where the
+    factor could act count, and skipped rows are not evidence: one skip must not
+    beget the next."""
+    if min_rows <= 0:
+        return None
+    for name in factors:
+        if name not in f or not is_active(name, f) or is_inert(name, f):
+            continue
+        lvl = str(f[name])
+        here, ok_elsewhere = [], False
+        for r in rows:
+            if name not in r or not is_active(name, r) or is_inert(name, r):
+                continue
+            if str(r[name]) == lvl:
+                if r.get("status") != "SKIP_SLOW":
+                    here.append(str(r.get("status", "")))
+            elif measured_ok([r]):
+                ok_elsewhere = True
+        if (len(here) >= min_rows and ok_elsewhere
+                and all(st == "SLOW" for st in here)):
+            return (f"{name}={lvl}: all {len(here)} earlier rows at this level "
+                    f"were SLOW while another level was OK")
+    return None
+
+
+def pre_skip(cfg, f: dict, rows: list[dict]) -> tuple[str, str] | None:
+    """(status, why) for a row that should not be run, or None.
+
+    Predicted OOM first: it is a property of the row alone. `predict_fits` is
+    cached, so asking once for the group (C3e) and again per row is free."""
+    if getattr(cfg, "oom_prune", False) and predict_fits(cfg, f, cfg.driver) is False:
+        return "SKIP_PRED", "predicted OOM"
+    if (float(getattr(cfg, "min_tgs", 0.0) or 0.0) > 0
+            or float(getattr(cfg, "min_pps", 0.0) or 0.0) > 0):
+        why = slow_skip_reason(cfg.factors, rows, f,
+                               getattr(cfg, "slow_skip", 2))
+        if why:
+            return "SKIP_SLOW", why
+    return None
+
+
 def show_dead_levels(cfg: Config, rows: list[dict]) -> list[str]:
     """Lines naming every level that never produced a measurement, or []."""
     lines = []
@@ -6314,6 +6527,8 @@ def apply_verification(cfg: Config, rows: list[dict], verify: dict):
 # Offline self-test (no GPU): exercises parsing / analysis / factor logic
 # ---------------------------------------------------------------------------
 def selftest() -> bool:
+    global THERMAL_POLL_S
+    THERMAL_POLL_S = 0.01   # fakes return at once; a 3s clock is pure waiting
     try:
         # llama-bench JSON parsing (schema per llama-bench.cpp get_fields())
         sample = json.dumps([
@@ -7759,16 +7974,16 @@ def selftest() -> bool:
                 _cycles = []
                 globals()["gpu_temp_c"] = fake_temp(
                     [50.0, 70.0, 88.0, 99.0, 99.2, 99.3, 99.4, 99.5])
-                assert run_until_warm(lambda: _cycles.append(1),
+                assert run_until_warm(lambda: _cycles.append(1), poll_s=0,
                                       cap_s=99) == ("warm", 99.5)
                 globals()["gpu_temp_c"] = fake_temp(
                     [50.0, 60.0, 70.0, 80.0, 90.0, 99.0])
-                got_w = run_until_warm(lambda: None, cap_s=0)
+                got_w = run_until_warm(lambda: None, cap_s=0, poll_s=0)
                 assert got_w[0] == "cap", got_w
                 # a card drifting slightly DOWN at the plateau is still plateaued
                 globals()["gpu_temp_c"] = fake_temp(
                     [99.0, 98.9, 98.8, 98.7, 98.6])
-                assert run_until_warm(lambda: None, cap_s=99)[0] == "warm"
+                assert run_until_warm(lambda: None, cap_s=99, poll_s=0)[0] == "warm"
                 # The real trace, sampled on an MI50 holding steady under load:
                 # it oscillates 99<->100. Comparing each reading to the previous
                 # one resets on every other poll and NEVER converges, so the
@@ -7777,10 +7992,31 @@ def selftest() -> bool:
                 # on the ramp.
                 globals()["gpu_temp_c"] = fake_temp(
                     [99.0, 100.0, 99.0, 100.0, 99.0, 100.0, 100.0, 99.0])
-                assert run_until_warm(lambda: None, cap_s=99)[0] == "warm"
+                assert run_until_warm(lambda: None, cap_s=99, poll_s=0)[0] == "warm"
                 # ...and the ramp that precedes it is NOT mistaken for flat
                 globals()["gpu_temp_c"] = fake_temp([40.0, 55.0, 70.0, 85.0])
-                assert run_until_warm(lambda: None, cap_s=0)[0] == "cap"
+                assert run_until_warm(lambda: None, cap_s=0, poll_s=0)[0] == "cap"
+                # C3a: the sensor is read on a clock, not once per request.
+                # A card already at its plateau is released after the window
+                # fills, inside ONE long request -- it used to take five
+                # full requests whatever the temperature was doing.
+                _calls, _done = [], []
+
+                def _long_request():
+                    _calls.append(1)
+                    time.sleep(0.3)
+                    _done.append(1)
+                globals()["gpu_temp_c"] = fake_temp([99.0] * 8)
+                assert run_until_warm(_long_request, cap_s=99,
+                                      poll_s=0.01) == ("warm", 99.0)
+                assert len(_calls) == 1, _calls
+                # ...and that request finished before the reps may start: a
+                # preheat request still holding the slot queues the first rep
+                assert _done == [1]
+                # a load that fails cannot heat anything -- stop, do not spin
+                globals()["gpu_temp_c"] = fake_temp([50.0, 60.0, 70.0, 80.0])
+                assert run_until_warm(lambda: 1 / 0, cap_s=99,
+                                      poll_s=0.01)[0] == "cap"
         finally:
             globals()["gpu_temp_c"] = real_temp
 
@@ -8158,6 +8394,64 @@ def selftest() -> bool:
         _av = build_child_argv(_A, replace(cfg_n, ngram_type="ngram-mod"),
                                {"ngl": ["64"]}, Path("r.csv"), False, [])
         assert "--ngram-type" in _av and _av[_av.index("--ngram-type") + 1] == "ngram-mod"
+        # the floors reach every pass: they were never forwarded, so each
+        # refinement pass after the first ran without them
+        assert "--min-tgs" not in _av            # unset stays unset
+        _av = build_child_argv(_A, replace(cfg_n, min_tgs=2.5, min_pps=300.0,
+                                           slow_grace=45, slow_skip=3),
+                               {"ngl": ["64"]}, Path("r.csv"), False, [])
+        for _flag, _val in (("--min-tgs", "2.5"), ("--min-pps", "300"),
+                            ("--tgs-timeout", "45"), ("--slow-skip", "3")):
+            assert _av[_av.index(_flag) + 1] == _val, (_flag, _av)
+
+        # --- C3d: a level that has only ever been SLOW stops being run ---
+        _fx = {"ngl": ["0", "99"], "kv_type": ["f16", "q8_0"]}
+        _r = lambda ngl, kv, st, tg=5.0: {"ngl": ngl, "kv_type": kv,
+                                          "status": st, "tg_tps": tg,
+                                          "eff_tps": tg}
+        _two_slow = [_r("0", "f16", "SLOW"), _r("0", "q8_0", "SLOW"),
+                     _r("99", "f16", "OK", 40.0)]
+        _why = slow_skip_reason(_fx, _two_slow, {"ngl": "0", "kv_type": "f16"})
+        assert _why and _why.startswith("ngl=0"), _why
+        # the other level is untouched, and so is a level with one SLOW row
+        assert slow_skip_reason(_fx, _two_slow,
+                                {"ngl": "99", "kv_type": "q8_0"}) is None
+        assert slow_skip_reason(_fx, _two_slow[1:],
+                                {"ngl": "0", "kv_type": "f16"}) is None
+        # one non-SLOW row at the level and it is not "only ever slow"
+        assert slow_skip_reason(_fx, _two_slow + [_r("0", "f16", "OK", 9.0)],
+                                {"ngl": "0", "kv_type": "q8_0"}) is None
+        # every level slow is the box, not the level -- nothing to retire
+        _all_slow = [_r(n, k, "SLOW") for n in ("0", "99")
+                     for k in ("f16", "q8_0")]
+        assert slow_skip_reason(_fx, _all_slow,
+                                {"ngl": "0", "kv_type": "f16"}) is None
+        # skipped rows are not evidence, or one skip would beget the next
+        _one = [_r("0", "f16", "SLOW"), _r("0", "q8_0", "SKIP_SLOW"),
+                _r("99", "f16", "OK", 40.0)]
+        assert slow_skip_reason(_fx, _one, {"ngl": "0", "kv_type": "f16"}) is None
+        # --slow-skip 0 turns it off
+        assert slow_skip_reason(_fx, _two_slow, {"ngl": "0", "kv_type": "f16"},
+                                min_rows=0) is None
+        # ...and rows where the factor could not act carry nothing about it
+        _cond = next(n for n, s_ in FACTORS.items() if s_.get("active_when"))
+        _gate, _live = FACTORS[_cond]["active_when"]
+        _dead_gate = next(v for v in ("__off__",) if v not in _live)
+        _cx = {_cond: ["a", "b"]}
+        _inactive = [{_cond: "a", _gate: _dead_gate, "status": "SLOW"},
+                     {_cond: "a", _gate: _dead_gate, "status": "SLOW"},
+                     {_cond: "b", _gate: _dead_gate, "status": "OK",
+                      "tg_tps": 9.0, "eff_tps": 9.0}]
+        assert slow_skip_reason(_cx, _inactive,
+                                {_cond: "a", _gate: next(iter(_live))}) is None
+
+        # pre_skip: SKIP_SLOW only when a floor is set (no floor, no SLOW rows)
+        _pc = SimpleNamespace(oom_prune=False, min_tgs=0.0, min_pps=0.0,
+                              slow_skip=2, factors=_fx, driver="bench")
+        assert pre_skip(_pc, {"ngl": "0", "kv_type": "f16"}, _two_slow) is None
+        _pc.min_tgs = 10.0
+        assert pre_skip(_pc, {"ngl": "0", "kv_type": "f16"},
+                        _two_slow)[0] == "SKIP_SLOW"
 
         # spec-type merging: mtp + ngram both present → comma-separated
         merged = _merge_spec_type_parts(["--spec-type draft-mtp", "--spec-type ngram-mod"])
@@ -8623,6 +8917,34 @@ def selftest() -> bool:
         _c.slow_grace = 10
         assert slow_budget_secs(_c, 1200) == 10
 
+        # C3c / SC7: the budget covers every token the config must process.
+        _c = SimpleNamespace(min_tgs=10.0, min_pps=0.0, slow_grace=60, reps=3,
+                             n_gen=64, n_prompt=512, driver="bench")
+        # depth 0 on bench is what it always was: 4 x 64 / 10, at the grace
+        assert slow_budget_secs(_c, 1200) == 60
+        # the false SLOW: -d 32768 re-fills before every rep of both tests,
+        # which the decode-only budget gave 60s. Unpriced by --min-pps, prefill
+        # is held to the decode floor -- so a deep row gets its full timeout
+        assert slow_budget_secs(_c, 1200, depth=32768) == 1200
+        # ...and --min-pps prices it: 4 x 64/10 + 2 x 32768 x 4 / 2000
+        _c.min_pps = 2000.0
+        assert slow_budget_secs(_c, 1200, depth=32768) == int(25.6 + 131.072)
+        # concurrency: tg is AGGREGATE, so a round is par x n_gen tokens. A
+        # config exactly at the floor needs par times the single-stream budget
+        _c = SimpleNamespace(min_tgs=2.0, min_pps=1000.0, slow_grace=1, reps=3,
+                             n_gen=256, driver="server")
+        assert slow_budget_secs(_c, 99999, prompt_tokens=0, par=1) == 512
+        assert slow_budget_secs(_c, 99999, prompt_tokens=0, par=4) == 2048
+        # the warm request alone: one prefill and one n_gen at the floors
+        assert warm_budget_secs(_c, 1000) == 1000 / 1000.0 + 256 / 2.0
+        assert warm_budget_secs(SimpleNamespace(min_tgs=0.0), 1000) is None
+        # the reps' fresh deadline: decode at the floor, plus re-prefill at
+        # the MEASURED rate for whatever the battery does not share
+        assert rest_budget_secs(_c, 99999, 3, 1000, 1.0, 500.0) == 3 * 128.0
+        assert rest_budget_secs(_c, 99999, 3, 1000, 0.5, 500.0) == 384.0 + 3.0
+        assert rest_budget_secs(_c, 100, 3, 1000, 1.0, 500.0) == 100.0
+        assert rest_budget_secs(SimpleNamespace(min_tgs=0.0), 9, 3, 1, 1, 1) is None
+
         # floors reject the unwanted, not the impossible — the numbers survive
         _f = SimpleNamespace(min_tgs=5.0, min_pps=100.0)
         assert too_slow_reason(_f, 500.0, 25.0) is None       # meets both
@@ -9050,6 +9372,77 @@ def selftest() -> bool:
                 r_z = measure_in_session(_slow_cfg, {"n_depth": "8192"}, sess, 30)
             assert r_z["status"] != "OK", r_z
             assert "0 t/s" in _buf_z.getvalue(), _buf_z.getvalue()
+
+            # --- C3b: the warm request answers --min-tgs before the preheat ---
+            def _counting(per_second):
+                calls = []
+
+                def f(port, prompt, n_gen, timeout, cache=False, **_kw):
+                    calls.append(timeout)
+                    return {"content": "x",
+                            "timings": {"prompt_per_second": 444.1,
+                                        "predicted_per_second": per_second,
+                                        "predicted_n": 128, "prompt_n": 64}}
+                return f, calls
+
+            _floor_cfg = SimpleNamespace(n_prompt=0, n_gen=128, parallel=1,
+                                         reps=3, measure_vram=False, factors={},
+                                         emit_mtp=False, ngram=False, hw={},
+                                         driver="server", min_tgs=10.0,
+                                         min_pps=0.0, slow_grace=1)
+            # the session reads the floors from its own cfg, which in a real
+            # sweep IS the run's cfg; the fixture session carries a bare one
+            _sess_cfg, sess.cfg = sess.cfg, SimpleNamespace(
+                prefix_reuse=1.0, min_tgs=10.0, min_pps=0.0, n_gen=128,
+                slow_grace=1)
+            # a clear miss cold is a miss hot: one request, no preheat, no reps
+            _f, _calls = _counting(2.0)
+            globals()["_completion"] = _f
+            with contextlib.redirect_stdout(io.StringIO()):
+                r_w = measure_in_session(_floor_cfg, {"n_depth": "64"}, sess, 30)
+            assert r_w["status"] == "SLOW", r_w
+            assert "warm request" in r_w["too_slow"], r_w
+            assert len(_calls) == 1, _calls
+            # ...the number survives, as SLOW rows' numbers do (SC2)
+            assert r_w["tg_tps"] == 2.0, r_w
+            # near the floor is NOT decided on one cold sample: measured as
+            # before, then judged on the median of its reps
+            _f, _calls = _counting(9.0)
+            globals()["_completion"] = _f
+            with contextlib.redirect_stdout(io.StringIO()):
+                r_n = measure_in_session(_floor_cfg, {"n_depth": "64"}, sess, 30)
+            assert r_n["status"] == "SLOW", r_n
+            assert "warm request" not in r_n["too_slow"], r_n
+            assert len(_calls) > 1, _calls
+            # under speculation the warm rate bounds nothing -- the reps repeat
+            # the warm prompt and a self-speculative head accepts more on them
+            _f, _calls = _counting(2.0)
+            globals()["_completion"] = _f
+            with contextlib.redirect_stdout(io.StringIO()):
+                measure_in_session(_floor_cfg, {"n_depth": "64",
+                                                "spec_type": "ngram-cache"},
+                                   sess, 30)
+            assert len(_calls) > 1, _calls
+            # the warm request is bounded by ONE request's worth of the floors
+            # (64/10 + 128/10 = 19.2s), not by the whole config's budget
+            _f, _calls = _counting(50.0)
+            globals()["_completion"] = _f
+            with contextlib.redirect_stdout(io.StringIO()):
+                measure_in_session(_floor_cfg, {"n_depth": "64"}, sess, 1200)
+            assert _calls[0] == 19, _calls
+            # ...and running out of it is the finding, not an ERROR
+
+            def _times_out(port, prompt, n_gen, timeout, cache=False, **_kw):
+                raise urllib.error.URLError(TimeoutError("timed out"))
+            globals()["_completion"] = _times_out
+            with contextlib.redirect_stdout(io.StringIO()):
+                r_t = measure_in_session(_floor_cfg, {"n_depth": "64"}, sess, 30)
+            assert r_t["status"] == "SLOW", r_t
+            assert "did not finish" in r_t["too_slow"], r_t
+            # a refused connection is a failure, not slowness
+            assert not _timed_out(urllib.error.URLError(ConnectionRefusedError()))
+            assert _timed_out(TimeoutError()) and _timed_out(socket.timeout())
+            sess.cfg = _sess_cfg
 
             # ...and a model that stops at EOS on its FIRST token is a third
             # thing, needing the opposite response from the user: no amount of
@@ -10201,6 +10594,14 @@ def build_child_argv(args, cfg: Config, factors: dict, results_path: Path,
         argv += ["--seed", str(args.seed)]
     if args.max_depth is not None:
         argv += ["--max-depth", str(args.max_depth)]
+    # The floors are what keep a pass short. They were never forwarded, so every
+    # refinement pass after the first quietly ran without them.
+    if cfg.min_tgs > 0:
+        argv += ["--min-tgs", f"{cfg.min_tgs:g}"]
+    if cfg.min_pps > 0:
+        argv += ["--min-pps", f"{cfg.min_pps:g}"]
+    argv += ["--tgs-timeout", str(cfg.slow_grace),
+             "--slow-skip", str(cfg.slow_skip)]
     argv += ["--min-kv", "any"]   # parent already applied the floor; don't re-filter
     # Carry every earlier pass's measurements into this pass's report/picks: a
     # refinement pass can chase a noise-led region, and without the merge the
@@ -10816,6 +11217,14 @@ def main():
                     help="as --min-tgs, for prefill. On the server driver this "
                          "is answerable the moment the warm-up returns, so a "
                          "config failing it skips its decode reps entirely")
+    ap.add_argument("--slow-skip", type=int, default=2, metavar="N",
+                    help="with --min-tgs/--min-pps: once N rows at one level of "
+                         "a factor have all been SLOW while another level of it "
+                         "was OK, record the level's remaining rows SKIP_SLOW "
+                         "instead of running them (default 2; 0 = never). SLOW "
+                         "rows are already left out of the effects and picks, "
+                         "so the skipped rows were the slowest in the design and "
+                         "bought nothing the report uses")
     ap.add_argument("--tgs-timeout", type=int, default=60, metavar="SECS",
                     help="never judge a config on less than this many seconds "
                          "(default 60), so a small --n-gen cannot derive a "
@@ -10987,6 +11396,7 @@ def main():
         min_tgs=max(0.0, args.min_tgs),
         min_pps=max(0.0, args.min_pps),
         slow_grace=max(1, args.tgs_timeout),
+        slow_skip=max(0, args.slow_skip),
         measure_vram=args.vram,
         oom_prune=not args.no_oom_prune,
         fit_headroom_mib=args.fit_headroom,
@@ -11533,6 +11943,11 @@ def main():
         for group in plan:
             session = None
             pending = [r for r in group if str(r.get("run_id", "")) not in done]
+            # A group whose every pending row will be skipped launches nothing:
+            # the prediction used to run per row, AFTER the server was up (C3e).
+            if pending and all(pre_skip(cfg, r["factors"], rows)
+                               for r in pending):
+                pending = []
             if cfg.driver == "server" and pending:
                 launch = pending[0]["factors"]
                 par = int(launch.get("parallel", cfg.parallel))
@@ -11563,22 +11978,24 @@ def main():
                               f"{f['kv_type']} KV cache, {f['n_depth']}-token context, "
                               f"ubatch {f['ubatch']}")
                     journal_write(journal, "TRY", "run", rid, json.dumps(f))  # durable
-                    # OOM pruning: estimate VRAM footprint before loading the model.
-                    # Skip rows certain to exceed physical VRAM (ROADMAP item 2).
-                    if cfg.oom_prune:
-                        est = predict_fits(cfg, f, cfg.driver)
-                        if est is False:
-                            res = {"status": "SKIP_PRED", "pp_tps": 0.0,
-                                   "tg_tps": 0.0, "secs": 0.0, "vram_mib": 0}
-                            res["eff_tps"] = 0.0
-                            row = {"run_id": rid, **f, **derived_abs_cols(cfg, f),
-                                   **res, "temp_c": "", **stamp}
-                            rows.append(row)
-                            writer.writerow(row)
-                            fh.flush()
-                            journal_write(journal, "OK", "run", rid)  # close journal
-                            print(f"{prefix} -> SKIP_PRED (predicted OOM, skipped)")
-                            continue
+                    # Rows not worth a run: predicted OOM (ROADMAP item 2), or a
+                    # level that has only ever been slow (C3d).
+                    skip = pre_skip(cfg, f, rows)
+                    if skip:
+                        status, why = skip
+                        res = {"status": status, "pp_tps": 0.0,
+                               "tg_tps": 0.0, "secs": 0.0, "vram_mib": 0}
+                        res["eff_tps"] = 0.0
+                        if status == "SKIP_SLOW":
+                            res["too_slow"] = why
+                        row = {"run_id": rid, **f, **derived_abs_cols(cfg, f),
+                               **res, "temp_c": "", **stamp}
+                        rows.append(row)
+                        writer.writerow(row)
+                        fh.flush()
+                        journal_write(journal, "OK", "run", rid)  # close journal
+                        print(f"{prefix} -> {status} ({why}, skipped)")
+                        continue
                     temp0 = gpu_temp_c()   # fallback only; see below
                     if cfg.driver == "server":
                         res = with_ticker(

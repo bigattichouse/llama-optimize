@@ -25,6 +25,18 @@ earlier.
 
 ### ⚠️ Affects existing results
 
+- **`SLOW` rows from floor-bounded sweeps at depth, under concurrency, or in an
+  `--iterate` pass after the first.** The `--min-tgs` budget counted decode
+  tokens only, so a deep row could spend it prefilling and be recorded `SLOW`
+  without decoding anything; under `--parallel`/`concurrency` it was `par` times
+  too small for the aggregate rate it was compared against; and refinement
+  passes never received the floors at all, so they ran unbounded (see *Fixed*).
+
+  **Re-read first.** A `SLOW` row with `n_depth` well above zero, or with
+  parallel > 1, may have been a config that meets the floor; its `too_slow`
+  column says which budget it ran out of. Refinement-pass rows are fine — they
+  were measured, only more slowly than intended.
+
 - **Any comparison between two rows measured at different temperatures.** The
   thermal settle was on by default and had three independent ways of giving up
   without saying so (see *Fixed*), so `--no-thermal-wait` was never the only way
@@ -93,6 +105,24 @@ earlier.
   needed for it alone.
 
 ### Added
+
+- **Floor-bounded sweeps spend less time on configs you would not ship**
+  ([docs/sweep-cost-design.md](docs/sweep-cost-design.md) C3). None of these
+  has been timed on hardware yet; the savings are arithmetic from the code.
+  - The warm-mode preheat reads the sensor on a 3s clock while the load runs,
+    instead of once per request. A config that inherits a card already at its
+    plateau is released after ~12s; it used to pay five full unmeasured
+    requests regardless.
+  - On the server driver the warm request now answers `--min-tgs` before the
+    preheat: a config decoding under 0.75x the floor cold is recorded `SLOW`
+    without preheat or reps. Skipped under speculation, where the warm rate
+    does not bound the rep rate. The warm request is also bounded by one
+    request's worth of the floors rather than the whole config's budget.
+  - **`--slow-skip N`** (default 2): once N rows at a level of a factor have all
+    been `SLOW` while another level was `OK`, its remaining rows are recorded
+    `SKIP_SLOW` without running. `0` turns it off.
+  - A server group whose every pending row is predicted to OOM or `SKIP_SLOW`
+    no longer launches a server.
 
 - **Flash attention is derived from the box, not pinned from one GPU**
   ([issue #20]). `FIXED_FA = 1` was chosen on gfx906 and shipped to everyone,
@@ -167,6 +197,14 @@ earlier.
 - **`--thermal-cap SECS`** bounds the idle-mode settle (default 600).
 
 ### Fixed
+
+- **The `--min-tgs` budget left out work the config had to do.** It now
+  includes prefill (`llama-bench -d` re-fills before every rep of both tests),
+  scales with concurrent streams, and gives the server driver's reps their own
+  deadline after the preheat, so a preheat can no longer spend the time a
+  config exactly at the floor needs for its last rep.
+- **`--iterate` passes after the first ran without `--min-tgs`, `--min-pps` and
+  `--tgs-timeout`.** `build_child_argv` never forwarded them.
 
 - **A deep prompt of filler alone silently stopped measuring decode**, and the
   row said `0 t/s` without saying why. Root-caused on `Qwen3.6-35B-A3B`
