@@ -829,7 +829,10 @@ def gpu_temp_c() -> float | None:
 # build while an older llama-fit-params is found on $PATH or left from a
 # previous checkout. Observed in the other direction too, inside one build tree
 # — llama-fit-params carrying -ncffn while llama-bench did not.
-FIT_RECENT_FLAGS = {"-ncmoe", "-ncffn"}
+# `--moe-cache-mib` (b11626) is the odd one out: it ADDS a device buffer rather
+# than moving weights off, so a blind estimate errs low instead of high. Gated
+# the same way regardless — an estimate missing a buffer is not an estimate.
+FIT_RECENT_FLAGS = {"-ncmoe", "-ncffn", "--moe-cache-mib"}
 
 
 def fit_blind_flags(cfg: "Config", f: dict, driver: str) -> list[str]:
@@ -901,6 +904,11 @@ def _fit_params_flags(cfg: "Config", f: dict, driver: str) -> list[str]:
     # beyond asking the level what it emits.
     if "ffn_place" in f:
         flags += ffn_place_args(f["ffn_place"])
+    # The MoE expert cache is a device buffer of exactly this size, and
+    # llama.cpp counts it in the context's memory breakdown. Only when it can
+    # act: an inert row allocates nothing.
+    if f.get("moe_cache", "0") != "0" and not is_inert("moe_cache", f):
+        flags += ["--moe-cache-mib", str(f["moe_cache"])]
     return flags
 
 
@@ -2166,6 +2174,10 @@ class Config:
     min_pps: float = 0.0        # ...or prefilling slower than this
     slow_grace: int = 60        # never judge a config on less than this many seconds
     slow_skip: int = 2          # SLOW rows that retire a level (C3d); 0 = never
+    # Optional columns build_factors left out because adding them would have
+    # grown the array (name -> (levels, from_array, to_array)). Reachable by
+    # --factor; recorded so main() can say so rather than leave them invisible.
+    unswept: dict = field(default_factory=dict)
 
 
 def effective_tps(n_prompt: int, n_gen: int, pp: float, tg: float) -> float:
@@ -2356,9 +2368,74 @@ def build_factors(cfg: Config):
             # is (docs/flag-coverage.md).
             factors["ngram"] = ["none", "ngram-simple", "ngram-mod",
                                 "ngram-map-k", "ngram-map-k4v"]
+    # Knobs from llama.cpp b11626. Each is only ever ADDED IF FREE: at --levels
+    # 3 the server set fills L27 exactly, and one more column would take a
+    # sweep from 27 runs to 81 (docs/flag-coverage.md, "What the arrays can
+    # hold"). A knob that does not fit is recorded in cfg.unswept and named in
+    # the header, so it is a stated omission rather than an invisible one.
+    cfg.unswept = {}
+    if cfg.driver == "bench" and supports_flag(cfg.llama_bench, "--repack"):
+        add_if_free(cfg, factors, "repack", ["0", "1"])
+    if cfg.driver == "server" and "ncmoe" in factors:
+        _mc = moe_cache_levels(cfg.hw.get("vram"), nlv)
+        if _mc and supports_flag(cfg.llama_server, "--moe-cache-mib"):
+            add_if_free(cfg, factors, "moe_cache", _mc)
+    # Probabilistic drafting changes nothing at temperature 0: the target's
+    # distribution is a point mass, so rejection sampling accepts exactly what
+    # argmax-and-match would. Only a sampled workload can tell them apart.
+    if (cfg.driver == "server" and effective_temperature(cfg) > 0
+            and ("mtp" in factors or "spec_type" in factors or cfg.draft_model)
+            and supports_flag(cfg.llama_server, "--spec-draft-sampling")):
+        add_if_free(cfg, factors, "spec_draft_sampling",
+                    ["greedy", "probabilistic"])
     lvl_errors = validate_factor_levels(factors)
     assert not lvl_errors, "factor levels invalid: " + "; ".join(lvl_errors)
     return factors
+
+
+def add_if_free(cfg, factors: dict, name: str, levels: list) -> bool:
+    """Add `name` to the design only if the array it needs is no larger.
+
+    The cost of a column is not its own levels, it is the array: L27 holds 13
+    factors and the 14th makes it L81. A knob worth measuring is still not
+    worth tripling a sweep the user sized with --levels, so the costly case is
+    recorded in cfg.unswept for the header to name, with the --factor that
+    would add it."""
+    before = choose_array(factors)
+    after = choose_array({**factors, name: levels})
+    if after == before or len(levels) <= 1:
+        factors[name] = levels
+        return True
+    cfg.unswept[name] = (levels, before, after)
+    return False
+
+
+# The largest MoE expert cache the default grid tries, as a share of total VRAM.
+# NOT MEASURED: chosen so the top level leaves room for weights and KV on a card
+# that already holds the attention layers. The OOM pruner prices the cache
+# exactly (it is forwarded to llama-fit-params), so a level that does not fit is
+# skipped rather than run; what this constant can get wrong is only whether the
+# grid reaches the optimum. Revisit with a real MoE sweep.
+MOE_CACHE_MAX_VRAM_FRACTION = 0.25
+MOE_CACHE_STEP_MIB = 256
+
+
+def moe_cache_levels(vram_mib, levels: int = 5) -> list[str]:
+    """`--moe-cache-mib` levels: off, then an even span up to a quarter of VRAM,
+    in 256 MiB steps. Empty when VRAM is unknown — the size is a share of the
+    card, and guessing the card is the one thing this must not do."""
+    if not vram_mib or levels < 2:
+        return []
+    top = int(vram_mib * MOE_CACHE_MAX_VRAM_FRACTION)
+    top -= top % MOE_CACHE_STEP_MIB
+    if top < MOE_CACHE_STEP_MIB:
+        return []
+    out = []
+    for v in n_levels_span(0, top, levels):
+        v -= v % MOE_CACHE_STEP_MIB
+        if str(v) not in out:
+            out.append(str(v))
+    return out
 
 
 # Orthogonal-array capacity: name -> number of columns (factors) it holds.
@@ -2476,12 +2553,11 @@ def prune_gated_factors(factors: dict) -> tuple[dict, list[str]]:
     Only prunes when the gate is present AND no level of it is live, so a gate
     that is still being swept keeps its children. Returns (factors, dropped)."""
     dropped = []
-    for name, spec in FACTORS.items():
-        gate_live = spec.get("gated_by")
-        if not gate_live or name not in factors:
+    for name in FACTORS:
+        if name not in factors:
             continue
-        gate, live = gate_live
-        if gate in factors and not any(v in live for v in factors[gate]):
+        if any(gate in factors and not any(v in live for v in factors[gate])
+               for gate, live in gate_pairs(name)):
             dropped.append(name)
     return ({n: v for n, v in factors.items() if n not in dropped}, dropped)
 
@@ -2650,11 +2726,48 @@ def ngram_child_levels(variant: str) -> dict:
 #                  Resolved at emission via the row's gate value; takes the place
 #                  of a static `server`/`bench` tuple.
 # ---------------------------------------------------------------------------
+class LiveUnless:
+    """A `gated_by` live set for a NUMERIC gate: every level except these.
+
+    `gated_by` was written for categorical gates (`mtp` in {"1"}), where the
+    live levels can be listed. A numeric gate like `ncmoe` is live at every
+    level but 0, and its levels are generated per model, so they cannot be
+    listed in a static registry. Membership is all `gated_by` ever asks of its
+    live set, so this answers that and nothing else."""
+
+    def __init__(self, *dead):
+        self.dead = frozenset(str(d) for d in dead)
+
+    def __contains__(self, value) -> bool:
+        return str(value) not in self.dead
+
+    def __repr__(self) -> str:
+        return f"LiveUnless{tuple(sorted(self.dead))}"
+
+
+def gate_pairs(name: str) -> list:
+    """`name`'s `gated_by` as a list of (gate, live) pairs. A factor may need
+    several gates — the MoE cache does nothing unless experts are on the CPU
+    (`ncmoe`) AND their layers are on a GPU (`ngl`) — and is inert when ANY of
+    them is present and dead. One bare pair is the original, common spelling."""
+    g = FACTORS.get(name, {}).get("gated_by")
+    if not g:
+        return []
+    return [tuple(g)] if isinstance(g[0], str) else [tuple(p) for p in g]
+
+
 FACTORS = {
     # --- offload / placement ---
     "ngl":          {"bench": ("-ngl",), "server": ("-ngl",), "kind": "num"},
     "ncmoe":        {"bench": ("-ncmoe",), "server": ("-ncmoe",), "kind": "num"},
     "ncffn":        {"bench": ("-ncffn",), "server": ("-ncffn",), "kind": "num"},
+    # GPU cache (MiB) for MoE experts that -ncmoe left in host memory (llama.cpp
+    # b11626, #29887). It caches experts of layers ASSIGNED TO A GPU, so it is
+    # inert unless some experts are on the CPU and some layers on the GPU.
+    "moe_cache":    {"bench": None, "server": ("--moe-cache-mib",), "kind": "num",
+                     "server_only": True,
+                     "gated_by": (("ncmoe", LiveUnless("0")),
+                                  ("ngl", LiveUnless("0")))},
     "ot":           {"bench": ("-ot",), "server": ("-ot",), "kind": "cat",
                      "translate": OT_PATTERNS},
     # Dense FFN placement: one categorical spanning -ot and -ncffn, whose level
@@ -2718,6 +2831,24 @@ FACTORS = {
                         "abs_name": "spec_n_min", "gated_by": ("mtp", {"1"})},
     "spec_p_min":   {"bench": None, "server": ("--spec-draft-p-min",), "kind": "float", "server_only": True,
                      "gated_by": ("mtp", {"1"})},
+    # Draft sampled and verified by rejection instead of argmax-and-match
+    # (llama.cpp #27694). Implemented for the simple drafter and MTP only.
+    "spec_draft_sampling": {"bench": None, "server": ("--spec-draft-sampling",),
+                            "kind": "cat", "server_only": True,
+                            "gated_by": (("mtp", {"1"}),
+                                         ("spec_type", {"draft-simple",
+                                                        "draft-mtp"}))},
+    # The draft context's own ubatch (llama.cpp #30459), as a FRACTION of the
+    # target's: it is only ever a saving, so at_most, and an absolute level
+    # could exceed the row's -ub. `min_abs` because llama.cpp reads 0 as "same
+    # as --n-ubatch" -- a level that floors to 0 would silently mean 1.0.
+    "spec_draft_ubatch_frac": {"bench": None, "server": ("--spec-draft-n-ubatch",),
+                               "kind": "float", "server_only": True,
+                               "derived_from": ("ubatch", "scale"),
+                               "relation": "at_most", "min_abs": 1,
+                               "abs_name": "spec_draft_ubatch",
+                               "gated_by": (("mtp", {"1"}),
+                                            ("spec_type", LiveUnless("none")))},
     "spec_p_split": {"bench": None, "server": ("--spec-draft-p-split",), "kind": "float", "server_only": True,
                      "gated_by": ("mtp", {"1"})},
     "ngram":             {"bench": None, "server": ("--spec-type",), "kind": "cat", "server_only": True,
@@ -2770,9 +2901,11 @@ FACTORS = {
     "no_op_offload": {"bench": ("-nopo",), "server": ("--no-op-offload",),
                       "kind": "bool", "off_flag": "--op-offload"},
     "no_host":      {"bench": ("--no-host",), "server": ("--no-host",), "kind": "bool"},
-    # default ON upstream, so 0 must emit --no-repack rather than nothing (R3)
-    "repack":       {"bench": None, "server": ("--repack",), "kind": "bool",
-                     "off_flag": "--no-repack", "server_only": True},
+    # default ON upstream, so 0 must emit --no-repack rather than nothing (R3).
+    # llama-bench takes `--repack <0|1>` from b11626, which the bench bool
+    # spelling already produces.
+    "repack":       {"bench": ("--repack",), "server": ("--repack",), "kind": "bool",
+                     "off_flag": "--no-repack"},
     # --- attention / cache shape (server only) ---
     "swa_full":     {"bench": None, "server": ("--swa-full",), "kind": "bool",
                      "server_only": True},
@@ -2922,11 +3055,8 @@ def is_inert(name: str, assignment: dict) -> bool:
     no `mtp` column at all, so treating its absence as inertness would delete
     every draft-model row from `--spec-draft-n-max`'s effect and stop emitting
     the flag (issue #16)."""
-    gate_live = FACTORS.get(name, {}).get("gated_by")
-    if not gate_live:
-        return False
-    gate, live = gate_live
-    return gate in assignment and assignment.get(gate) not in live
+    return any(gate in assignment and assignment.get(gate) not in live
+               for gate, live in gate_pairs(name))
 
 
 def active_factors(names, assignment: dict) -> list:
@@ -3013,7 +3143,8 @@ def derived_value(name: str, f: dict, cfg=None) -> int:
         raw = math.floor(lvl * base) if at_most else math.ceil(lvl * base)
     else:                                              # "offset"
         raw = base + int(lvl)
-    return max(0, min(raw, base)) if at_most else max(raw, base)
+    floor = int(spec.get("min_abs", 0))
+    return max(floor, min(raw, base)) if at_most else max(raw, base)
 
 
 def derived_names(names=None) -> list:
@@ -6940,7 +7071,115 @@ def selftest() -> bool:
             cfg_b = Config(model=Path("m.gguf"), llama_bench=Path("b"),
                            llama_server=Path("s"), array="auto", ctx_floor=8192,
                            driver="bench", hw=dict(_hw_tog))
-            assert "repack" not in build_factors(cfg_b)
+            # llama-bench gained `--repack <0|1>` in b11626; a bench build
+            # that has it gets the column, spelled the bench way
+            assert build_factors(cfg_b)["repack"] == ["0", "1"]
+            assert _flat(factor_flags(cfg_b, {"repack": "0"}, "bench")) \
+                == ["--repack", "0"]
+            globals()["supports_flag"] = lambda _b, _f: _f != "--repack"
+            assert "repack" not in build_factors(cfg_b)   # older bench: no
+
+            # --- knobs from llama.cpp b11626 ---
+            globals()["supports_flag"] = lambda _b, _f: True
+            # MoE expert cache: off, then up to a quarter of VRAM in 256 MiB
+            # steps; nothing at all without a VRAM figure to take a share of
+            assert moe_cache_levels(32768, 5) == ["0", "2048", "4096",
+                                                  "6144", "8192"]
+            assert moe_cache_levels(32768, 3) == ["0", "4096", "8192"]
+            assert moe_cache_levels(None, 5) == []
+            assert moe_cache_levels(512, 5) == []        # 128 MiB: below a step
+            _hw_moe = dict(_hw_tog, n_experts=8, vram=32768)
+            cfg_moe = Config(model=Path("m.gguf"), llama_bench=Path("b"),
+                             llama_server=Path("s"), array="auto",
+                             ctx_floor=8192, driver="server", hw=dict(_hw_moe))
+            f_moe = build_factors(cfg_moe)
+            assert f_moe["moe_cache"] == moe_cache_levels(32768, 5), f_moe
+            assert cfg_moe.unswept == {}
+            # ...but only if free: at --levels 3 the server set already fills
+            # L27, and the 14th column would make it L81 -- 27 runs to 81.
+            # Left out, and recorded so the header can name it.
+            cfg_moe3 = Config(model=Path("m.gguf"), llama_bench=Path("b"),
+                              llama_server=Path("s"), array="auto",
+                              ctx_floor=8192, driver="server", levels=3,
+                              hw=dict(_hw_moe))
+            f_moe3 = build_factors(cfg_moe3)
+            assert "moe_cache" not in f_moe3
+            assert cfg_moe3.unswept["moe_cache"][1:] == ("L27", "L81"), \
+                cfg_moe3.unswept
+            assert choose_array(f_moe3) == "L27"
+            # dense models have no experts to cache
+            assert "moe_cache" not in build_factors(cfg_tog)
+            # It caches experts of layers ON A GPU that -ncmoe left in host
+            # memory, so it cannot act with no experts on the CPU, or with
+            # every layer on the CPU. Both gates, either one dead, is inert.
+            assert is_inert("moe_cache", {"ncmoe": "0", "ngl": "99"})
+            assert is_inert("moe_cache", {"ncmoe": "20", "ngl": "0"})
+            assert not is_inert("moe_cache", {"ncmoe": "20", "ngl": "99"})
+            assert not is_inert("moe_cache", {})        # absent is not evidence
+            assert ["--moe-cache-mib", "4096"] in factor_flags(
+                cfg_moe, {"moe_cache": "4096", "ncmoe": "20", "ngl": "99"},
+                "server")
+            assert "--moe-cache-mib" not in _flat(factor_flags(
+                cfg_moe, {"moe_cache": "4096", "ncmoe": "0", "ngl": "99"},
+                "server"))
+            # pinned off, the design does not sweep it (issue #11's rule)
+            _pr, _dropped = prune_gated_factors({"ncmoe": ["0"],
+                                                 "moe_cache": ["0", "4096"]})
+            assert _dropped == ["moe_cache"] and "moe_cache" not in _pr
+            _pr, _dropped = prune_gated_factors({"ncmoe": ["0", "20"],
+                                                 "moe_cache": ["0", "4096"]})
+            assert _dropped == []                  # still swept: keep it
+            # the OOM estimator is told about the cache it has to fit
+            assert _fit_params_flags(cfg_moe, {"moe_cache": "4096",
+                                               "ncmoe": "20", "ngl": "99"},
+                                     "server")[-2:] == ["--moe-cache-mib", "4096"]
+            assert "--moe-cache-mib" not in _fit_params_flags(
+                cfg_moe, {"moe_cache": "4096", "ncmoe": "0", "ngl": "99"},
+                "server")
+            # an estimator too old to take it does not price the row without it
+            globals()["supports_flag"] = lambda _b, _f: _f != "--moe-cache-mib"
+            assert "--moe-cache-mib" in fit_blind_flags(
+                cfg_moe, {"moe_cache": "4096", "ncmoe": "20", "ngl": "99"},
+                "server")
+            globals()["supports_flag"] = lambda _b, _f: True
+            # a numeric gate's live set: every level but the dead ones
+            assert "20" in LiveUnless("0") and 0 not in LiveUnless("0")
+            assert gate_pairs("spec_p_min") == [("mtp", {"1"})]   # old spelling
+            assert len(gate_pairs("moe_cache")) == 2
+            assert gate_pairs("ngl") == []
+
+            # Probabilistic drafting: at temperature 0 it is the same run as
+            # greedy, so it is a column only when the workload samples
+            _hw_mtp = dict(_hw_tog, n_nextn=1)
+            cfg_t0 = Config(model=Path("m.gguf"), llama_bench=Path("b"),
+                            llama_server=Path("s"), array="auto",
+                            ctx_floor=8192, driver="server", hw=dict(_hw_mtp))
+            assert "spec_draft_sampling" not in build_factors(cfg_t0)
+            cfg_t7 = Config(model=Path("m.gguf"), llama_bench=Path("b"),
+                            llama_server=Path("s"), array="auto",
+                            ctx_floor=8192, driver="server", hw=dict(_hw_mtp),
+                            temperature=0.7)
+            assert build_factors(cfg_t7)["spec_draft_sampling"] == [
+                "greedy", "probabilistic"]
+            # llama.cpp implements it for the simple drafter and MTP only
+            assert is_inert("spec_draft_sampling", {"spec_type": "draft-eagle3"})
+            assert not is_inert("spec_draft_sampling", {"spec_type": "draft-mtp"})
+            assert is_inert("spec_draft_sampling", {"mtp": "0"})
+
+            # Draft ubatch, relative to the target's so it can never exceed it.
+            # 0 means "same as --n-ubatch" to llama.cpp, so a level that floors
+            # to 0 must not be emitted as 0: it would silently mean 1.0.
+            _fu = {"ubatch": "512", "spec_draft_ubatch_frac": "0.25"}
+            assert derived_value("spec_draft_ubatch_frac", _fu) == 128
+            assert derived_value("spec_draft_ubatch_frac",
+                                 dict(_fu, spec_draft_ubatch_frac="0.0")) == 1
+            assert derived_value("spec_draft_ubatch_frac",
+                                 dict(_fu, spec_draft_ubatch_frac="2.0")) == 512
+            assert ["--spec-draft-n-ubatch", "128"] in factor_flags(
+                cfg_t7, _fu, "server")
+            assert is_inert("spec_draft_ubatch_frac", {"spec_type": "none"})
+            assert not is_inert("spec_draft_ubatch_frac",
+                                {"spec_type": "draft-eagle3"})
         finally:
             globals()["supports_flag"] = _real_supports
 
@@ -11409,6 +11648,12 @@ def main():
             "numa_nodes": detect_numa_nodes()},
     )
     cfg.factors = build_factors(cfg)
+    _named = {a.partition("=")[0].strip() for a in args.factor}
+    for _n, (_lv, _from, _to) in cfg.unswept.items():
+        if _n in _named:
+            continue                     # asked for by name: not an omission
+        print(f"not swept : {_n} — adding it would grow the array {_from} -> "
+              f"{_to}. Add it yourself with --factor {_n}={','.join(_lv)}")
     if args.ctx_size is not None:            # fixed context: don't sweep n_depth
         cfg.factors["n_depth"] = [str(args.ctx_size)]
 
@@ -11443,7 +11688,8 @@ def main():
     # speculative-tuning columns sweeping full level sets (issue #11).
     cfg.factors, _inert = prune_gated_factors(cfg.factors)
     if _inert:
-        _gates = sorted({FACTORS[n]["gated_by"][0] for n in _inert})
+        _gates = sorted({g for n in _inert for g, _ in gate_pairs(n)
+                         if g in cfg.factors})
         print(f"not swept: {', '.join(_inert)} — inert at the pinned "
               f"{', '.join(_gates)}")
 

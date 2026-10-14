@@ -159,6 +159,36 @@ discovering a removed `-mmp` when a user's sweep died at argument parsing. Line
 numbers drifted at a third the rate of a single pull, so citations here name the
 symbol as well as the line wherever the symbol is stable enough to grep.
 
+### Refresh: `b10909` → `b11626` (2026-10-14)
+
+726 commits (`43f3dda62` to `a0e6dc738`). Diffed the option tables in
+`common/arg.cpp` and `tools/llama-bench/llama-bench.cpp` rather than `--help`,
+because the old binary was the one being replaced.
+
+| | |
+|---|---|
+| flags added | 4 in `common/arg.cpp`, 1 in llama-bench |
+| flags removed | 0 |
+
+| Flag | Disposition |
+|---|---|
+| `--moe-cache-mib N` | **Registered as `moe_cache`, swept by default on MoE models (server).** A GPU cache for the experts `-ncmoe` left in host memory, filled with the most recently used ones (`src/llama-moe-cache.h`). It caches only layers *assigned to a GPU*, so it is gated on both `ncmoe ≠ 0` and `ngl ≠ 0` — the first two-gate `gated_by`. Levels are off plus a span to a quarter of VRAM (`MOE_CACHE_MAX_VRAM_FRACTION`, **not measured**). Forwarded to `llama-fit-params`, which accepts it, since it is counted in the context's memory breakdown. It also disables pipeline parallelism across GPUs (`llama-context.cpp`), which matters for [`multi-gpu-design.md`](multi-gpu-design.md) |
+| `--spec-draft-sampling {greedy,probabilistic}` | **Registered as `spec_draft_sampling`, swept when the sweep speculates AND samples.** Rejection-sampled drafting (#27694), implemented for `draft-simple` and `draft-mtp` only. At temperature 0 it cannot differ from greedy, so the column exists only when `effective_temperature > 0` (a `--task` preset or `--temp`) |
+| `--spec-draft-n-ubatch N` | **Registered as `spec_draft_ubatch_frac`, reachable by `--factor`, not swept.** The draft context's ubatch, as a fraction of the target's (derived, `at_most`). A VRAM lever, not a speed one. `min_abs: 1`, because llama.cpp reads 0 as "same as `--n-ubatch`" and a level that floored to 0 would silently mean 1.0 |
+| `--nextn` | Excluded: imatrix collection only (`LLAMA_EXAMPLE_IMATRIX`) |
+| llama-bench `--repack <0\|1>` | **`repack` is no longer server-only.** Swept on bench builds that advertise it |
+
+**The columns are added only if free.** At `--levels 3` the server set fills
+L27 exactly; one more column makes it L81, three times the runs. `add_if_free`
+adds a knob only when `choose_array` does not move, and otherwise records it in
+`cfg.unswept`, which the header names with the `--factor` that would add it.
+Measured on `Qwen3.6-35B-A3B` plan-only: `moe_cache` swept at `--levels 5`
+(L125 either way), left out at `--levels 3` with the note.
+
+Other changes in the range that touch what we emit: llama-server's default port
+moved 8080 → 9931 (we always pass `--port`); llama-bench `-fitc` defaults to 0
+(we never emit it).
+
 The fix is to make coverage checkable: parse `llama-server --help` and
 `llama-bench --help`, diff against `FACTORS` plus the emitted-fixed flags, and
 report anything in neither that list nor the explicit exclusion allow-list above.
@@ -216,6 +246,11 @@ about is how inert columns get created.
       never silently dropped from the estimate — it disables pruning for the
       rows that set it, because these flags reduce the footprint and ignoring
       one over-estimates in the direction that prunes valid configs
+- [x] b11626 knobs: `moe_cache`, `spec_draft_sampling`,
+      `spec_draft_ubatch_frac`, bench `repack` (see the refresh above)
+- [ ] Measure `moe_cache` on a real MoE sweep and replace
+      `MOE_CACHE_MAX_VRAM_FRACTION` with something derived from the expert
+      bytes actually left on the CPU
 - [ ] `-sps` folded into [`workload-shape-design.md`](workload-shape-design.md)
 ## Audit: detected-and-explored, or assumed?
 

@@ -106,6 +106,20 @@ earlier.
 
 ### Added
 
+- **Knobs from llama.cpp b11626** ([docs/flag-coverage.md](docs/flag-coverage.md),
+  "Refresh: b10909 → b11626"). Each is added to the default design only if it
+  does not grow the array; otherwise the header names it and the `--factor`
+  that adds it.
+  - `moe_cache` (`--moe-cache-mib`): a GPU cache for MoE experts left in host
+    memory. Swept on MoE models, gated on experts being on the CPU and layers
+    on the GPU, and priced by the OOM estimator.
+  - `spec_draft_sampling` (`--spec-draft-sampling`): probabilistic drafting,
+    swept only when the sweep both speculates and samples (temperature > 0).
+  - `spec_draft_ubatch_frac` (`--spec-draft-n-ubatch`): the draft context's
+    ubatch as a fraction of the target's. Reachable by `--factor` only.
+  - `repack` now sweeps on llama-bench builds that have `--repack`.
+  - `gated_by` accepts several gates, and `LiveUnless` for numeric ones.
+
 - **Floor-bounded sweeps spend less time on configs you would not ship**
   ([docs/sweep-cost-design.md](docs/sweep-cost-design.md) C3). None of these
   has been timed on hardware yet; the savings are arithmetic from the code.
