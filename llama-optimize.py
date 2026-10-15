@@ -23,6 +23,7 @@ import csv
 import io
 import json
 import math
+import mmap
 import os
 import platform
 import random
@@ -3804,7 +3805,7 @@ def validate_measurement(res: dict, parallel: int = 1) -> dict:
     return res
 
 
-def estimate_secs_per_run(cfg) -> float:
+def estimate_secs_per_run(cfg, rates: dict | None = None) -> float:
     """Rough seconds per sweep run, scaled by the things that actually drive it.
 
     Was a flat 90s, which reported the same ~187 minutes for a 270M model and a
@@ -3822,7 +3823,10 @@ def estimate_secs_per_run(cfg) -> float:
         gib = cfg.model.stat().st_size / (1024 ** 3)
     except OSError:
         pass
-    load = 6.0 + 2.5 * gib                      # weights off disk / into VRAM
+    # A load from the page cache, at this box's learned memory rate plus its
+    # fixed context/warmup cost (docs/load-and-stream-design.md L2). The cold
+    # read off disk is paid once, not per run — `cold_read_s` prices it.
+    load = estimate_load_s(gib * 1024, 0.0, rates or load_rates())
     if cfg.driver == "server":
         load *= 0.5                             # sessions are reused across runs
     # The decode-rate prior has to scale too, or the estimate just moves the
@@ -3832,6 +3836,16 @@ def estimate_secs_per_run(cfg) -> float:
     tps_prior = min(300.0, max(5.0, 300.0 / max(0.3, gib)))
     measure = max(1, cfg.reps) * (cfg.n_gen / tps_prior) + 4.0
     return max(8.0, load + measure)
+
+
+def cold_read_s(cfg, rates: dict | None = None) -> tuple[float, float]:
+    """(seconds, GiB) to read the part of the model not in page cache, at this
+    box's disk rate — paid by the first load only."""
+    pc = page_cached_mib(cfg.model)
+    if not pc:
+        return 0.0, 0.0
+    unc = max(0.0, pc[1] - pc[0])
+    return unc / (rates or load_rates())["disk_mib_s"], unc / 1024
 
 
 def fmt_dur(secs: float) -> str:
@@ -4165,19 +4179,82 @@ def apply_intent(ap, args, intent: "Intent | None"):
     return ap.parse_args([str(args.model)] + intent_args(intent))
 
 
+class LiveStatus:
+    """What the sweep is doing RIGHT NOW, for a person watching it
+    (docs/load-and-stream-design.md L4).
+
+    One line of `key=value` fields rewritten in place — `watch -n1 cat
+    <results>.live` from another terminal or screen window — and the same
+    summary on the TTY ticker. Writes are throttled and atomic (a reader never
+    sees half a line); with no path it only feeds the ticker."""
+
+    MIN_INTERVAL_S = 0.25
+
+    def __init__(self, path: Path | None = None):
+        self.path = path
+        self.fields: dict = {}
+        self._last = 0.0
+        self._lock = threading.Lock()
+
+    def set(self, force: bool = False, **kw) -> None:
+        with self._lock:
+            self.fields.update(kw)
+            now = time.time()
+            if self.path is None or (not force
+                                     and now - self._last < self.MIN_INTERVAL_S):
+                return
+            self._last = now
+            line = self.summary() + "\n"
+        try:
+            tmp = Path(str(self.path) + ".tmp")
+            tmp.write_text(line)
+            os.replace(tmp, self.path)
+        except OSError:
+            pass                      # a status file is a courtesy, not data
+
+    def summary(self) -> str:
+        f = dict(self.fields)
+        parts = [str(f.get("config", ""))]
+        for k in ("step", "phase"):
+            if f.get(k):
+                parts.append(str(f[k]))
+        if f.get("tokens"):
+            parts.append(f"{f['tokens']} tok")
+        if f.get("rate"):
+            parts.append(f"{f['rate']:.1f} t/s")
+        if f.get("started"):
+            parts.append(f"{fmt_dur(time.time() - f['started'])} elapsed")
+        return " | ".join(p for p in parts if p)
+
+
+LIVE = LiveStatus()
+
+
 def with_ticker(prefix: str, timeout: int, fn):
     """Run fn() showing a live elapsed ticker on a TTY; plain start line if the
     output is redirected (keeps logs one-line-in/one-line-out)."""
-    if not sys.stdout.isatty():
-        print("trying " + prefix + " ...", flush=True)
-        return fn()
-    stop = threading.Event()
     t0 = time.time()
+    LIVE.fields.clear()
+    LIVE.set(force=True, config=prefix, phase="starting", started=t0)
+    tty = sys.stdout.isatty()
+    if not tty:
+        print("trying " + prefix + " ...", flush=True)
+    stop = threading.Event()
 
     def tick():
         while not stop.wait(1.0):
+            # keep the watched file current: elapsed advances, and the latest
+            # state lands even when the events behind it were throttled
+            LIVE.set(force=True)
+            if not tty:
+                continue
+            f = LIVE.fields
+            what = " ".join(str(x) for x in (
+                f.get("step"), f.get("phase"),
+                f"{f['tokens']} tok" if f.get("tokens") else None,
+                f"{f['rate']:.1f} t/s" if f.get("rate") else None) if x)
             sys.stdout.write(f"\rtrying {prefix} ... {fmt_dur(time.time() - t0)} "
-                             f"(timeout {fmt_dur(timeout)})   ")
+                             f"(timeout {fmt_dur(timeout)}) {what}   ")
             sys.stdout.flush()
 
     th = threading.Thread(target=tick, daemon=True)
@@ -4187,8 +4264,9 @@ def with_ticker(prefix: str, timeout: int, fn):
     finally:
         stop.set()
         th.join(timeout=0.2)
-        sys.stdout.write("\r" + " " * (len(prefix) + 56) + "\r")  # clear line
-        sys.stdout.flush()
+        if tty:
+            sys.stdout.write("\r" + " " * (len(prefix) + 110) + "\r")  # clear
+            sys.stdout.flush()
 
 
 def run_with_progress(cfg: Config, f: dict, timeout: int, prefix: str):
@@ -4318,9 +4396,33 @@ def build_server_args(cfg: Config, f: dict, port: int, n_ctx: int) -> list[str]:
     return args
 
 
-def _wait_health(port: int, deadline: float, proc=None) -> bool:
+# How long a load may show NO progress — no new log line, no more of the model
+# in page cache — past its deadline before it is called stuck (L5), and how far
+# past the deadline progress can carry it at most.
+LOAD_STALL_S = 90.0
+LOAD_HARD_CAP_FACTOR = 4.0
+
+
+def _wait_health(port: int, deadline: float, proc=None, progress=None,
+                 stall_s: float = LOAD_STALL_S) -> bool:
+    """Wait for /health. With `progress` — a callable returning anything that
+    changes while the load advances — `deadline` is soft: past it, a server
+    still making progress keeps waiting, until `stall_s` with none or the hard
+    cap (LOAD_HARD_CAP_FACTOR x the time to the deadline). A slow load that is
+    visibly loading is not a failed one (docs/load-and-stream-design.md L5)."""
     url = f"http://127.0.0.1:{port}/health"
-    while time.time() < deadline:
+    t0 = time.time()
+    hard = (t0 + LOAD_HARD_CAP_FACTOR * max(1.0, deadline - t0)
+            if progress is not None else deadline)
+    last, last_change = (progress() if progress else None), t0
+    while True:
+        now = time.time()
+        if progress is not None:
+            cur = progress()
+            if cur != last:
+                last, last_change = cur, now
+        if now >= hard or (now >= deadline and now - last_change >= stall_s):
+            return False
         if proc is not None and proc.poll() is not None:
             return False  # server process exited (died during load) — stop waiting
         try:
@@ -4330,7 +4432,6 @@ def _wait_health(port: int, deadline: float, proc=None) -> bool:
         except Exception:
             pass
         time.sleep(0.5)
-    return False
 
 
 # Varied prose so speculative-decoding acceptance is realistic. A repeated single
@@ -4761,10 +4862,17 @@ class RepClock:
     wall: float
     prefill_s: float = 0.0
     overhead_s: float = 0.0     # per-request overhead the warm request measured
+    decode_s: float = 0.0       # OUR clock, first token -> last (streamed, L3)
 
     @property
     def ceiling(self) -> float:
-        """The fastest decode rate this rep's elapsed time can support."""
+        """The fastest decode rate this rep's elapsed time can support.
+
+        With a streamed request we timed decode ourselves, first token to
+        last, so no prefill or overhead has to be credited: the server's
+        counter is checked against a clock it does not control (L3)."""
+        if self.decode_s > 0 and self.n_dec > 1:
+            return (self.n_dec - 1) / self.decode_s
         d = decode_wall(self.wall, self.prefill_s)
         d -= min(max(self.overhead_s, 0.0), WALL_OVERHEAD_CREDIT_MAX * d)
         return self.n_dec / d if d > 0 else 0.0
@@ -4945,19 +5053,102 @@ def raise_for_server_error(body):
 
 
 def _completion(port: int, prompt, n_gen: int, timeout: int, cache: bool = False,
-                temp: float = DEFAULT_TEMPERATURE) -> dict:
+                temp: float = DEFAULT_TEMPERATURE, judge=None,
+                prefill_judge=None) -> dict:
+    """One /completion request, STREAMED (docs/load-and-stream-design.md L3).
+
+    Returns the server's final event — the same `timings` a non-streamed
+    request returns, so nothing recorded changes (LS3) — plus a `client` block
+    timed by us: `first_s` (request start -> first token, i.e. when prefill
+    ended), `decode_s` (first -> last token), `n` (tokens generated) and
+    `wall`. Token counts come from the server's cumulative `tokens_predicted`,
+    which stays exact when a speculative step emits several tokens at once.
+
+    `judge(n, decode_s)` is asked after every token once generation has begun;
+    a non-None answer stops the request there and is returned as `aborted`,
+    with whatever had been generated. `prefill_judge(processed, total, secs)`
+    is asked the same way during prefill, from the server's progress events.
+
+    `timeout` bounds each phase: prefill may run past it while visibly
+    advancing, up to LOAD_HARD_CAP_FACTOR x, the way a load does (L5) — a
+    131k-token prompt at 70 t/s needs ~30 min and is working the whole time —
+    and decode then gets `timeout` of its own from the first token, so a
+    trickling decoder is still bounded."""
     body = json.dumps({
         "prompt": prompt,
         "n_predict": n_gen,
         "temperature": temp,
         "cache_prompt": cache,
         "timings_per_token": False,
+        "stream": True,
+        "return_progress": True,     # prefill progress events (L5)
     }).encode()
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/completion", data=body,
         headers={"Content-Type": "application/json"})
+    t0 = time.time()
+    t_first = t_last = None
+    n, final = 0, None
+    done_pp, last_pp_at = -1, t0
+    LIVE.set(force=True, phase="prefill", tokens=0, rate=0.0)
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return raise_for_server_error(json.loads(r.read()))
+        for raw in r:
+            now = time.time()
+            el = now - t0
+            if t_first is None:
+                # prefill: soft past `timeout` while visibly advancing, never
+                # past the cap
+                if el > timeout and (now - last_pp_at >= LOAD_STALL_S
+                                     or el > LOAD_HARD_CAP_FACTOR * timeout):
+                    raise TimeoutError(f"prefill exceeded {el:.0f}s")
+            elif now - t_first > timeout:
+                # decode gets `timeout` of its own, from the first token
+                raise TimeoutError(f"decode exceeded {timeout}s "
+                                   f"after {el - (now - t_first):.0f}s of prefill")
+            line = raw.strip()
+            if not line.startswith(b"data:"):
+                continue
+            ev = raise_for_server_error(json.loads(line[5:]))
+            now = time.time()
+            pg = ev.get("prompt_progress")
+            if pg and t_first is None:
+                proc_ = int(pg.get("processed") or 0)
+                tot = int(pg.get("total") or 0)
+                secs = float(pg.get("time_ms") or 0.0) / 1000.0
+                if proc_ > done_pp:
+                    done_pp, last_pp_at = proc_, now
+                    rate = (proc_ - int(pg.get("cache") or 0)) / secs if secs > 0 else 0.0
+                    LIVE.set(phase=(f"prefill {100 * proc_ / tot:.0f}% "
+                                    f"({proc_}/{tot} tok)") if tot else "prefill",
+                             tokens=0, rate=rate)
+                if prefill_judge is not None:
+                    why = prefill_judge(proc_, tot, secs)
+                    if why:
+                        final = {"aborted": why, "timings": {}}
+                        break
+                continue
+            got = int(ev.get("tokens_predicted") or 0)
+            if got > n:
+                if t_first is None:
+                    t_first = now
+                n, t_last = got, now
+                dec = t_last - t_first
+                LIVE.set(phase="decoding", tokens=n,
+                         rate=(n - 1) / dec if n > 1 and dec > 0 else 0.0)
+            if ev.get("stop"):
+                final = ev
+                break
+            if judge is not None and t_first is not None:
+                why = judge(n, t_last - t_first)
+                if why:
+                    final = {"aborted": why, "timings": {}}
+                    break
+    out = dict(final or {"timings": {}})
+    wall = time.time() - t0
+    out["client"] = {"first_s": (t_first - t0) if t_first else None,
+                     "decode_s": (t_last - t_first) if t_first else 0.0,
+                     "n": n, "wall": wall}
+    return out
 
 
 def _measure_round(port: int, prompts, n_gen: int, par: int, timeout: int, cache=False):
@@ -5126,20 +5317,47 @@ class ServerSession:
         # 400 without a hang once drained. Latent for any session serving more
         # than ~130 requests, and reached easily once the preheat polls on a
         # clock (docs/sweep-cost-design.md C3a). stdout carries nothing.
+        # L2: how long should this take? The cached share of the GGUF is the
+        # term that moves it most — the same 24 GB loaded in 212 s cold and
+        # 5 s from the page cache (Qwen3.6-27B, 2026-10-14).
+        cached = page_cached_mib(cfg.model)
+        model_mib = cached[1] if cached else float(_file_mib(cfg.model))
+        self.uncached_mib = (max(0.0, cached[1] - cached[0]) if cached
+                             else model_mib)
+        self.model_mib = model_mib
+        self.rates = load_rates()
+        self.load_estimate_s = estimate_load_s(model_mib, self.uncached_mib,
+                                               self.rates)
+        # the flag is the floor and the override; a big cold model gets time
+        self.start_timeout = max(float(cfg.server_start_timeout),
+                                 3.0 * self.load_estimate_s)
+        self.load_marks: dict = {}
+        self._t_spawn = time.time()
+        LIVE.set(force=True, step="server", phase=(
+            f"loading (estimate {self.load_estimate_s:.0f}s, "
+            f"{self.uncached_mib / 1024:.1f} GiB not cached)"))
         self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
                                      stderr=subprocess.PIPE, text=True,
                                      env=run_env(cfg, launch_f))
         self._log = collections.deque(maxlen=SERVER_LOG_TAIL_LINES)
         self._drain = threading.Thread(target=_drain_lines,
-                                       args=(self.proc.stderr, self._log),
+                                       args=(self.proc.stderr, self._log,
+                                             self.load_marks),
                                        daemon=True)
         self._drain.start()
         # Wait for the server to come up, but give up fast if the process dies
         # (crashed on load) or exceeds the startup budget — don't hang for the
         # whole per-run timeout.
-        start_deadline = time.time() + cfg.server_start_timeout
-        if _wait_health(self.port, start_deadline, self.proc):
+        start_deadline = self._t_spawn + self.start_timeout
+        if _wait_health(self.port, start_deadline, self.proc,
+                        progress=self._load_progress):
             self.ok = True
+            # L1: what the load spent its time on, and L2: learn from it
+            self.load_phases = load_phases(self.load_marks, self._t_spawn,
+                                           time.time())
+            self.rates = learn_load_rates(self.rates, self.model_mib,
+                                          self.uncached_mib, self.load_phases)
+            save_load_rates(self.rates)
             # Read back what the server settled on, now — before request
             # logging pushes the load lines out of the bounded tail (C5).
             _until = time.time() + 2.0
@@ -5163,7 +5381,8 @@ class ServerSession:
             self.load_timed_out = not died
             if self.load_timed_out:
                 self.err = (f"server not healthy within "
-                            f"{cfg.server_start_timeout}s (still loading? "
+                            f"{self.start_timeout:.0f}s (estimated load "
+                            f"{self.load_estimate_s:.0f}s; still loading? "
                             f"--server-start-timeout)\n" + self.err)
             self.signal = died_on_signal(self.proc.returncode) if died else None
             if not self.err:
@@ -5171,6 +5390,21 @@ class ServerSession:
                             if self.signal else
                             "server exited during load" if died else
                             f"server not healthy within {cfg.server_start_timeout}s")
+
+    def _load_progress(self):
+        """What changes while this load advances: log lines seen, and how much
+        of the model is in page cache (asked every few seconds — it is a
+        subprocess). Also keeps the live view's weights percentage current."""
+        now = time.time()
+        if now - getattr(self, "_pc_at", 0.0) >= 5.0:
+            self._pc_at = now
+            pc = page_cached_mib(self.cfg.model)
+            self._pc_mib = round(pc[0]) if pc else None
+            if pc and pc[1] > 0 and "weights" in self.load_marks \
+                    and "context" not in self.load_marks:
+                LIVE.set(force=True, phase=(f"loading: weights "
+                                            f"{100 * pc[0] / pc[1]:.0f}% read"))
+        return (self.load_marks.get("lines", 0), getattr(self, "_pc_mib", None))
 
     # Characters in the calibration probe. Big enough that the ratio is not
     # dominated by the first few tokens, small enough that prefilling it costs
@@ -5264,10 +5498,46 @@ class ServerSession:
                 warm_timeout = max(1, int(min(warm_timeout, warm_cap)))
             warm_tg = 0.0
             overhead = 0.0
+            warm = None
+            # L3: judge the warm request WHILE it decodes. After --tgs-timeout
+            # seconds of decode the average rate is a real measurement, and a
+            # config below --min-tgs has answered the question — however long
+            # --n-gen is. Not under speculation, for C3b's reason.
+            _floor = float(getattr(self.cfg, "min_tgs", 0.0) or 0.0)
+            _grace = float(getattr(self.cfg, "slow_grace", 60) or 60)
+
+            def _judge(n, dec_s):
+                if dec_s >= _grace and n > 1 and (n - 1) / dec_s < _floor:
+                    return (f"decoded {n} tokens in {dec_s:.0f}s after prefill "
+                            f"({(n - 1) / dec_s:.1f} t/s), under --min-tgs "
+                            f"{_floor:.1f}; stopped there")
+                return None
+            _pfloor = float(getattr(self.cfg, "min_pps", 0.0) or 0.0)
+
+            def _pjudge(done, total, secs):
+                # --min-pps answered DURING prefill, after the same grace
+                if secs >= _grace and done > 0 and done / secs < _pfloor:
+                    return (f"prefilled {done}/{total} tokens in {secs:.0f}s "
+                            f"({done / secs:.1f} t/s), under --min-pps "
+                            f"{_pfloor:.1f}; stopped there")
+                return None
             try:
                 _w0 = time.time()
+                LIVE.set(force=True, step="warm-up request")
                 warm = _completion(self.port, prompt, n_gen, warm_timeout,
-                                   cache=True, temp=_temp)
+                                   cache=True, temp=_temp,
+                                   judge=_judge if _floor > 0 and not spec
+                                   else None,
+                                   prefill_judge=_pjudge if _pfloor > 0
+                                   else None)
+                if warm.get("aborted"):
+                    _c = warm.get("client", {})
+                    _rate = ((_c.get("n", 0) - 1) / _c["decode_s"]
+                             if _c.get("decode_s") else 0.0)
+                    return {"pp": 0.0, "tg": max(0.0, _rate), "problem": None,
+                            "draft": {}, "err_rate": 0.0,
+                            "reuse": self.last_reuse, "prompt_tok": 0,
+                            "too_slow": warm["aborted"]}
                 wt = warm.get("timings", {})
                 overhead = warm_overhead_s(time.time() - _w0, wt)
                 pp = wt.get("prompt_per_second", 0.0) or 0.0
@@ -5296,6 +5566,16 @@ class ServerSession:
                                          f"measured")}
                 pp, n_err = 0.0, n_err + 1
                 self.last_error = request_error_text(e)
+            # A long prefill may have run past the config's deadline on the
+            # soft timeout (L5). Its reps are cheap from here — the prompt is
+            # cached — so give them their own time rather than recording a
+            # TIMEOUT for a config that just did the hard part.
+            _first = (warm or {}).get("client", {}).get("first_s")
+            if (deadline is not None and pp > 0 and warm_tg > 0 and _first
+                    and _w0 + _first > deadline - 1.0):  # prefill itself ran late
+                _per = (n_gen / warm_tg
+                        + (1.0 - self.last_reuse) * prompt_len / pp)
+                deadline = time.time() + max(_grace, 2.0 * max(1, reps) * _per)
             samples, timings = [], []
             # Prefill the rep cannot avoid, priced client-side, for servers that
             # report no `prompt_ms`. Deliberately a LOWER bound on the credit:
@@ -5353,6 +5633,7 @@ class ServerSession:
                 # preheated for its full cap and then recorded TIMEOUT, "the
                 # budget expired before any rep finished". A preheat that
                 # starves the measurement has inverted its own purpose.
+                LIVE.set(force=True, step="preheat")
                 got = run_until_warm(
                     _heat, cap_s=min(THERMAL_WARMUP_CAP_S,
                                      max(0.0, _left(timeout, deadline)) / 3.0))
@@ -5383,6 +5664,7 @@ class ServerSession:
                     cut_short = True
                     break
                 w0 = time.time()
+                LIVE.set(force=True, step=f"rep {i + 1}/{max(1, reps)}")
                 try:
                     r = _completion(self.port, prompts[(i + 1) % len(prompts)],
                                     n_gen, _left(timeout, deadline), cache=True,
@@ -5413,7 +5695,9 @@ class ServerSession:
                     except (TypeError, ValueError):
                         reported = 0.0     # unparseable is not a credit
                     prefill = reported / 1000.0 if reported > 0 else prefill_est
-                    clock = RepClock(n_dec, wall, prefill, overhead)
+                    clock = RepClock(n_dec, wall, prefill, overhead,
+                                     float((r.get("client") or {})
+                                           .get("decode_s") or 0.0))
                 samples.append(RepSample(rate, clock))
             # Each rep is judged against its own request's duration, then the
             # survivors decide the number. One rep with a broken counter is a
@@ -5631,14 +5915,181 @@ def request_error_text(e: BaseException) -> str:
     return f"{type(e).__name__}: {e}"[:300]
 
 
-def _drain_lines(stream, sink) -> None:
+# llama.cpp's own markers for the stages of a load (load-and-stream-design L1)
+LOAD_MARKS = (("weights", "load_tensors: loading model tensors"),
+              ("context", "llama_context: constructing"))
+_GPU_BUF = re.compile(r"(ROCm|CUDA|Vulkan|Metal|SYCL)\d*\s+model buffer size\s*=\s*"
+                      r"([\d.]+)\s*MiB")
+
+
+SERVER_LOG_PATH: Path | None = None    # set by main(): <results>.server.log
+
+
+def _drain_lines(stream, sink, marks: dict | None = None) -> None:
     """Read `stream` to EOF into `sink` (a bounded deque). Runs in a thread for
-    a server's whole life, so its pipe can never fill and block it."""
+    a server's whole life, so its pipe can never fill and block it.
+
+    `marks`, when given, gets each LOAD_MARKS stage's arrival time (our clock)
+    and the MiB llama.cpp says it put on GPUs (`gpu_mib`)."""
+    tee = None
+    if marks is not None and SERVER_LOG_PATH is not None:
+        try:
+            tee = open(SERVER_LOG_PATH, "a")
+            tee.write(f"\n===== server start {time.strftime('%H:%M:%S')} =====\n")
+        except OSError:
+            tee = None
     try:
         for line in iter(stream.readline, ""):
             sink.append(line)
+            if tee is not None:
+                tee.write(line)
+                tee.flush()
+            if marks is None:
+                continue
+            marks["lines"] = marks.get("lines", 0) + 1
+            for name, pat in LOAD_MARKS:
+                if name not in marks and pat in line:
+                    marks[name] = time.time()
+                    LIVE.set(force=True, phase=f"loading: {name}")
+            g = _GPU_BUF.search(line)
+            if g:
+                marks["gpu_mib"] = marks.get("gpu_mib", 0.0) + float(g.group(2))
     except (OSError, ValueError):
         pass                                 # closed under us: nothing to keep
+    finally:
+        if tee is not None:
+            tee.close()
+
+
+def load_phases(marks: dict, t_spawn: float, t_ready: float) -> dict:
+    """Seconds per load stage: start (spawn -> reading weights), weights
+    (reading + uploading), ready (context, KV, warmup). A stage whose marker
+    never appeared is folded into the next, so the parts always sum."""
+    tw = marks.get("weights", t_spawn)
+    tc = marks.get("context", tw)
+    return {"start": max(0.0, tw - t_spawn), "weights": max(0.0, tc - tw),
+            "ready": max(0.0, t_ready - tc), "total": max(0.0, t_ready - t_spawn)}
+
+
+def load_report(session) -> str:
+    """One line: how long a load took, where, and what was guessed (L1/L2)."""
+    ph = getattr(session, "load_phases", None) or {}
+    if not ph:
+        return "  loaded"
+    unc = max(0.0, getattr(session, "uncached_mib", 0.0))
+    est = getattr(session, "load_estimate_s", 0.0)
+    guess = ("prior" if int((getattr(session, "rates", {}) or {})
+                            .get("measured", 0)) <= 1 else "learned")
+    return (f"  loaded in {ph['total']:.0f}s (weights {ph['weights']:.0f}s, "
+            f"context+warmup {ph['ready']:.0f}s; {unc / 1024:.1f} GiB was not "
+            f"in page cache; estimate {est:.0f}s, {guess})")
+
+
+def page_cached_mib(path) -> tuple[float, float] | None:
+    """(MiB of `path` in the page cache, its size in MiB), from util-linux
+    `fincore`, or None when that cannot be asked."""
+    try:
+        out = subprocess.run(["fincore", "--bytes", "--noheadings", "--raw",
+                              "--output", "RES,SIZE", str(path)],
+                             capture_output=True, text=True, timeout=10)
+        res, size = out.stdout.split()[:2]
+        return int(res) / 2**20, int(size) / 2**20
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+# Learned load rates for THIS box (L2), kept per user so every results dir
+# benefits. Priors are deliberately pessimistic until a load has been measured:
+# a timeout derived from an optimistic prior is the failure L2 exists to fix.
+LOAD_RATES_PATH = Path(os.environ.get("XDG_CACHE_HOME",
+                                      str(Path.home() / ".cache"))) \
+    / "llama-optimize" / "load-rates.json"
+LOAD_RATE_PRIORS = {"disk_mib_s": 80.0, "mem_mib_s": 1500.0, "fixed_s": 30.0,
+                    "measured": 0}
+
+
+def disk_read_mib_s(path, mib: int = 1024, chunk_mib: int = 16) -> float | None:
+    """Sequential read speed of the disk `path` lives on, in MiB/s, measured by
+    reading `mib` of it with the page cache BYPASSED (O_DIRECT), so the answer
+    is the disk's whatever is cached. None where O_DIRECT is unavailable or the
+    file is too small to say anything (L2).
+
+    1 GiB rather than a few MB: a small read measures latency and readahead,
+    not throughput. At the ~120 MiB/s measured here that is ~8 s, paid once
+    per box — after that the learned rate is used."""
+    flag = getattr(os, "O_DIRECT", None)
+    if flag is None:
+        return None
+    try:
+        size = os.path.getsize(path)
+        want = min(mib * 2**20, size // 2**20 // chunk_mib * chunk_mib * 2**20)
+        if want < 64 * 2**20:
+            return None
+        buf = mmap.mmap(-1, chunk_mib * 2**20)      # page-aligned, as O_DIRECT needs
+        fd = os.open(str(path), os.O_RDONLY | flag)
+        try:
+            t0, done = time.time(), 0
+            while done < want:
+                got = os.readv(fd, [buf])
+                if got <= 0:
+                    break
+                done += got
+            secs = time.time() - t0
+        finally:
+            os.close(fd)
+            buf.close()
+        return (done / 2**20) / secs if secs > 0 and done else None
+    except OSError:
+        return None
+
+
+def load_rates(path: Path | None = None) -> dict:
+    try:
+        got = json.loads((path or LOAD_RATES_PATH).read_text())
+        return {**LOAD_RATE_PRIORS, **{k: v for k, v in got.items()
+                                       if k in LOAD_RATE_PRIORS}}
+    except (OSError, ValueError):
+        return dict(LOAD_RATE_PRIORS)
+
+
+def estimate_load_s(model_mib: float, uncached_mib: float, rates: dict) -> float:
+    """A guess at a load's seconds: the uncached part off disk, all of it
+    through memory to the device, plus the fixed context/warmup cost."""
+    return (max(0.0, uncached_mib) / rates["disk_mib_s"]
+            + max(0.0, model_mib) / rates["mem_mib_s"] + rates["fixed_s"])
+
+
+def learn_load_rates(rates: dict, model_mib: float, uncached_mib: float,
+                     phases: dict, alpha: float = 0.5) -> dict:
+    """Fold one measured load into the rates (an exponential average, so one
+    odd load moves them but does not own them). A mostly-cached load prices
+    memory; a mostly-uncached one prices the disk, net of the memory part."""
+    out = dict(rates)
+    w = phases.get("weights", 0.0)
+    if w > 0.5 and model_mib > 0:
+        if uncached_mib < 0.1 * model_mib:
+            out["mem_mib_s"] = ((1 - alpha) * rates["mem_mib_s"]
+                                + alpha * model_mib / w)
+        else:
+            disk_s = w - model_mib / rates["mem_mib_s"]
+            if disk_s > 0.5:
+                out["disk_mib_s"] = ((1 - alpha) * rates["disk_mib_s"]
+                                     + alpha * uncached_mib / disk_s)
+    fixed = phases.get("start", 0.0) + phases.get("ready", 0.0)
+    if fixed > 0:
+        out["fixed_s"] = (1 - alpha) * rates["fixed_s"] + alpha * fixed
+    out["measured"] = int(rates.get("measured", 0)) + 1
+    return out
+
+
+def save_load_rates(rates: dict, path: Path | None = None) -> None:
+    p = path or LOAD_RATES_PATH
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({k: round(v, 3) if isinstance(v, float) else v
+                                 for k, v in rates.items()}, indent=1))
+    except OSError:
+        pass                     # a cache we cannot write is a cache we skip
 
 
 def load_key(cfg: Config, f: dict):
@@ -7063,7 +7514,7 @@ def apply_verification(cfg: Config, rows: list[dict], verify: dict):
 # Offline self-test (no GPU): exercises parsing / analysis / factor logic
 # ---------------------------------------------------------------------------
 def selftest() -> bool:
-    global THERMAL_POLL_S
+    global THERMAL_POLL_S, SERVER_LOG_PATH
     THERMAL_POLL_S = 0.01   # fakes return at once; a 3s clock is pure waiting
     try:
         # llama-bench JSON parsing (schema per llama-bench.cpp get_fields())
@@ -8854,6 +9305,246 @@ def selftest() -> bool:
         assert prune_gated_factors({"ngl": ["0"], "nkvo": ["0", "1"],
                                     "threads": ["4"]})[1] == ["nkvo"]
 
+        # --- L1: a load's stages, timed on arrival ---
+        _marks = {}
+        _src = io.StringIO("I srv load_model: loading model 'm.gguf'\n"
+                           "I load_tensors: loading model tensors, this can take\n"
+                           "I load_tensors:        ROCm0 model buffer size = 271.86 MiB\n"
+                           "I load_tensors:   CPU_Mapped model buffer size = 170.00 MiB\n"
+                           "I llama_context: constructing llama_context\n")
+        _drain_lines(_src, collections.deque(), _marks)
+        assert {"weights", "context"} <= set(_marks)
+        assert _marks["gpu_mib"] == 271.86        # GPU buffers only, not CPU
+        _ph = load_phases({"weights": 10.0, "context": 200.0}, 5.0, 212.0)
+        assert _ph == {"start": 5.0, "weights": 190.0, "ready": 12.0,
+                       "total": 207.0}
+        # a marker that never appeared folds into the next stage: still sums
+        _ph = load_phases({}, 0.0, 30.0)
+        assert _ph["total"] == 30.0 and _ph["ready"] == 30.0
+
+        # --- L2: estimate a load, learn from the ones that happen ---
+        _r = dict(LOAD_RATE_PRIORS)
+        # cold 24.2 GiB: the disk term dominates, and the prior is pessimistic
+        _cold = estimate_load_s(24780, 24780, _r)
+        assert _cold > 212, _cold          # longer than the real cold load
+        assert estimate_load_s(24780, 0, _r) < 60   # cached: much shorter
+        # the derived start timeout covers a cold load the 180 s flag did not
+        assert max(180.0, 3 * _cold) > 212
+        # learning from today's two loads moves the rates toward the truth
+        _r = learn_load_rates(_r, 24780, 0, {"start": 1, "weights": 3, "ready": 1})
+        assert _r["mem_mib_s"] > LOAD_RATE_PRIORS["mem_mib_s"]   # cached: fast
+        _r2 = learn_load_rates(_r, 24780, 24780,
+                               {"start": 2, "weights": 205, "ready": 5})
+        assert _r2["disk_mib_s"] > LOAD_RATE_PRIORS["disk_mib_s"]  # ~120 MiB/s
+        assert _r2["measured"] == 2
+        # a load too short to say anything about rates leaves them alone
+        assert learn_load_rates(_r, 100, 100, {"weights": 0.1})["disk_mib_s"] \
+            == _r["disk_mib_s"]
+        # persisted per box, and a missing or broken file is the priors
+        with tempfile.TemporaryDirectory() as _td:
+            _lp = Path(_td) / "x" / "load-rates.json"
+            assert load_rates(_lp) == LOAD_RATE_PRIORS
+            save_load_rates(_r2, _lp)
+            assert round(load_rates(_lp)["disk_mib_s"], 3) == round(
+                _r2["disk_mib_s"], 3)
+            _lp.write_text("not json")
+            assert load_rates(_lp) == LOAD_RATE_PRIORS
+            # the page cache, asked of a real file
+            _f = Path(_td) / "blob"
+            _f.write_bytes(b"x" * 2**20)
+            _pc = page_cached_mib(_f)
+            assert _pc is None or (0.0 <= _pc[0] <= _pc[1] and _pc[1] == 1.0)
+        _ses = SimpleNamespace(load_phases=load_phases({"weights": 1.0,
+                                                        "context": 4.0}, 0.0, 5.0),
+                               uncached_mib=2048.0, load_estimate_s=9.0,
+                               rates={"measured": 3})
+        assert load_report(_ses).startswith("  loaded in 5s (weights 3s")
+        assert "2.0 GiB was not in page cache" in load_report(_ses)
+
+        # --- L3: streamed requests, timed on our own clock ---
+        import http.server
+        _plan = {}
+
+        class _SSE(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                try:
+                    for _done, _tot, _ms in _plan.get("pp", []):
+                        self.wfile.write(("data: " + json.dumps(
+                            {"stop": False, "tokens_predicted": 0,
+                             "prompt_progress": {"total": _tot, "cache": 0,
+                                                 "processed": _done,
+                                                 "time_ms": _ms}})
+                                          + "\n\n").encode())
+                        self.wfile.flush()
+                        time.sleep(_plan.get("pp_gap", 0.0))
+                    time.sleep(_plan.get("prefill", 0.0))
+                    for i in range(1, _plan["n"] + 1):
+                        if _plan.get("error_at") == i:
+                            self.wfile.write(b'data: {"error": {"message": '
+                                             b'"boom"}}\n\n')
+                            self.wfile.flush()
+                            return
+                        self.wfile.write(("data: " + json.dumps(
+                            {"content": "x", "stop": False,
+                             "tokens_predicted": i}) + "\n\n").encode())
+                        self.wfile.flush()
+                        time.sleep(_plan.get("gap", 0.0))
+                    self.wfile.write(("data: " + json.dumps(
+                        {"stop": True, "tokens_predicted": _plan["n"],
+                         "timings": {"predicted_n": _plan["n"],
+                                     "predicted_per_second": 99.0}})
+                                      + "\n\n").encode())
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass                    # the client hung up: as intended
+        _srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _SSE)
+        threading.Thread(target=_srv.serve_forever, daemon=True).start()
+        _port = _srv.server_address[1]
+        try:
+            # the final event is what a non-streamed request returned (LS3),
+            # and the client block says when prefill ended and how decode went
+            _plan.update(n=6, prefill=0.15, gap=0.02)
+            _r = _completion(_port, "p", 6, 10)
+            assert _r["timings"]["predicted_n"] == 6
+            assert _r["client"]["n"] == 6
+            assert 0.1 < _r["client"]["first_s"] < 1.0
+            assert _r["client"]["decode_s"] > 0.05
+            # judged mid-stream: stopped where the judge said, with the count
+            _plan.update(n=200, prefill=0.0, gap=0.01)
+            _r = _completion(_port, "p", 200, 10,
+                             judge=lambda n, d: "too slow" if n >= 5 else None)
+            assert _r["aborted"] == "too slow" and _r["client"]["n"] == 5
+            # the timeout bounds the WHOLE request: a trickle cannot stretch it
+            _plan.update(n=1000, prefill=0.0, gap=0.05)
+            _t = time.time()
+            try:
+                _completion(_port, "p", 1000, 1)
+                assert False, "a trickling stream outlived its timeout"
+            except TimeoutError:
+                pass
+            assert time.time() - _t < 3
+            # an error event mid-stream is a failure, not a short measurement
+            _plan.update(n=10, gap=0.0, error_at=3)
+            try:
+                _completion(_port, "p", 10, 10)
+                assert False, "an error event was taken as a result"
+            except OSError as _e:
+                assert "boom" in str(_e)
+            _plan.pop("error_at")
+            # prefill is observable: the live view shows how far it got...
+            _plan.update(n=3, gap=0.0, pp_gap=0.05,
+                         pp=[(256, 1024, 2000), (512, 1024, 4000),
+                             (768, 1024, 6000), (1024, 1024, 8000)])
+            LIVE.fields.clear()
+            _seen = []
+            _real_set = LIVE.set
+            try:
+                LIVE.set = lambda force=False, **kw: (_seen.append(dict(kw)),
+                                                      _real_set(force, **kw))[1]
+                _r = _completion(_port, "p", 3, 10)
+            finally:
+                LIVE.set = _real_set
+            assert any(str(k.get("phase", "")).startswith("prefill 50%")
+                       for k in _seen), _seen
+            assert _r["client"]["n"] == 3
+            # ...--min-pps can be answered DURING prefill...
+            _r = _completion(_port, "p", 3, 10,
+                             prefill_judge=lambda d, t, sec: "slow prefill"
+                             if d >= 512 else None)
+            assert _r["aborted"] == "slow prefill" and _r["client"]["n"] == 0
+            # ...and a prefill still advancing past the timeout is not cut off:
+            # 1.2 s of visible progress against a 1 s timeout completes
+            _plan.update(pp=[(i * 64, 1024, i * 100) for i in range(1, 17)],
+                         pp_gap=0.075)
+            _r = _completion(_port, "p", 3, 1)
+            assert _r["client"]["n"] == 3, _r
+            _plan.update(pp=[], pp_gap=0.0)
+            # a prefill that goes SILENT is a stall: the read timeout ends it
+            _plan.update(prefill=2.5)
+            _t = time.time()
+            try:
+                _completion(_port, "p", 3, 1)
+                assert False, "a silent prefill outlived its timeout"
+            except (TimeoutError, OSError):
+                pass
+            assert time.time() - _t < 2.4
+            _plan.update(prefill=0.0)
+        finally:
+            _srv.shutdown()
+        # our own decode clock replaces every credit in the cross-check: 64
+        # tokens, first to last in 0.42 s, is ~150 t/s whatever the prefill was
+        assert abs(RepClock(64, 12.5, 11.2, 0.0, 0.42).ceiling - 63 / 0.42) < 1e-9
+        assert exceeds_wall_clock(148.9, [RepClock(64, 12.5, 11.2, 0.0, 0.42)]) \
+            is None
+        assert exceeds_wall_clock(1e6, [RepClock(64, 12.5, 11.2, 0.0, 0.42)])
+
+        # --- L4: what is happening now, for a person watching ---
+        with tempfile.TemporaryDirectory() as _td:
+            _lv = LiveStatus(Path(_td) / "r.csv.live")
+            _lv.set(force=True, config="run 3: ngl=99", step="rep 2/3",
+                    phase="decoding", tokens=57, rate=17.84,
+                    started=time.time() - 75)
+            _txt = (Path(_td) / "r.csv.live").read_text()
+            assert _txt.startswith("run 3: ngl=99 | rep 2/3 | decoding | "
+                                   "57 tok | 17.8 t/s | 1m1"), _txt
+            # throttled: a burst of per-token updates is not a burst of writes
+            _lv.set(tokens=58)
+            assert "57 tok" in (Path(_td) / "r.csv.live").read_text()
+            assert _lv.fields["tokens"] == 58      # ...but the ticker sees it
+            # no path: feeds the ticker only, writes nothing
+            LiveStatus().set(force=True, phase="x")
+            # the server's own log, copied as it is written, for tail -f
+            _saved, SERVER_LOG_PATH = SERVER_LOG_PATH, Path(_td) / "r.server.log"
+            try:
+                _drain_lines(io.StringIO("I load_tensors: loading model tensors\n"
+                                         "I llama_context: constructing\n"),
+                             collections.deque(), {})
+            finally:
+                SERVER_LOG_PATH = _saved
+            _sl = (Path(_td) / "r.server.log").read_text()
+            assert "===== server start" in _sl and "constructing" in _sl
+            # the disk probe: real throughput, or None where O_DIRECT cannot
+            _blob = Path(_td) / "blob"
+            _blob.write_bytes(os.urandom(96 * 2**20))
+            _d = disk_read_mib_s(_blob, mib=64)
+            assert _d is None or _d > 0, _d
+            # too small to say anything about throughput
+            (Path(_td) / "tiny").write_bytes(b"x" * 4096)
+            assert disk_read_mib_s(Path(_td) / "tiny") is None
+
+        # --- L5: a load that is visibly loading is not given up on ---
+        _real_urlopen2 = urllib.request.urlopen
+        try:
+            def _never(*a, **k):
+                raise OSError("not up yet")
+            urllib.request.urlopen = _never
+            # no progress hook: the deadline is hard, as before
+            _t = time.time()
+            assert _wait_health(1, _t + 0.3) is False
+            assert time.time() - _t < 1.5
+            # progress still arriving past the deadline: keep waiting...
+            _ticks = iter(range(10**6))
+            _t = time.time()
+            assert _wait_health(1, _t + 0.2, progress=lambda: next(_ticks),
+                                stall_s=0.3) is False      # ...to the hard cap
+            # 4 x max(1 s, time to deadline): the 1 s floor keeps a tiny
+            # deadline from making the cap meaningless
+            assert 3.5 < time.time() - _t < 5.5, time.time() - _t
+            # ...but a load with NO progress past its deadline is stuck
+            _t = time.time()
+            assert _wait_health(1, _t + 0.2, progress=lambda: 7,
+                                stall_s=0.3) is False
+            assert time.time() - _t < 1.2
+        finally:
+            urllib.request.urlopen = _real_urlopen2
+
         # --- a server's log is drained while it runs ---
         # An unread stderr pipe holds 64 KB; llama-server writes ~1 KB per
         # request, so at about the 131st request its next write blocked and the
@@ -9977,13 +10668,16 @@ def selftest() -> bool:
         _sent = []
         _real_urlopen = urllib.request.urlopen
 
-        class _Resp:
+        class _Resp:                     # a streamed response (L3): one event
             def __enter__(self_): return self_
             def __exit__(self_, *a): return False
-            def read(self_):
-                return json.dumps({"content": "x", "timings": {
-                    "prompt_per_second": 444.1, "predicted_per_second": 600.0,
-                    "predicted_n": 128, "prompt_n": 8192, "cache_n": 0}}).encode()
+            def __iter__(self_):
+                yield (b"data: " + json.dumps({
+                    "content": "x", "stop": True, "tokens_predicted": 128,
+                    "timings": {"prompt_per_second": 444.1,
+                                "predicted_per_second": 600.0,
+                                "predicted_n": 128, "prompt_n": 8192,
+                                "cache_n": 0}}).encode() + b"\n\n")
 
         try:
             def _cap(req, timeout=None):
@@ -9993,6 +10687,7 @@ def selftest() -> bool:
             urllib.request.urlopen = _cap
             _completion(1, "hello", 8, 5, temp=0.7)
             assert _sent[-1]["temperature"] == 0.7, _sent[-1]
+            assert _sent[-1]["stream"] is True        # read as it arrives (L3)
             _completion(1, "hello", 8, 5)
             assert _sent[-1]["temperature"] == DEFAULT_TEMPERATURE, _sent[-1]
 
@@ -10804,7 +11499,8 @@ def selftest() -> bool:
         # C-F: the sweep estimate must scale with model size, not be flat
         _big = Config(model=Path("/nonexistent-big.gguf"), llama_bench=Path("b"),
                       array="auto", ctx_floor=8192, n_gen=256, reps=3)
-        assert estimate_secs_per_run(_big) > 8.0        # missing file: no crash
+        _pr = dict(LOAD_RATE_PRIORS)     # hermetic: not this box's learned rates
+        assert estimate_secs_per_run(_big, _pr) > 8.0   # missing file: no crash
         class _Sz:
             def __init__(self, n): self.n = n
             def stat(self): return SimpleNamespace(st_size=self.n)
@@ -10812,12 +11508,16 @@ def selftest() -> bool:
                        array="auto", ctx_floor=8192, n_gen=256, reps=3)
         big = Config(model=_Sz(25 * 1024**3), llama_bench=Path("b"),
                      array="auto", ctx_floor=8192, n_gen=256, reps=3)
-        assert estimate_secs_per_run(big) > 3 * estimate_secs_per_run(small), (
-            estimate_secs_per_run(big), estimate_secs_per_run(small))
+        assert estimate_secs_per_run(big, _pr) > 3 * estimate_secs_per_run(
+            small, _pr), (estimate_secs_per_run(big, _pr),
+                          estimate_secs_per_run(small, _pr))
+        # a box whose memory is measured fast loads a cached model faster
+        assert estimate_secs_per_run(big, dict(_pr, mem_mib_s=8000.0)) < \
+            estimate_secs_per_run(big, _pr)
         # more reps and more generated tokens both cost time
         more = Config(model=_Sz(300 * 1024**2), llama_bench=Path("b"),
                       array="auto", ctx_floor=8192, n_gen=256, reps=5)
-        assert estimate_secs_per_run(more) > estimate_secs_per_run(small)
+        assert estimate_secs_per_run(more, _pr) > estimate_secs_per_run(small, _pr)
         assert {n for n, _, _ in PROMPT_BANKS} == {
             "simple_qa", "reasoning", "code", "rag", "long_ctx"}
 
@@ -12624,11 +13324,18 @@ def main():
             print("  " + " ".join(build_server_args(cfg, f0, 8080, n_ctx)))
         else:
             print("  " + " ".join(bench_command(cfg, f0)))
-        per = estimate_secs_per_run(cfg)
+        _rates = load_rates()
+        per = estimate_secs_per_run(cfg, _rates)
+        cold, cold_gib = cold_read_s(cfg, _rates)
+        src = ("measured on this box" if int(_rates.get("measured", 0)) > 0
+               or _rates["disk_mib_s"] != LOAD_RATE_PRIORS["disk_mib_s"]
+               else "priors — no load measured here yet")
         print(f"\nAll {len(runs)} runs would execute sequentially "
-              f"(~{fmt_dur(len(runs) * per)} at a rough {per:.0f}s/run, "
-              f"scaled from model size, reps and n_gen — a guess, not a "
-              f"measurement).")
+              f"(~{fmt_dur(len(runs) * per + cold)} at ~{per:.0f}s/run"
+              + (f", plus ~{fmt_dur(cold)} once to read the {cold_gib:.1f} GiB "
+                 f"not in page cache" if cold >= 1 else "")
+              + f"; load rates: {src}. Decode/prefill speeds are still a guess "
+              f"until rows are measured).")
         if asked is not None:
             # The estimate above is the "then show the cost" half of the
             # interview: the numbers are on screen before anything is spent.
@@ -12727,6 +13434,28 @@ def main():
         stamp["task"] = cfg.task
 
     fresh = not (args.resume and args.results.exists())
+    # Things a person can watch while this runs (L4): the current step, and the
+    # server's own log. Plain files, so `watch` / `tail -f` / a screen window.
+    global SERVER_LOG_PATH
+    LIVE.path = Path(str(args.results) + ".live")
+    SERVER_LOG_PATH = Path(str(args.results) + ".server.log")
+    if cfg.driver == "server":
+        print(f"watch      : watch -n1 cat {LIVE.path}   |   "
+              f"tail -f {SERVER_LOG_PATH}")
+        # L2: no learned disk rate yet and the model is not in memory — ask
+        # the disk once, rather than time the first load against a prior
+        _rates = load_rates()
+        _pc = page_cached_mib(cfg.model)
+        if (int(_rates.get("measured", 0)) == 0 and _pc
+                and _pc[1] - _pc[0] > 1024):
+            _d = disk_read_mib_s(cfg.model)
+            if _d:
+                _rates["disk_mib_s"] = _d
+                save_load_rates(_rates)
+                print(f"disk       : {_d:.0f} MiB/s sequential (measured, page "
+                      f"cache bypassed) — {(_pc[1] - _pc[0]) / 1024:.1f} GiB of "
+                      f"the model is not cached, ~{(_pc[1] - _pc[0]) / _d:.0f}s "
+                      f"to read")
     fh = open(args.results, "w" if fresh else "a", newline="")
     writer = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
     if fresh:
@@ -12822,6 +13551,7 @@ def main():
                     lambda lf=launch, nc=n_ctx: ServerSession(cfg, lf, nc, args.timeout))
                 if getattr(session, "ok", False):
                     journal_write(journal, "OK", "load", lk)  # load survived
+                    print(load_report(session))
             try:
                 for run in group:
                     i += 1

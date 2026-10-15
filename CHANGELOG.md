@@ -116,6 +116,32 @@ earlier.
 
 ### Added
 
+- **Requests are streamed, and judged while they run**
+  ([docs/load-and-stream-design.md](docs/load-and-stream-design.md)). The tool
+  now sees when prefill ended, how far generation got and the live rate.
+  `--tgs-timeout` finally means what it reads as: after that many seconds of
+  decode, a config averaging below `--min-tgs` is stopped there, however long
+  `--n-gen` is. The wall-clock cross-check uses our own first-to-last-token
+  clock instead of crediting prefill and overhead.
+- **Load time is estimated, recorded, and learned.** Each launch prints how
+  long it took and where (weights vs context+warmup) beside its estimate. The
+  estimate uses how much of the model is in the page cache (`fincore`) and this
+  box's learned disk and memory rates (`~/.cache/llama-optimize/load-rates.json`),
+  seeded by a 1 GiB `O_DIRECT` disk read on first use. The server start timeout
+  is now `max(--server-start-timeout, 3 × estimate)`: the user's everyday
+  Qwen3.6-27B config took 212 s to load cold, past the fixed 180 s.
+- **Fixed clocks wait on progress instead.** A load past its deadline keeps
+  waiting while log lines arrive or more of the model reaches page cache, and
+  is abandoned after 90 s without progress (or 4× the deadline). Prefill is
+  observable through llama-server's progress events: it may run past
+  `--timeout` while advancing, and decode then gets `--timeout` of its own.
+  Measured on the user's Qwen3.6-27B config: the 131k-depth row needed ~30 min
+  of prefill and was recorded TIMEOUT at 1200 s while working the whole time.
+  `--min-pps` is now judged during prefill.
+- **Something to watch.** `watch -n1 cat <results>.live` shows the current
+  config, step, phase, tokens and rate; `tail -f <results>.server.log` shows
+  the server's own log.
+
 - **Sizes on a doubling scale** ([docs/sweep-cost-design.md](docs/sweep-cost-design.md)
   C4). Context depth, `moe_cache` and `--iterate`'s refinement of `ubatch` space
   their levels by ratio rather than evenly, so a sweep stops spending its levels
