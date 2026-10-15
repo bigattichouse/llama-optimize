@@ -410,6 +410,28 @@ What this does not change: a config is still heated under *its own* request,
 and the window that defines "flat" is the same one that was tuned against the
 MI50 99↔100°C oscillation.
 
+**Measured afterwards, and the cost was not what this section first claimed.**
+A/B on gemma-3-270m, MI50, llama.cpp b11639, one config (`ngl` 18, 8k depth,
+~0.2 s requests), two trials of each sampler alternating on the same card:
+
+| sampler | verdict | time | requests | temperature |
+|---|---|---|---|---|
+| per-request (old) | warm | 1.5 s, 1.6 s | 4, 4 | 94, 95 °C |
+| on a clock (new) | warm | 239 s, 34 s | 898, 122 | 98, 100 °C |
+
+The old sampler's plateau was **false**: its five readings were taken within
+1.5 s and were identical (94, 94, 94, 94, 94) because the sensor had not
+updated between them — the window measured the sensor's refresh rate, not the
+card. Under sustained load the same config settles at 98–100 °C, so for fast
+configs the old preheat measured the burst rate `warm` mode exists to avoid.
+
+So C3a is a **correctness fix with a mixed cost**: cheaper on slow configs (no
+five full unmeasured requests), more expensive on fast ones, which now heat
+until they are actually hot — up to `THERMAL_WARMUP_CAP_S`. One config of
+sixteen hit that cap in a real sweep. `--thermal-mode idle` remains the fast,
+burst-rate alternative. The "~12 s" above holds only for a card already at its
+plateau.
+
 ### C3b — the warm request already answers `--min-tgs`
 
 The single-stream path sends one warm request (`n_gen` tokens) before anything
@@ -511,6 +533,108 @@ C3b judges on the warm request, which still runs to `n_gen`. Judging after
 the flag — needs a streamed `/completion` so tokens can be counted as they
 arrive. It is the larger change (the request path every test fake replaces) and
 is left as the next item.
+
+## C4 — size knobs on a doubling scale (2026-10-14)
+
+Prompted by a field config (RTX A2000 12GB, `Qwen3.6-35B-A3B` with every expert on
+the CPU, 262k context) and the question "why walk 16000, 17000, 18000?".
+
+Sizes — context depth, a cache in MiB, `ubatch` — have effects that scale with
+the *ratio* between levels, not the difference: going from 4k to 8k context
+changes far more than going from 60k to 64k. An even span spends most of its
+levels at the top of the range, where neighbours barely differ, and for depth
+those are also the most expensive rows in the design (prefill grows with depth).
+
+**Levels.** `log_levels_span(lo, hi, n, quantum)` spaces levels by a constant
+ratio, rounded to a quantum. With `lo = 0` the zero level is kept (it is the
+"off" or "shallowest" anchor) and the rest are halvings of `hi`:
+
+| knob | before (even) | now (doubling) |
+|---|---|---|
+| `n_depth`, floor 0, cap 64k | 0, 16k, 32k, 48k, 64k | 0, 8k, 16k, 32k, 64k |
+| `n_depth`, floor 8k, cap 64k | 8k, 22k, 36k, 50k, 64k | 8k, 13k, 22k, 38k, 64k |
+| `moe_cache`, ceiling 8 GiB | 0, 2k, 4k, 6k, 8k | 0, 1k, 2k, 4k, 8k |
+
+`ubatch` was already powers of two. Factors carry `"scale": "log"` and a
+`"quantum"` in the registry, and `refine_numeric` honours both, so an
+`--iterate` refinement around `ubatch=512` brackets 256..1024 on the same
+doubling scale instead of walking 256, 448, 640, 832, 1024.
+
+This moves the depth levels of every new sweep, so depth-sliced comparisons
+against older CSVs should compare like depths (the CHANGELOG says so).
+
+**The context probe gallops instead of bisecting evenly.** `probe_max_context`
+used to test `cap`, then bisect `0..cap` at its arithmetic midpoint. Now:
+
+1. **Seed from the estimator.** `estimated_max_depth` bisects with
+   `llama-fit-params` — a metadata read, no GPU, no prefill — for the deepest
+   depth predicted to fit. The real probe starts there, so on a box where the
+   estimator is right the answer costs two or three launches.
+2. **Gallop.** From the seed, step outward in doubling offsets — +2k, +4k,
+   +8k while it loads, or −2k, −4k, −8k while it does not — until the answer
+   flips. The estimator is usually close, so this takes a step or two; when it
+   is far off, the offsets reach the boundary in `log2(error)` launches.
+   Doubling the depth itself was the first version and was worse: from a seed
+   of 39k it jumped straight to the 64k cap, discarding the estimate.
+3. **Bisect the bracket** arithmetically to 2048 tokens, as before.
+
+Without an estimator the seed is `cap`, which is what the probe tested first
+anyway. Galloping assumes the boundary is monotone in depth — true for memory,
+which is all this probe asks ("does it load"); it is *not* assumed for
+throughput, which the design measures at fixed levels instead.
+
+**The `moe_cache` ceiling comes from headroom, not a quarter of the card.** On
+the A2000 config the experts are all on the CPU and the KV cache is small, so
+most of the 12 GB is free and a quarter (3 GB) undershoots. The ceiling is now
+`total VRAM - --fit-headroom - footprint` of the design's most demanding
+all-experts-on-CPU cell (deepest depth, largest KV, `ngl` 99), as predicted by
+`llama-fit-params` — the same worst-case cell `full_offload_fits` uses, so the
+top level fits in every row it lands in. No estimator: the quarter-of-VRAM
+fallback. Headroom under one step: no column.
+
+## C5 — the row must describe what ran (2026-10-14)
+
+A real sweep on gemma-3-270m (MI50, llama.cpp b11639) after C3/C4 turned up
+four ways the tool ran something, got back something other than it asked for,
+and recorded the wrong thing. User's framing: "when it might run stuff and not
+get what it expected back so it reports something incorrect".
+
+| # | What was asked | What happened | Recorded as |
+|---|---|---|---|
+| 1 | depth = n_ctx_train (32768) + 512 prompt | llama-server caps a slot at n_ctx_train; HTTP 400 | `ERROR`, no reason — every deepest row |
+| 2 | ~130+ requests to one session | the unread stderr pipe filled at 64 KB; server froze | `TIMEOUT`/`SLOW`, "depth 0 failed to load" |
+| 3 | `-b ub×16` at an 8k context | llama.cpp clamps `n_batch` to `n_ctx`, `n_ubatch` to `n_batch`, silently | the requested value |
+| 4 | a 64-token rep after a 32k re-prefill | ~0.9 s of tokenize/HTTP overhead outside both server timers | `IMPLAUSIBLE` — a true number rejected |
+
+1 and 2 are fixed above (`depth_ceiling`, the stderr drain). 3 and 4:
+
+**Read back what the server actually did.** llama.cpp logs the values it
+settled on (`llama_context: n_ctx = …`, `n_batch = …`, `n_ubatch = …`) and warns
+when it turns a feature off (`swa_full is not supported by this model, it will
+be disabled`, `speculative decoding not supported by this context`, `… not
+supported, set to disabled`). The session's drained log tail is parsed once per
+launch (`parse_server_effective`), compared with what the row asked for
+(`server_adjustments`), and every difference goes in a new `adjusted` column.
+A difference in a swept factor's own value — `ubatch` clamped, `swa_full`
+disabled, speculation refused — makes the row `ADJUSTED`: its numbers are kept
+(they are true) but it is out of the picks and the main effects, because it
+measured a different level from the one it is filed under (the issue #16
+principle). `batch` above the context is recorded but does not change the
+status: a batch at least as large as the context already processes any prompt
+the context can hold in one batch, so the level still means "as large as it
+gets". llama-bench is not covered; it prints no such log.
+
+**Credit the overhead the warm request measured.** The wall-clock cross-check
+(I5) subtracts prefill from a rep's wall time and treats the rest as decode,
+with a flat 2× margin for everything else. That margin is multiplicative and
+the overhead is additive: tokenizing a 200 KB prompt costs the same ~1 s
+whether 64 tokens or 1024 follow, so short generations after deep prompts were
+rejected — 149 t/s reported, 51 t/s "allowed", 0.43 s of decode beside 0.87 s
+of overhead. The warm request now measures that overhead directly (its wall
+time minus both server timers) and each rep is credited it, capped at half the
+rep's post-prefill time (`WALL_OVERHEAD_CREDIT_MAX`) so a server with a broken
+counter cannot switch the check off. The defect class the check exists for
+overshoots by 1000×; this changes nothing there.
 
 ## Invariants
 

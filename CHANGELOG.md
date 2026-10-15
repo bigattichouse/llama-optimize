@@ -25,6 +25,16 @@ earlier.
 
 ### ⚠️ Affects existing results
 
+- **`ERROR` rows at the deepest depth, on models with a native context of 64k
+  or less.** Those were a request that could not fit, not a configuration that
+  failed (see *Fixed*). The rest of such a sweep is unaffected; the deep end of
+  its context curve was simply never measured.
+
+- **Depth-sliced comparisons with older sweeps.** `n_depth` levels are now
+  spaced by doubling (0, 8k, 16k, 32k, 64k) instead of evenly (0, 16k, 32k,
+  48k, 64k), so new CSVs sit at different depths. Compare like depths; the
+  numbers at a given depth mean what they did.
+
 - **`SLOW` rows from floor-bounded sweeps at depth, under concurrency, or in an
   `--iterate` pass after the first.** The `--min-tgs` budget counted decode
   tokens only, so a deep row could spend it prefilling and be recorded `SLOW`
@@ -106,6 +116,24 @@ earlier.
 
 ### Added
 
+- **Sizes on a doubling scale** ([docs/sweep-cost-design.md](docs/sweep-cost-design.md)
+  C4). Context depth, `moe_cache` and `--iterate`'s refinement of `ubatch` space
+  their levels by ratio rather than evenly, so a sweep stops spending its levels
+  — and its most expensive rows — at the top of a range where neighbours barely
+  differ.
+- **The max-context probe starts from the estimator and gallops.** It seeds at
+  the deepest depth `llama-fit-params` predicts will load, steps outward in
+  doubling offsets until the answer flips, then bisects. Where the estimate is
+  close that is two or three launches instead of a bisection of 0..cap.
+- **`moe_cache`'s ceiling is the VRAM actually left** with every expert on the
+  CPU, as `llama-fit-params` predicts it, instead of a quarter of the card. On a
+  12 GB card running all experts on the CPU, the quarter undershot.
+- **`load_mode` (mmap / none) is swept on MoE models** when free: with experts
+  in system RAM, how they are loaded is a measurement, not a default. It is a
+  load-time factor, so the server driver launches twice as many sessions.
+- **Windows binary lookup**: `--llama-cpp <dir>` now finds `llama-server.exe`,
+  including under Visual Studio's `build/bin/Release`. Untested on Windows.
+
 - **Knobs from llama.cpp b11626** ([docs/flag-coverage.md](docs/flag-coverage.md),
   "Refresh: b10909 → b11626"). Each is added to the default design only if it
   does not grow the array; otherwise the header names it and the `--factor`
@@ -124,9 +152,12 @@ earlier.
   ([docs/sweep-cost-design.md](docs/sweep-cost-design.md) C3). None of these
   has been timed on hardware yet; the savings are arithmetic from the code.
   - The warm-mode preheat reads the sensor on a 3s clock while the load runs,
-    instead of once per request. A config that inherits a card already at its
-    plateau is released after ~12s; it used to pay five full unmeasured
-    requests regardless.
+    instead of once per request. Cheaper for slow configs, which paid five full
+    unmeasured requests; **slower for fast ones**, because the old sampler's
+    plateau was false — five readings 0.3 s apart returned the same stale
+    value. Measured: the old preheat stopped at 94 °C after 1.5 s on a config
+    that settles at 98–100 °C. Fast configs now heat until they are hot (up to
+    the 300 s cap); `--thermal-mode idle` is the fast alternative.
   - On the server driver the warm request now answers `--min-tgs` before the
     preheat: a config decoding under 0.75x the floor cold is recorded `SLOW`
     without preheat or reps. Skipped under speculation, where the warm rate
@@ -211,6 +242,41 @@ earlier.
 - **`--thermal-cap SECS`** bounds the idle-mode settle (default 600).
 
 ### Fixed
+
+- **A server session froze after ~130 requests.** `ServerSession` started
+  `llama-server` with its stderr on a pipe it never read. The server logs about
+  1 KB per request and a pipe holds 64 KB, so at about the 131st request a log
+  write blocked and the server stopped answering for good — every later request
+  timed out. Measured on gemma-3-270m: a hang at exactly request 131 on two
+  llama.cpp builds and two context sizes; 400 requests without one once the
+  pipe was drained. stderr is now drained by a thread into a bounded tail
+  (still used to diagnose load failures). Latent for any long session; the
+  clock-polled preheat made it easy to reach.
+- **Every row at the deepest depth was an ERROR on models with a native context
+  of 64k or less.** The top level was `n_ctx_train` itself, and the request adds
+  the prompt and generation on top; llama-server caps a slot at `n_ctx_train`
+  and answered HTTP 400. The deepest level (and the context probe's cap) now
+  leaves room for the request: 31744 rather than 32768 on a 32k model.
+- **A failed request now says why.** The server's own error message is printed
+  for ERROR rows and failed requests, and a server that did not load prints its
+  last log lines; the row used to say only `ERROR`.
+- **A server still loading when `--server-start-timeout` ran out is `TIMEOUT`,
+  not `ERROR`.** A 27 GB model off a cold disk took longer than the default
+  180 s, and the working config was filed as broken.
+- **Rows record what llama.cpp actually ran** ([docs/sweep-cost-design.md](docs/sweep-cost-design.md)
+  C5). The server's own log is read back after launch; a clamped `batch`, a
+  `ubatch` reduced to fit the context, a `swa_full` the model does not support
+  or speculation the context refused is written to a new `adjusted` column, and
+  a row whose swept factor ran at a different level is `ADJUSTED` — numbers
+  kept, out of the picks and effects. Contexts are no longer sized below the
+  row's `ubatch`, which is what clamped it.
+- **False `IMPLAUSIBLE` on deep prompts with short generations.** The
+  wall-clock check now credits the per-request overhead the warm request
+  measured (tokenizing a 200 KB prompt costs ~1 s regardless of what follows);
+  a true 149 t/s had been rejected against an "allowed" 51.
+- **Placement knobs no longer vote at `ngl=0`.** `ncmoe`, `ncffn`, `ot`,
+  `ffn_place` and `nkvo` cannot act with every layer on the CPU; those rows
+  are now inert for them, the CPU-only half of issue #17.
 
 - **The `--min-tgs` budget left out work the config had to do.** It now
   includes prefill (`llama-bench -d` re-fills before every rep of both tests),

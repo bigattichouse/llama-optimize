@@ -17,6 +17,7 @@ Nothing touches the GPU unless --run is given.
 """
 
 import argparse
+import collections
 import contextlib
 import csv
 import io
@@ -56,13 +57,22 @@ SUBMODULE_DIR = next((p for p in (PROJECT_ROOT / "robust", PROJECT_ROOT / "taguc
                       if p.exists()), PROJECT_ROOT / "robust")
 
 
-def resolve_binary(name: str, explicit: Path | None, hint: Path | None) -> Path:
+# Windows names executables `llama-server.exe`, and a multi-config CMake build
+# (Visual Studio) puts them under build/bin/Release. Without both, `--llama-cpp
+# <dir>` found nothing on Windows and fell back to a path that cannot exist
+# (field report: a b11562 win-cuda build, 2026-10-14). Untested on Windows.
+EXE_SUFFIX = ".exe" if os.name == "nt" else ""
+
+
+def resolve_binary(name: str, explicit: Path | None, hint: Path | None,
+                   exe: str | None = None) -> Path:
     """Locate a llama.cpp binary. Search order: explicit path, --llama-cpp hint
-    (root / build/bin / bin), $LLAMA_CPP, $PATH, then the sibling-workspace
-    default. Returns the first existing match, else a best-guess path (whose
-    non-existence is reported later)."""
+    (root / build/bin / build/bin/Release / bin), $LLAMA_CPP, $PATH, then the
+    sibling-workspace default. Returns the first existing match, else a
+    best-guess path (whose non-existence is reported later)."""
     if explicit is not None:
         return explicit
+    name = name + (EXE_SUFFIX if exe is None else exe)
     roots = []
     if hint is not None:
         roots.append(hint)
@@ -71,7 +81,8 @@ def resolve_binary(name: str, explicit: Path | None, hint: Path | None) -> Path:
         roots.append(Path(env))
     cands: list[Path] = []
     for r in roots:
-        cands += [r / name, r / "build" / "bin" / name, r / "bin" / name]
+        cands += [r / name, r / "build" / "bin" / name,
+                  r / "build" / "bin" / "Release" / name, r / "bin" / name]
     on_path = shutil.which(name)
     if on_path:
         cands.append(Path(on_path))
@@ -931,7 +942,7 @@ _fit_blind_warned: set = set()
 # verdict. A pruned row never runs, so a wrong verdict silently deletes a valid
 # config from the sweep — on MoE models, where -ncmoe is the biggest VRAM lever
 # we have, exactly the configs the feature exists to sort out.
-_fit_cache: dict[tuple, bool | None] = {}
+_fit_cache: dict[tuple, int | None] = {}
 
 
 def _file_mib(path) -> int:
@@ -1024,9 +1035,22 @@ def predict_fits(cfg: "Config", f: dict, driver: str) -> bool | None:
     llama-fit-params' per-device lines, the ceiling from --list-devices. They
     used to disagree about what "GPU memory" means — issue #7's APU counted GTT
     on one side and a 2 GiB VRAM carve-out on the other, and every row lost."""
-    global _oom_prune_warned, _fit_cache
     total_vram = cfg.hw.get("vram")
-    if total_vram is None or not cfg.fit_params.exists():
+    if total_vram is None:
+        return None
+    used = predict_footprint_mib(cfg, f, driver)
+    if used is None:
+        return None
+    return used < total_vram - cfg.fit_headroom_mib
+
+
+def predict_footprint_mib(cfg: "Config", f: dict, driver: str) -> int | None:
+    """Predicted GPU MiB for row `f` (llama-fit-params plus what it cannot see),
+    or None when it cannot be estimated. The number `predict_fits` compares; split
+    out so a level generator can ask "how much room is left" and not only "does
+    this fit" (docs/sweep-cost-design.md C4)."""
+    global _oom_prune_warned, _fit_cache
+    if cfg.hw.get("vram") is None or not cfg.fit_params.exists():
         return None
     # The estimator cannot see one of this row's placement factors, so it cannot
     # answer the question being asked. Say so and run the row (P3) rather than
@@ -1057,10 +1081,8 @@ def predict_fits(cfg: "Config", f: dict, driver: str) -> bool | None:
         gpu_used = parse_fit_print(proc.stdout)
         # fit-params priced the text model only; add the artifacts it cannot see
         gpu_used += resident_extra_mib(cfg, f)
-        limit = total_vram - cfg.fit_headroom_mib
-        result = gpu_used < limit
-        _fit_cache[key] = result
-        return result
+        _fit_cache[key] = gpu_used
+        return gpu_used
     except (OSError, ValueError, subprocess.TimeoutExpired, IndexError):
         if not _oom_prune_warned:
             print("OOM prune: unable to estimate — running all configs anyway "
@@ -1748,6 +1770,35 @@ def n_levels_span(lo: int, hi: int, n: int = 5) -> list[int]:
     return sorted(out)[:n]
 
 
+def log_levels_span(lo: int, hi: int, n: int = 5, quantum: int = 1) -> list[int]:
+    """`n` levels in [lo, hi] spaced by a constant RATIO, snapped down to
+    `quantum` (docs/sweep-cost-design.md C4).
+
+    For sizes — context, cache MiB, ubatch — where 4k->8k matters far more than
+    60k->64k. An even span spends its levels at the top, where neighbours barely
+    differ and (for depth) every row is the most expensive in the design.
+
+    With lo <= 0 the zero level is kept as the off/shallowest anchor and the
+    rest are halvings of `hi`: 0, hi/8, hi/4, hi/2, hi. The endpoints are exact;
+    a positive level never snaps to 0, which would turn it into the anchor."""
+    n, q = max(2, int(n)), max(1, int(quantum))
+    if hi <= lo:
+        return [lo]
+
+    def snap(v: float) -> int:
+        return max(q, int(v) // q * q)
+    if lo <= 0:
+        vals = [0] + [snap(hi / 2 ** (n - 2 - i)) for i in range(n - 2)] + [hi]
+    else:
+        r = (hi / lo) ** (1.0 / (n - 1))
+        vals = [lo] + [snap(lo * r ** i) for i in range(1, n - 1)] + [hi]
+    out = []
+    for v in vals:
+        if lo <= v <= hi and v not in out:
+            out.append(v)
+    return sorted(out)
+
+
 def five_levels_span(lo: int, hi: int) -> list[int]:
     """Back-compat alias: the default width."""
     return n_levels_span(lo, hi, 5)
@@ -2090,16 +2141,37 @@ def kv_at_or_above(levels: list, floor: str) -> list:
 
 
 def depth_levels(n_ctx_train: int | None, override_max: int | None = None,
-                 floor: int = 0, levels: int = 5) -> list[int]:
+                 floor: int = 0, levels: int = 5, reserve: int = 0) -> list[int]:
     """Five n_depth levels spanning floor..min(native ctx, cap). Adaptive so we
     never test beyond the model's native context.  The floor raises the minimum
     depth so the sweep only tests context sizes the user actually needs (--ctx-floor)."""
-    top = min(n_ctx_train or DEFAULT_MAX_DEPTH, DEFAULT_MAX_DEPTH)
+    # `reserve` is what the request adds ON TOP of the depth (prompt, generated
+    # tokens, the server's margin). llama-server caps a slot at n_ctx_train, so
+    # depth == n_ctx_train asked for more than any slot holds: every deepest row
+    # came back HTTP 400 "exceeds the available context size" and was recorded
+    # ERROR (gemma-3-270m, native 32768, request 33217 tokens; 2026-10-14).
+    top = min(depth_ceiling(n_ctx_train, reserve), DEFAULT_MAX_DEPTH)
     if override_max is not None:
         top = min(top, override_max)
     if floor >= top:
         return [top]
-    return n_levels_span(floor, top, levels)
+    # doubling, not even: the deep rows are the expensive ones, and an even
+    # span put most of the design there (C4)
+    return log_levels_span(floor, top, levels, quantum=1024)
+
+
+def depth_ceiling(n_ctx_train: int | None, reserve: int = 0) -> int:
+    """Deepest n_depth whose whole request still fits the model's native
+    context, snapped down to 1024. Without a native context, DEFAULT_MAX_DEPTH."""
+    if not n_ctx_train:
+        return DEFAULT_MAX_DEPTH
+    return max(1024, (int(n_ctx_train) - int(reserve)) // 1024 * 1024)
+
+
+def request_reserve(cfg) -> int:
+    """Tokens a request adds beyond its depth: the prompt, the generation, and
+    the 256 the server driver adds to n_ctx as margin."""
+    return int(getattr(cfg, "n_prompt", 0)) + int(getattr(cfg, "n_gen", 0)) + 256
 
 
 def cpu_offload_levels(n_layers: int | None, levels: int = 5) -> list[int]:
@@ -2209,7 +2281,8 @@ def build_factors(cfg: Config):
     # stays an L125 until the last five-level column is gone (--levels).
     nlv = max(2, int(getattr(cfg, "levels", 5)))
     depths = depth_levels(cfg.hw.get("n_ctx_train"), cfg.max_depth,
-                          floor=cfg.ctx_floor, levels=nlv)
+                          floor=cfg.ctx_floor, levels=nlv,
+                          reserve=request_reserve(cfg))
     kv_lv = list(DEFAULT_KV_LEVELS)[:nlv]
     # Asked once, at the deepest depth and largest KV in this design: when every
     # layer provably fits, an even 0..n_layers span spends its slowest rows where
@@ -2377,9 +2450,21 @@ def build_factors(cfg: Config):
     if cfg.driver == "bench" and supports_flag(cfg.llama_bench, "--repack"):
         add_if_free(cfg, factors, "repack", ["0", "1"])
     if cfg.driver == "server" and "ncmoe" in factors:
-        _mc = moe_cache_levels(cfg.hw.get("vram"), nlv)
+        _mc = moe_cache_levels(cfg.hw.get("vram"), nlv,
+                               headroom_mib=moe_cache_headroom_mib(
+                                   cfg, depths, kv_lv, n_layers),
+                               cap_mib=_file_mib(cfg.model) or None)
         if _mc and supports_flag(cfg.llama_server, "--moe-cache-mib"):
             add_if_free(cfg, factors, "moe_cache", _mc)
+    # How the weights are loaded, where experts live in system RAM. We pin mmap
+    # on every row otherwise, so `none` (read into memory) was never tried — and
+    # a field config (A2000 12GB, every expert on the CPU) runs exactly that.
+    # Which wins is not known here. Costs more than its column: load_mode is a
+    # load-time factor, so the server driver launches twice as many sessions.
+    if "ncmoe" in factors:
+        _drv = cfg.llama_bench if cfg.driver == "bench" else cfg.llama_server
+        if supports_flag(_drv, "--load-mode"):
+            add_if_free(cfg, factors, "load_mode", ["mmap", "none"])
     # Probabilistic drafting changes nothing at temperature 0: the target's
     # distribution is a point mass, so rejection sampling accepts exactly what
     # argmax-and-match would. Only a sampled workload can tell them apart.
@@ -2420,22 +2505,49 @@ MOE_CACHE_MAX_VRAM_FRACTION = 0.25
 MOE_CACHE_STEP_MIB = 256
 
 
-def moe_cache_levels(vram_mib, levels: int = 5) -> list[str]:
-    """`--moe-cache-mib` levels: off, then an even span up to a quarter of VRAM,
-    in 256 MiB steps. Empty when VRAM is unknown — the size is a share of the
-    card, and guessing the card is the one thing this must not do."""
+def moe_cache_levels(vram_mib, levels: int = 5, headroom_mib: int | None = None,
+                     cap_mib: int | None = None) -> list[str]:
+    """`--moe-cache-mib` levels: off, then halvings of a ceiling, in 256 MiB steps.
+
+    The ceiling is `headroom_mib` — VRAM left at the design's most demanding
+    all-experts-on-CPU cell, from `moe_cache_headroom_mib` — when the estimator
+    could say, else a quarter of VRAM. `cap_mib` bounds it by what there is to
+    cache. Empty when VRAM is unknown (the size is a share of the card, and
+    guessing the card is the one thing this must not do), or when there is not
+    room for one step."""
     if not vram_mib or levels < 2:
         return []
-    top = int(vram_mib * MOE_CACHE_MAX_VRAM_FRACTION)
+    top = (int(headroom_mib) if headroom_mib is not None
+           else int(vram_mib * MOE_CACHE_MAX_VRAM_FRACTION))
+    if cap_mib:
+        top = min(top, int(cap_mib))
     top -= top % MOE_CACHE_STEP_MIB
     if top < MOE_CACHE_STEP_MIB:
         return []
-    out = []
-    for v in n_levels_span(0, top, levels):
-        v -= v % MOE_CACHE_STEP_MIB
-        if str(v) not in out:
-            out.append(str(v))
-    return out
+    return [str(v) for v in log_levels_span(0, top, levels, MOE_CACHE_STEP_MIB)]
+
+
+def moe_cache_headroom_mib(cfg, depths: list, kv_levels: list,
+                           n_layers: int | None) -> int | None:
+    """VRAM left for an expert cache at the design's worst all-experts-on-CPU
+    cell, or None when the estimator cannot say (C4).
+
+    The same worst case `full_offload_fits` prices — deepest depth, largest KV,
+    KV on the GPU — but with every expert on the CPU, which is the only shape
+    the cache serves. Sized there, the top level fits in every row it lands in;
+    sized at a shallow cell it would be pruned from exactly the deep rows the
+    other factors need."""
+    vram = cfg.hw.get("vram")
+    if not getattr(cfg, "oom_prune", False) or not n_layers or not vram:
+        return None
+    probe = {"ngl": str(n_layers), "ncmoe": str(n_layers),
+             "n_depth": str(max(int(d) for d in depths) if depths else 0),
+             "kv_type": str(kv_levels[0]) if kv_levels else "f16",
+             "nkvo": "0"}
+    used = predict_footprint_mib(cfg, probe, cfg.driver)
+    if used is None:
+        return None
+    return int(vram - cfg.fit_headroom_mib - used)
 
 
 # Orthogonal-array capacity: name -> number of columns (factors) it holds.
@@ -2759,24 +2871,34 @@ def gate_pairs(name: str) -> list:
 FACTORS = {
     # --- offload / placement ---
     "ngl":          {"bench": ("-ngl",), "server": ("-ngl",), "kind": "num"},
-    "ncmoe":        {"bench": ("-ncmoe",), "server": ("-ncmoe",), "kind": "num"},
-    "ncffn":        {"bench": ("-ncffn",), "server": ("-ncffn",), "kind": "num"},
+    # Placement knobs move tensors from the GPU to the CPU. At ngl=0 nothing is
+    # on the GPU to move, so every level is the same run — yet those rows voted
+    # on each knob's main effect, crediting it with noise (issue #17's sharp
+    # case, `ngl=0 x any ncmoe`; the same holds for ncffn, ot, ffn_place and
+    # nkvo). Gated so those rows are inert: not emitted, not counted.
+    "ncmoe":        {"bench": ("-ncmoe",), "server": ("-ncmoe",), "kind": "num",
+                     "gated_by": ("ngl", LiveUnless("0"))},
+    "ncffn":        {"bench": ("-ncffn",), "server": ("-ncffn",), "kind": "num",
+                     "gated_by": ("ngl", LiveUnless("0"))},
     # GPU cache (MiB) for MoE experts that -ncmoe left in host memory (llama.cpp
     # b11626, #29887). It caches experts of layers ASSIGNED TO A GPU, so it is
     # inert unless some experts are on the CPU and some layers on the GPU.
     "moe_cache":    {"bench": None, "server": ("--moe-cache-mib",), "kind": "num",
-                     "server_only": True,
+                     "server_only": True, "scale": "log", "quantum": 256,
                      "gated_by": (("ncmoe", LiveUnless("0")),
                                   ("ngl", LiveUnless("0")))},
     "ot":           {"bench": ("-ot",), "server": ("-ot",), "kind": "cat",
-                     "translate": OT_PATTERNS},
+                     "translate": OT_PATTERNS,
+                     "gated_by": ("ngl", LiveUnless("0"))},
     # Dense FFN placement: one categorical spanning -ot and -ncffn, whose level
     # carries its own flag (see ffn_place_args). `emit` exists because neither
     # `translate` (one flag, many values) nor `flag_for` (server-only, keyed on
     # ANOTHER factor's gate) can express "this level picks the flag".
     "ffn_place":    {"bench": ("-ot",), "server": ("-ot",), "kind": "cat",
-                     "emit": ffn_place_args},
-    "nkvo":         {"bench": ("-nkvo",), "server": ("-nkvo",), "kind": "bool"},
+                     "emit": ffn_place_args,
+                     "gated_by": ("ngl", LiveUnless("0"))},
+    "nkvo":         {"bench": ("-nkvo",), "server": ("-nkvo",), "kind": "bool",
+                     "gated_by": ("ngl", LiveUnless("0"))},
     # --- batching ---
     # -b is DERIVED from -ub (docs/CONSTRAINED-FACTORS.md): a batch below the
     # micro-batch is a contradiction llama.cpp silently clamps, so an absolute -b
@@ -2786,7 +2908,9 @@ FACTORS = {
     "batch_ratio":  {"bench": ("-b",), "server": ("-b",), "kind": "num",
                      "derived_from": ("ubatch", "scale"), "relation": "at_least",
                      "abs_name": "batch"},
-    "ubatch":       {"bench": ("-ub",), "server": ("-ub",), "kind": "num"},
+    # sizes: refined on a doubling scale (C4), snapped to `quantum`
+    "ubatch":       {"bench": ("-ub",), "server": ("-ub",), "kind": "num",
+                     "scale": "log", "quantum": 32},
     # --- KV cache ---
     "kv_type":      {"bench": ("-ctk", "-ctv"), "server": ("-ctk", "-ctv"), "kind": "cat"},
     # --- CPU / threads ---
@@ -4132,6 +4256,12 @@ def build_server_args(cfg: Config, f: dict, port: int, n_ctx: int) -> list[str]:
         "--host", "127.0.0.1", "--port", str(port),
         "-c", str(n_ctx),                          # mmap on is the server default
     ]
+    # Verbose enough that llama.cpp logs the n_ctx / n_batch / n_ubatch it
+    # actually settled on, which the default level does not. It clamps batch to
+    # the context and ubatch to the batch without a warning, and the row must
+    # describe what ran (C5). ~40 lines per request, drained by the session.
+    if supports_flag(cfg.llama_server, "--log-verbosity"):
+        args += ["--log-verbosity", str(SERVER_LOG_VERBOSITY)]
     # A draft model is an INPUT, not a factor (D1): a sweep either has one or it
     # does not. Its presence is also what switches llama.cpp's speculation from
     # the target's own head to a separate model — has_dft() is simply "was a -md
@@ -4597,6 +4727,17 @@ WALL_CLOCK_MARGIN = 2.0
 # was written for.
 WALL_PREFILL_CREDIT_MAX = 0.9
 
+# The most of a rep's post-prefill time that may be credited to per-request
+# overhead (C5). The overhead — tokenizing the prompt, HTTP, JSON — is ADDITIVE:
+# ~1 s for a 200 KB prompt whether 64 tokens follow or 1024, so the
+# multiplicative WALL_CLOCK_MARGIN rejected true numbers on deep prompts with
+# short generations (149 t/s reported against 51 "allowed", gemma-3-270m at
+# 32k). It is measured on the warm request, which runs on the server's own
+# timers, so it is capped like the prefill credit: a broken counter can loosen
+# the ceiling by at most 2x more, against the ~1000x overshoot of the defect
+# class this check exists for.
+WALL_OVERHEAD_CREDIT_MAX = 0.5
+
 
 def decode_wall(wall: float, prefill_s: float) -> float:
     """The part of a request's elapsed time that could have been decode.
@@ -4619,12 +4760,27 @@ class RepClock:
     n_dec: int
     wall: float
     prefill_s: float = 0.0
+    overhead_s: float = 0.0     # per-request overhead the warm request measured
 
     @property
     def ceiling(self) -> float:
         """The fastest decode rate this rep's elapsed time can support."""
         d = decode_wall(self.wall, self.prefill_s)
+        d -= min(max(self.overhead_s, 0.0), WALL_OVERHEAD_CREDIT_MAX * d)
         return self.n_dec / d if d > 0 else 0.0
+
+
+def warm_overhead_s(wall: float, timings: dict) -> float:
+    """Time a request spent outside both server timers: tokenizing, HTTP, JSON.
+    0 when the server reported neither timer — nothing to subtract from."""
+    try:
+        p = float(timings.get("prompt_ms") or 0.0)
+        d = float(timings.get("predicted_ms") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if p <= 0 and d <= 0:
+        return 0.0
+    return max(0.0, wall - (p + d) / 1000.0)
 
 
 def exceeds_wall_clock(tg: float, reps: list) -> str | None:
@@ -4962,23 +5118,53 @@ class ServerSession:
         self.err = ""
         self.port = _free_port()
         args = build_server_args(cfg, launch_f, self.port, n_ctx)
-        self.proc = subprocess.Popen(args, stdout=subprocess.PIPE,
+        # The server's log MUST be drained while it runs. It writes ~1 KB to
+        # stderr per request, and an unread pipe holds 64 KB: at about the
+        # 131st request its next log write blocked and the server froze for
+        # good — every later request a TIMEOUT. Measured on gemma-3-270m: 131
+        # requests then a hang on two llama.cpp builds and at two context sizes;
+        # 400 without a hang once drained. Latent for any session serving more
+        # than ~130 requests, and reached easily once the preheat polls on a
+        # clock (docs/sweep-cost-design.md C3a). stdout carries nothing.
+        self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL,
                                      stderr=subprocess.PIPE, text=True,
                                      env=run_env(cfg, launch_f))
+        self._log = collections.deque(maxlen=SERVER_LOG_TAIL_LINES)
+        self._drain = threading.Thread(target=_drain_lines,
+                                       args=(self.proc.stderr, self._log),
+                                       daemon=True)
+        self._drain.start()
         # Wait for the server to come up, but give up fast if the process dies
         # (crashed on load) or exceeds the startup budget — don't hang for the
         # whole per-run timeout.
         start_deadline = time.time() + cfg.server_start_timeout
         if _wait_health(self.port, start_deadline, self.proc):
             self.ok = True
+            # Read back what the server settled on, now — before request
+            # logging pushes the load lines out of the bounded tail (C5).
+            _until = time.time() + 2.0
+            while (time.time() < _until
+                   and not any("n_ubatch" in ln for ln in list(self._log))):
+                time.sleep(0.05)
+            self.effective = parse_server_effective(list(self._log))
         else:
             died = self.proc.poll() is not None
             self.proc.terminate()
             try:
-                _, err = self.proc.communicate(timeout=10)
-                self.err = err or ""
+                self.proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+            # the drain thread ends at EOF, once the process has gone
+            self._drain.join(timeout=5)
+            self.err = "".join(self._log)
+            # Still loading when the clock ran out is not a failed config: a
+            # 27 GB model off a cold disk can take longer than the default
+            # 180 s, and calling that ERROR files a working config as broken.
+            self.load_timed_out = not died
+            if self.load_timed_out:
+                self.err = (f"server not healthy within "
+                            f"{cfg.server_start_timeout}s (still loading? "
+                            f"--server-start-timeout)\n" + self.err)
             self.signal = died_on_signal(self.proc.returncode) if died else None
             if not self.err:
                 self.err = (f"server died on signal {self.signal} during load"
@@ -5043,6 +5229,7 @@ class ServerSession:
         # One prompt per request rather than one prompt reused: at reuse 1.0 the
         # battery reproduces the historical identical-prompt behaviour exactly,
         # and below it the requests genuinely differ (W-D1/W-D3).
+        self.last_error = ""               # this config's, not the last one's
         reuse = float(getattr(self.cfg, "prefix_reuse", 1.0))
         n_req = (max(1, reps) + 1) if par == 1 else par
         # cpt is measured once per session, by `calibrate`, BEFORE the first
@@ -5076,10 +5263,13 @@ class ServerSession:
             if warm_cap is not None:
                 warm_timeout = max(1, int(min(warm_timeout, warm_cap)))
             warm_tg = 0.0
+            overhead = 0.0
             try:
+                _w0 = time.time()
                 warm = _completion(self.port, prompt, n_gen, warm_timeout,
                                    cache=True, temp=_temp)
                 wt = warm.get("timings", {})
+                overhead = warm_overhead_s(time.time() - _w0, wt)
                 pp = wt.get("prompt_per_second", 0.0) or 0.0
                 warm_tg = wt.get("predicted_per_second", 0.0) or 0.0
                 # What the prompt ACTUALLY became. `n_depth` records what was
@@ -5105,6 +5295,7 @@ class ServerSession:
                                          f"floors allow one request; reps not "
                                          f"measured")}
                 pp, n_err = 0.0, n_err + 1
+                self.last_error = request_error_text(e)
             samples, timings = [], []
             # Prefill the rep cannot avoid, priced client-side, for servers that
             # report no `prompt_ms`. Deliberately a LOWER bound on the credit:
@@ -5196,8 +5387,9 @@ class ServerSession:
                     r = _completion(self.port, prompts[(i + 1) % len(prompts)],
                                     n_gen, _left(timeout, deadline), cache=True,
                                     temp=_temp)
-                except (urllib.error.URLError, OSError, json.JSONDecodeError):
+                except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
                     n_err += 1
+                    self.last_error = request_error_text(e)
                     continue
                 wall = time.time() - w0
                 t = r.get("timings", {})
@@ -5221,7 +5413,7 @@ class ServerSession:
                     except (TypeError, ValueError):
                         reported = 0.0     # unparseable is not a credit
                     prefill = reported / 1000.0 if reported > 0 else prefill_est
-                    clock = RepClock(n_dec, wall, prefill)
+                    clock = RepClock(n_dec, wall, prefill, overhead)
                 samples.append(RepSample(rate, clock))
             # Each rep is judged against its own request's duration, then the
             # survivors decide the number. One rep with a broken counter is a
@@ -5341,6 +5533,114 @@ class ServerSession:
                 self.proc.kill()
 
 
+# llama.cpp's level at which `llama_context: n_batch = ...` is logged (C5).
+SERVER_LOG_VERBOSITY = 4
+
+# Lines of server log kept per session — enough to hold a load failure's whole
+# story (the OOM and signal patterns are read from it), bounded so a session
+# serving thousands of requests does not keep its whole log in memory.
+SERVER_LOG_TAIL_LINES = 2000
+
+
+_EFFECTIVE_PAT = re.compile(r"llama_context:\s+(n_ctx|n_batch|n_ubatch)\s+=\s+(\d+)")
+# llama.cpp's own words when it turns a requested feature off (server-context.cpp)
+_SWA_FULL_OFF = "swa_full is not supported by this model"
+_SPEC_REFUSED = "speculative decoding not supported by this context"
+_SLOT_CAPPED = re.compile(r"slot context \((\d+)\) exceeds the training context "
+                          r"of the model \((\d+)\) - capping")
+
+
+def parse_server_effective(lines) -> dict:
+    """What a llama-server actually settled on, from its log (C5).
+
+    Returns {"n_ctx", "n_batch", "n_ubatch"} (the FIRST context's — the target's;
+    a draft context logs its own after it) plus flags for the features llama.cpp
+    announces it turned off. Missing keys mean the log did not say, never 0."""
+    eff: dict = {}
+    for ln in lines:
+        m = _EFFECTIVE_PAT.search(ln)
+        if m and m.group(1) not in eff:
+            eff[m.group(1)] = int(m.group(2))
+        if _SWA_FULL_OFF in ln:
+            eff["swa_full_off"] = True
+        if _SPEC_REFUSED in ln:
+            eff["spec_refused"] = True
+        c = _SLOT_CAPPED.search(ln)
+        if c:
+            eff["slot_capped"] = (int(c.group(1)), int(c.group(2)))
+    return eff
+
+
+def server_adjustments(cfg, f: dict, eff: dict) -> tuple[list, bool]:
+    """(differences between what row `f` asked for and what ran, whether any
+    changes the level of a swept factor). A changed level means the row
+    measured something other than what it is filed under (C5)."""
+    out, relabels = [], False
+    ub = int(f.get("ubatch", 512))
+    want_b = (derived_value("batch_ratio", f, cfg) if "batch_ratio" in f
+              else max(FIXED_BATCH, ub))
+    got_ub, got_b = eff.get("n_ubatch"), eff.get("n_batch")
+    if got_ub is not None and got_ub != ub:
+        out.append(f"ubatch {ub} ran as {got_ub} (llama.cpp clamps it to the "
+                   f"batch, and the batch to the context)")
+        relabels = relabels or "ubatch" in f
+    if got_b is not None and got_b != want_b:
+        # a batch at least as large as the context already holds any prompt
+        # the context can: recorded, but the level still means what it says
+        out.append(f"batch {want_b} ran as {got_b} (clamped to the context)")
+    if eff.get("swa_full_off") and str(f.get("swa_full")) == "1":
+        out.append("swa_full=1 was disabled by llama.cpp (not supported by "
+                   "this model)")
+        relabels = True
+    if eff.get("spec_refused") and speculation_requested(cfg, f):
+        out.append("speculative decoding was refused by llama.cpp (not "
+                   "supported by this context)")
+        relabels = True
+    if eff.get("slot_capped"):
+        a, b = eff["slot_capped"]
+        out.append(f"slot context {a} capped to the model's {b}")
+    return out, relabels
+
+
+def load_failure_lines(err: str, n: int = 4) -> list:
+    """The lines of a failed load's log worth showing: our own verdict line
+    if there is one, then llama.cpp's errors, else its last few lines."""
+    lines = [ln.strip() for ln in (err or "").splitlines() if ln.strip()]
+    if not lines:
+        return []
+    head = [lines[0]] if lines[0].startswith("server ") else []
+    errs = [ln for ln in lines if re.search(r"\b(E|error|failed|abort)\b",
+                                            ln, re.I)]
+    return head + (errs[-n:] if errs else lines[-n:])
+
+
+def request_error_text(e: BaseException) -> str:
+    """One line saying why a request failed, preferring the server's own
+    message (llama-server answers a bad request with a JSON error body)."""
+    if isinstance(e, urllib.error.HTTPError):
+        try:
+            body = json.loads(e.read() or b"{}")
+            msg = (body.get("error") or {}).get("message")
+            if msg:
+                return f"HTTP {e.code}: {msg}"
+        except (OSError, ValueError, AttributeError):
+            pass
+        return f"HTTP {e.code}"
+    if _timed_out(e):
+        return "timed out"
+    return f"{type(e).__name__}: {e}"[:300]
+
+
+def _drain_lines(stream, sink) -> None:
+    """Read `stream` to EOF into `sink` (a bounded deque). Runs in a thread for
+    a server's whole life, so its pipe can never fill and block it."""
+    try:
+        for line in iter(stream.readline, ""):
+            sink.append(line)
+    except (OSError, ValueError):
+        pass                                 # closed under us: nothing to keep
+
+
 def load_key(cfg: Config, f: dict):
     """Server launch identity: every factor except the request-time n_depth."""
     return tuple((k, f.get(k)) for k in cfg.factors if k != "n_depth")
@@ -5416,7 +5716,15 @@ def measure_in_session(cfg: Config, f: dict, session, timeout: int) -> dict:
     if session is None or not session.ok:
         err = session.err if session else ""
         status = ("OOM" if _OOM_PAT.search(err or "") else
-                  "SIGNAL" if getattr(session, "signal", None) else "ERROR")
+                  "SIGNAL" if getattr(session, "signal", None) else
+                  "TIMEOUT" if getattr(session, "load_timed_out", False) else
+                  "ERROR")
+        # the row says why: the server's own last words, not a bare status
+        tail = load_failure_lines(err)
+        if tail:
+            print(f"  server did not load ({status}):")
+            for ln in tail:
+                print(f"    {ln}")
         return {"status": status, "pp_tps": 0.0, "tg_tps": 0.0, "secs": 0.0,
                 "vram_mib": 0}
     prompt_len = cfg.n_prompt + int(f.get("n_depth", 0))
@@ -5431,8 +5739,9 @@ def measure_in_session(cfg: Config, f: dict, session, timeout: int) -> dict:
         m = session.measure(prompt_len, cfg.n_gen, par, cfg.reps, timeout,
                             deadline=time.time() + budget,
                             spec=speculation_requested(cfg, f))
-    except (urllib.error.URLError, OSError, json.JSONDecodeError):
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
         status = "ERROR"
+        session.last_error = request_error_text(e)
     finally:
         if sampler:
             sampler.__exit__()
@@ -5471,6 +5780,23 @@ def measure_in_session(cfg: Config, f: dict, session, timeout: int) -> dict:
         res.update(status="IMPLAUSIBLE",
                    implausible=f"{m['problem']}; measured pp={pp:.1f} t/s",
                    pp_tps=0.0, tg_tps=0.0)
+    # What ran, not only what was asked for (C5). A swept factor that ran at a
+    # different level makes the row ADJUSTED: true numbers, wrong label, so out
+    # of the picks and the effects like any other non-OK row.
+    _adj, _relabel = server_adjustments(cfg, f, getattr(session, "effective",
+                                                        None) or {})
+    if _adj:
+        res["adjusted"] = "; ".join(_adj)
+        if _relabel and status == "OK":
+            status = "ADJUSTED"
+            res["status"] = status
+        print(f"  adjusted by llama.cpp: {res['adjusted']}")
+    # Say WHY a request failed. The server's own message is usually exact —
+    # "request (33217 tokens) exceeds the available context size (32768
+    # tokens)" — and the row used to say only ERROR, which is how a context
+    # overflow on every deepest row went unexplained.
+    if (status == "ERROR" or err_rate > 0) and getattr(session, "last_error", ""):
+        print(f"  request failed: {session.last_error}")
     # Below a floor the user set. A real measurement they have said they do not
     # want, so it keeps its numbers and is merely not OK — unlike IMPLAUSIBLE,
     # which zeroes them because they cannot be true (T1).
@@ -5502,6 +5828,10 @@ def server_run_one(cfg: Config, f: dict, timeout: int):
     # so only the split regime asks for slots x the per-slot context.
     n_ctx = (prompt_len + cfg.n_gen + 256) * ctx_slots_multiplier(
         f.get("concurrency", str(par) if par > 1 else "1"))
+    # never smaller than the row's ubatch: llama.cpp clamps ubatch to the
+    # context without a word, so a depth-0 probe of ubatch=2048 at -c 832 ran
+    # at 832 and recorded 2048 (C5). The extra KV is at most a ubatch's worth.
+    n_ctx = max(n_ctx, int(f.get("ubatch", 0) or 0))
     session = ServerSession(cfg, f, n_ctx, timeout)
     try:
         return measure_in_session(cfg, f, session, timeout)
@@ -6042,9 +6372,12 @@ def factor_level_means(rows: list[dict], factor: str) -> dict:
     return means
 
 
-def refine_numeric(vals: list[int], best: int) -> list[str]:
+def refine_numeric(vals: list[int], best: int, scale: str = "lin",
+                   quantum: int = 1) -> list[str]:
     """Finer grid of levels bracketing `best` (its neighbours in the current
-    grid), for the next refinement pass."""
+    grid), for the next refinement pass. `scale="log"` spaces the new grid by
+    ratio, snapped to `quantum`: around ubatch=512 that is 256..1024 on the
+    doubling scale, not 256, 448, 640, 832, 1024 (C4)."""
     vals = sorted(set(vals))
     if len(vals) <= 1:
         return [str(v) for v in vals] or [str(best)]
@@ -6055,6 +6388,10 @@ def refine_numeric(vals: list[int], best: int) -> list[str]:
     if lo == hi:
         step = max(1, (vals[-1] - vals[0]) // len(vals))
         lo, hi = max(0, best - step), best + step
+        if scale == "log" and best > 0:
+            lo, hi = best // 2, best * 2
+    if scale == "log":
+        return [str(x) for x in log_levels_span(lo, hi, 5, quantum)]
     return [str(x) for x in five_levels_span(lo, hi)]
 
 
@@ -6190,7 +6527,10 @@ def refine_factors(cfg: Config, rows: list[dict]) -> dict:
         if not active:
             new[name] = [str(best)]                       # settle at the winner
         elif numeric:
-            new[name] = refine_numeric([int(x) for x in cur], int(best))  # finer grid
+            _spec = FACTORS.get(name, {})
+            new[name] = refine_numeric([int(x) for x in cur], int(best),  # finer
+                                       _spec.get("scale", "lin"),         # grid
+                                       _spec.get("quantum", 1))
         else:                                             # cat/float/env: keep top few
             means = factor_level_means(rows, name)
             ranked = sorted(means, key=means.get, reverse=True)
@@ -6511,25 +6851,64 @@ def taguchi_effects(cfg: Config, exp, rows: list[dict]):
 # ---------------------------------------------------------------------------
 def probe_max_context(cfg: Config, base_f: dict, timeout: int, cap: int,
                       baseline_c: float | None = None):
-    """Binary-search the largest n_depth that loads (no OOM) for base_f.
+    """Find the largest n_depth that loads (no OOM) for base_f.
 
     Returns (max_depth, tg_tps_at_max) or None if even depth 0 fails.
-    """
+
+    Seeded, then galloping, then bisecting (docs/sweep-cost-design.md C4). The
+    seed is the estimator's own answer (`estimated_max_depth`: llama-fit-params,
+    no GPU, no prefill), else `cap` — which is what this tested first anyway.
+    From the seed it steps outward in doubling offsets (2k, 4k, 8k, ...) until
+    the answer flips, which brackets the boundary in log2(error) launches, and
+    only then bisects. Every launch here prefills its whole depth, so where
+    the estimator is right the answer costs two or three of them instead of a
+    bisection of 0..cap from its arithmetic midpoint.
+
+    Galloping assumes "loads" is monotone in depth, which holds for memory —
+    the only thing this asks."""
     def try_depth(d):
         wait_until_cool(baseline_c)   # each attempt measures; keep it comparable
         f = dict(base_f)
         f["n_depth"] = str(d)
         r = drive_one(cfg, f, timeout)
-        return r["status"] == "OK", r
+        # ADJUSTED loaded fine — llama.cpp changed a setting, it did not fail;
+        # this probe asks only whether the depth loads
+        return r["status"] in ("OK", "ADJUSTED"), r
 
     good, _ = try_depth(0)
     if not good:
         return None
-    good, r = try_depth(cap)
-    if good:
+    seed = estimated_max_depth(cfg, base_f, cap) or cap
+    good, r = try_depth(seed)
+    if good and seed >= cap:
         return cap, r["tg_tps"]
-
-    lo, hi, best_tps = 0, cap, None
+    lo, hi, best_tps = (seed, cap, r["tg_tps"]) if good else (0, seed, None)
+    # Gallop outward from the seed in doubling OFFSETS (2k, 4k, 8k, ...): the
+    # estimator is usually close, so the boundary is found in a step or two;
+    # when it is far off, the offsets reach it in log2(error) launches.
+    step = 2048
+    if good:                                   # loads at the seed: go deeper
+        while hi - lo > 2048:
+            nxt = min(cap, lo + step)
+            good, r = try_depth(nxt)
+            if not good:
+                hi = nxt
+                break
+            lo, best_tps = nxt, r["tg_tps"]
+            if nxt >= cap:
+                return cap, best_tps
+            step *= 2
+    else:                                      # does not: come back down
+        while hi - lo > 2048:
+            nxt = max(lo, (hi - step) // 1024 * 1024)
+            if nxt <= lo:
+                break
+            good, r = try_depth(nxt)
+            if good:
+                lo, best_tps = nxt, r["tg_tps"]
+                break
+            hi = nxt
+            step *= 2
     while hi - lo > 2048:
         mid = ((lo + hi) // 2 // 1024) * 1024
         if mid <= lo:
@@ -6540,6 +6919,29 @@ def probe_max_context(cfg: Config, base_f: dict, timeout: int, cap: int,
         else:
             hi = mid
     return lo, best_tps
+
+
+def estimated_max_depth(cfg: Config, base_f: dict, cap: int) -> int | None:
+    """Deepest n_depth `predict_fits` says loads for base_f, to 1024 tokens, or
+    None when it cannot say. A seed for `probe_max_context`, never a verdict:
+    the estimator is a metadata read, so asking it ~8 times costs less than one
+    real launch at depth."""
+    def fits(d):
+        return predict_fits(cfg, {**base_f, "n_depth": str(d)}, cfg.driver)
+    if fits(cap):
+        return cap
+    if fits(0) is not True:
+        return None
+    lo, hi = 0, cap
+    while hi - lo > 1024:
+        mid = (lo + hi) // 2 // 1024 * 1024
+        if mid <= lo:
+            break
+        ok = fits(mid)
+        if ok is None:
+            return None
+        lo, hi = (mid, hi) if ok else (lo, mid)
+    return lo or None
 
 
 def run_probe_stage(cfg: Config, all_rows: list[dict], timeout: int,
@@ -6556,7 +6958,10 @@ def run_probe_stage(cfg: Config, all_rows: list[dict], timeout: int,
     # fastest) — the memory-lightest good config — so this is the true
     # physical ceiling, not the fastest config's (which may fit less).
     base_row = max(ok, key=lambda r: (int(r["n_depth"]), score_of(r)))
-    cap = cfg.hw.get("n_ctx_train") or 131072
+    # the same ceiling the grid uses: a probe at the full native context asks
+    # for more than a slot holds, and its HTTP 400 would read as a memory limit
+    cap = (depth_ceiling(cfg.hw.get("n_ctx_train"), request_reserve(cfg))
+           if cfg.hw.get("n_ctx_train") else 131072)
     if cfg.max_depth:                          # --max-context caps the search
         cap = min(cap, cfg.max_depth)
     base = {k: base_row[k] for k in cfg.factors}
@@ -7083,9 +7488,40 @@ def selftest() -> bool:
             globals()["supports_flag"] = lambda _b, _f: True
             # MoE expert cache: off, then up to a quarter of VRAM in 256 MiB
             # steps; nothing at all without a VRAM figure to take a share of
-            assert moe_cache_levels(32768, 5) == ["0", "2048", "4096",
-                                                  "6144", "8192"]
+            # a size: halvings of the ceiling, not an even walk (C4)
+            assert moe_cache_levels(32768, 5) == ["0", "1024", "2048",
+                                                  "4096", "8192"]
             assert moe_cache_levels(32768, 3) == ["0", "4096", "8192"]
+            # the ceiling is the measured headroom when the estimator has one:
+            # a 12 GB card with every expert on the CPU is mostly free, and a
+            # quarter of it (3 GB) undershoots
+            assert moe_cache_levels(12288, 5, headroom_mib=9000) == [
+                "0", "1024", "2048", "4352", "8960"]
+            # ...bounded by what there is to cache, and absent with no room
+            assert moe_cache_levels(12288, 3, headroom_mib=9000,
+                                    cap_mib=2048) == ["0", "1024", "2048"]
+            assert moe_cache_levels(12288, 5, headroom_mib=100) == []
+            assert moe_cache_levels(12288, 5, headroom_mib=-500) == []
+            # the headroom is priced at the worst all-experts-on-CPU cell:
+            # deepest depth, largest KV, every expert on the CPU
+            _seen_fp = []
+            _real_fp = predict_footprint_mib
+            try:
+                globals()["predict_footprint_mib"] = lambda c, f, d: (
+                    _seen_fp.append(dict(f)), 3000)[1]
+                _hc = SimpleNamespace(oom_prune=True, fit_headroom_mib=512,
+                                      driver="server", hw={"vram": 12288})
+                assert moe_cache_headroom_mib(_hc, ["0", "65536"],
+                                              ["f16", "q8_0"], 40) == 12288 - 512 - 3000
+                assert _seen_fp[0] == {"ngl": "40", "ncmoe": "40",
+                                       "n_depth": "65536", "kv_type": "f16",
+                                       "nkvo": "0"}, _seen_fp
+                globals()["predict_footprint_mib"] = lambda c, f, d: None
+                assert moe_cache_headroom_mib(_hc, ["0"], ["f16"], 40) is None
+                _hc.oom_prune = False        # --no-oom-prune: do not trust it
+                assert moe_cache_headroom_mib(_hc, ["0"], ["f16"], 40) is None
+            finally:
+                globals()["predict_footprint_mib"] = _real_fp
             assert moe_cache_levels(None, 5) == []
             assert moe_cache_levels(512, 5) == []        # 128 MiB: below a step
             _hw_moe = dict(_hw_tog, n_experts=8, vram=32768)
@@ -7094,6 +7530,9 @@ def selftest() -> bool:
                              ctx_floor=8192, driver="server", hw=dict(_hw_moe))
             f_moe = build_factors(cfg_moe)
             assert f_moe["moe_cache"] == moe_cache_levels(32768, 5), f_moe
+            # experts in system RAM: how they are loaded is measured, not pinned
+            assert f_moe["load_mode"] == ["mmap", "none"], f_moe
+            assert "load_mode" not in build_factors(cfg_tog)    # dense: no
             assert cfg_moe.unswept == {}
             # ...but only if free: at --levels 3 the server set already fills
             # L27, and the 14th column would make it L81 -- 27 runs to 81.
@@ -8302,6 +8741,175 @@ def selftest() -> bool:
 
         # refinement: settle the flat factor, refine the high-impact one
         assert refine_numeric([20, 40, 60], 60) == ["40", "45", "50", "55", "60"]
+        # --- C4: sizes on a doubling scale ---
+        assert log_levels_span(0, 65536, 5, 1024) == [0, 8192, 16384, 32768, 65536]
+        assert log_levels_span(8192, 65536, 5, 1024) == [8192, 13312, 22528,
+                                                         38912, 65536]
+        assert log_levels_span(0, 8192, 2) == [0, 8192]
+        assert log_levels_span(5, 5, 5) == [5]
+        # a positive level never snaps to 0 and becomes a second anchor
+        assert log_levels_span(0, 300, 5, 256) == [0, 256, 300]
+        # depth uses it: the deep rows are the expensive ones
+        assert depth_levels(65536, floor=0) == [0, 8192, 16384, 32768, 65536]
+        # refinement around ubatch=512 stays on the doubling scale, snapped
+        assert refine_numeric([128, 256, 512, 1024, 2048], 512, "log", 32) == [
+            "256", "352", "512", "704", "1024"]
+        # a narrow bracket snaps levels together; fewer levels, never a
+        # level outside it
+        assert refine_numeric([128, 256, 512], 128, "log", 32) == [
+            "128", "160", "192", "256"]
+        assert FACTORS["ubatch"]["scale"] == "log"
+
+        # Windows: llama-server.exe, and Visual Studio's build/bin/Release
+        with tempfile.TemporaryDirectory() as _td:
+            _rel = Path(_td) / "build" / "bin" / "Release"
+            _rel.mkdir(parents=True)
+            (_rel / "llama-server.exe").write_text("")
+            assert resolve_binary("llama-server", None, Path(_td),
+                                  exe=".exe") == _rel / "llama-server.exe"
+            # and nothing changes where there is no suffix to add
+            assert resolve_binary("llama-server", None, Path(_td),
+                                  exe="").name == "llama-server"
+
+        # --- the deepest level fits the native context, with the request ---
+        # depth == n_ctx_train asked for prompt + generation MORE than a slot
+        # holds: llama-server caps slots there and answered HTTP 400 on every
+        # deepest row (gemma-3-270m, 32768 native, 2026-10-14)
+        assert depth_ceiling(32768, 512 + 64 + 256) == 31744
+        assert depth_ceiling(None, 999) == DEFAULT_MAX_DEPTH
+        assert depth_levels(32768, floor=8192, levels=2,
+                            reserve=832) == [8192, 31744]
+        assert max(depth_levels(262144, reserve=832)) == DEFAULT_MAX_DEPTH
+        assert request_reserve(SimpleNamespace(n_prompt=512, n_gen=64)) == 832
+        # a failed request says why, in the server's own words
+        _he = urllib.error.HTTPError(
+            "http://x", 400, "Bad Request", {}, io.BytesIO(json.dumps(
+                {"error": {"code": 400, "message": "request (33217 tokens) "
+                           "exceeds the available context size"}}).encode()))
+        assert request_error_text(_he) == ("HTTP 400: request (33217 tokens) "
+                                           "exceeds the available context size")
+        assert request_error_text(TimeoutError()) == "timed out"
+
+        # --- C5: the row describes what ran ---
+        _log = ["0.00.41 I llama_context: n_ctx                 = 1024\n",
+                "0.00.41 I llama_context: n_batch               = 832\n",
+                "0.00.41 I llama_context: n_ubatch              = 832\n",
+                "0.00.50 I llama_context: n_batch               = 512\n",  # draft
+                "0.00.58 W srv    load_model: the slot context (33792) exceeds the "
+                "training context of the model (32768) - capping\n",
+                "W srv swa_full is not supported by this model, it will be disabled\n"]
+        _eff = parse_server_effective(_log)
+        assert _eff["n_batch"] == 832 and _eff["n_ubatch"] == 832  # target's
+        assert _eff["slot_capped"] == (33792, 32768) and _eff["swa_full_off"]
+        assert parse_server_effective([]) == {}            # silent: no claims
+        _ac = SimpleNamespace(emit_mtp=False, ngram=False, hw={},
+                              draft_model=None)
+        # measured on gemma-3-270m: -ub 2048 -b 32768 at -c 832 ran 832/832
+        _adj, _rel = server_adjustments(
+            _ac, {"ubatch": "2048", "batch_ratio": "16"}, _eff)
+        assert _rel and any(a.startswith("ubatch 2048 ran as 832") for a in _adj)
+        assert any(a.startswith("batch 32768 ran as 832") for a in _adj)
+        # batch above the context alone is recorded, not a relabel: a batch
+        # that holds the whole context already holds any prompt it can
+        _adj, _rel = server_adjustments(
+            _ac, {"ubatch": "512", "batch_ratio": "16"},
+            {"n_batch": 9024, "n_ubatch": 512})
+        assert _adj and not _rel
+        # a swept feature llama.cpp switched off IS a relabel
+        _adj, _rel = server_adjustments(_ac, {"swa_full": "1"},
+                                        {"swa_full_off": True})
+        assert _rel
+        assert server_adjustments(_ac, {"swa_full": "0"},
+                                  {"swa_full_off": True})[1] is False
+        # nothing said, nothing claimed
+        assert server_adjustments(_ac, {"ubatch": "512"}, {}) == ([], False)
+
+        # the wall-clock check credits measured per-request overhead (C5):
+        # gemma-3-270m at 32k, 64 tokens in 12.5 s wall, 11.2 s prefill, server
+        # 148.9 t/s -- a true number the flat 2x margin rejected
+        assert warm_overhead_s(12.5, {"prompt_ms": 11200, "predicted_ms": 430}) \
+            == 12.5 - 11.63
+        assert warm_overhead_s(5.0, {}) == 0.0
+        assert exceeds_wall_clock(148.9, [RepClock(64, 12.5, 11.2)])  # before
+        assert exceeds_wall_clock(148.9, [RepClock(64, 12.5, 11.2, 0.87)]) is None
+        # ...and the defect class it exists for is still caught: 1e6 t/s
+        assert exceeds_wall_clock(1e6, [RepClock(64, 12.5, 11.2, 0.87)])
+        # a server claiming ALL the time was overhead cannot switch it off
+        assert exceeds_wall_clock(1e6, [RepClock(64, 12.5, 11.2, 99.0)])
+
+        # --- placement knobs cannot act with every layer on the CPU (#17) ---
+        for _pk in ("ncmoe", "ncffn", "ot", "ffn_place", "nkvo"):
+            assert is_inert(_pk, {"ngl": "0"}), _pk
+            assert not is_inert(_pk, {"ngl": "99"}), _pk
+            assert not is_inert(_pk, {}), _pk         # absent is not evidence
+        # an ngl=0 row is not counted in nkvo's effect...
+        _rows = [{"ngl": "0", "nkvo": "1", "status": "OK", "tg_tps": 5.0,
+                  "eff_tps": 5.0},
+                 {"ngl": "99", "nkvo": "1", "status": "OK", "tg_tps": 40.0,
+                  "eff_tps": 40.0},
+                 {"ngl": "99", "nkvo": "0", "status": "OK", "tg_tps": 50.0,
+                  "eff_tps": 50.0}]
+        assert factor_level_means(_rows, "nkvo") == {"0": 50.0, "1": 40.0}
+        # ...and a CPU-only sweep (ngl pinned 0) does not sweep them at all
+        assert prune_gated_factors({"ngl": ["0"], "nkvo": ["0", "1"],
+                                    "threads": ["4"]})[1] == ["nkvo"]
+
+        # --- a server's log is drained while it runs ---
+        # An unread stderr pipe holds 64 KB; llama-server writes ~1 KB per
+        # request, so at about the 131st request its next write blocked and the
+        # server froze. A child writing well past 64 KB must still finish.
+        _child = subprocess.Popen(
+            [sys.executable, "-c",
+             "import sys\nfor i in range(4000): sys.stderr.write('x'*99+'\\n')"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        _tail = collections.deque(maxlen=10)
+        _dt = threading.Thread(target=_drain_lines, args=(_child.stderr, _tail),
+                               daemon=True)
+        _dt.start()
+        assert _child.wait(timeout=20) == 0     # 400 KB through a 64 KB pipe
+        _dt.join(timeout=5)
+        assert len(_tail) == 10                 # bounded: the tail, not it all
+
+        # --- the context probe: seed, gallop, bisect (C4) ---
+        _real_drive, _real_pf = drive_one, predict_fits
+        _launches = []
+
+        def _drive(cfg_, f_, t_):          # a model that loads up to 40000
+            _launches.append(int(f_["n_depth"]))
+            ok = int(f_["n_depth"]) <= 40000
+            return {"status": "OK" if ok else "OOM", "tg_tps": 10.0}
+        _pc = SimpleNamespace(driver="server")
+        try:
+            globals()["drive_one"] = _drive
+            # no estimator: seeded at cap, as the probe always began
+            globals()["predict_fits"] = lambda c, f, d: None
+            _got = probe_max_context(_pc, {}, 30, 65536)
+            assert 40000 - 2048 < _got[0] <= 40000, _got
+            _blind = len(_launches)
+            # an estimator that is close (it keeps headroom, so it is low):
+            # the answer costs fewer launches, and the same answer
+            _launches.clear()
+            globals()["predict_fits"] = lambda c, f, d: int(f["n_depth"]) <= 38912
+            assert estimated_max_depth(_pc, {}, 65536) == 38912
+            _got = probe_max_context(_pc, {}, 30, 65536)
+            assert 40000 - 2048 < _got[0] <= 40000, _got
+            assert len(_launches) < _blind, (_launches, _blind)
+            assert max(_launches) < 65536      # never paid for the deepest
+            # an optimistic estimator is only a seed, never a verdict
+            _launches.clear()
+            globals()["predict_fits"] = lambda c, f, d: int(f["n_depth"]) <= 60416
+            _got = probe_max_context(_pc, {}, 30, 65536)
+            assert 40000 - 2048 < _got[0] <= 40000, _got
+            # fits at cap, no estimator: one launch past depth 0, as before
+            _launches.clear()
+            globals()["predict_fits"] = lambda c, f, d: None
+            globals()["drive_one"] = lambda c, f, t: (
+                _launches.append(1), {"status": "OK", "tg_tps": 9.0})[1]
+            assert probe_max_context(_pc, {}, 30, 65536) == (65536, 9.0)
+            assert len(_launches) == 2
+        finally:
+            globals()["drive_one"], globals()["predict_fits"] = _real_drive, _real_pf
+        assert FACTORS["moe_cache"]["scale"] == "log"
         cfg_r = Config(model=Path("m"), llama_bench=Path("b"), array="auto",
                        ctx_floor=8192)
         cfg_r.factors = {"ngl": ["20", "40", "60"], "kv_type": ["f16", "q8_0"]}
@@ -11786,7 +12394,8 @@ def main():
         if "kv_type" in cfg.factors:
             base["kv_type"] = max(cfg.factors["kv_type"],
                                   key=lambda k: KV_QUALITY.index(k) if k in KV_QUALITY else 0)
-        cap = cfg.hw.get("n_ctx_train") or 131072
+        cap = (depth_ceiling(cfg.hw.get("n_ctx_train"), request_reserve(cfg))
+               if cfg.hw.get("n_ctx_train") else 131072)
         if args.max_depth:                       # --max-context caps the scan
             cap = min(cap, args.max_depth)
         print(f"### Context scan — probing the physical ceiling first "
@@ -12082,6 +12691,7 @@ def main():
             # column and it is the difference between a bug report that can be
             # decided on sight and one that takes five round trips (issue #11).
             + (["task"] if cfg.task else [])
+            + (["adjusted"] if cfg.driver == "server" else [])
             + ["implausible", "tool_version", "llama_build"])
 
     # Resume keys on run_id (unique per array row), not config values, because
@@ -12201,6 +12811,8 @@ def main():
                 n_ctx = (cfg.n_prompt + max_depth + cfg.n_gen + 256) * \
                     ctx_slots_multiplier(launch.get(
                         "concurrency", str(par) if par > 1 else "1"))
+                # see server_run_one: a context under the ubatch clamps it
+                n_ctx = max(n_ctx, int(launch.get("ubatch", 0) or 0))
                 lp = (f"server launch: ngl={launch['ngl']} kv={launch['kv_type']} "
                       f"ub={launch['ubatch']} ctx={n_ctx}")
                 lk = load_key_str(cfg, launch)
