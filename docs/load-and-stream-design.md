@@ -146,6 +146,16 @@ prompt is cached) get their own budget rather than a TIMEOUT for a config that
 just did the hard part. `--min-pps` is judged during prefill the way
 `--min-tgs` is during decode.
 
+### Open: the sweep's 64k depth cap
+
+`DEFAULT_MAX_DEPTH = 65536` caps the sweep's depth grid regardless of the
+model's native context, from before prefill was observable ("deep contexts on
+CPU prefill very slowly"). The user: "a long context is one of the things I
+would expect users to want to test". The max-context probe already goes to the
+native ceiling, and `scripts/time-config.py` ignores the cap. Lifting it for
+the grid is a cost decision, not a correctness one: on Qwen3.6-27B a 131k row
+is ~34 min, and an L125 puts 25 rows at its top depth.
+
 ## Invariants
 
 - **LS1 — a slow load is not a failed config.** A server that is still loading
@@ -171,5 +181,9 @@ just did the hard part. `--min-pps` is judged during prefill the way
 - [x] L5: progress-aware load wait (log lines + page cache), stall + hard cap
 - [x] L5: prefill progress events; soft `--timeout` during prefill; `--min-pps` live
 - [x] Sweep ETA prices loads from measured rates, cold read shown separately
+- [x] Prefill ETA in the live view; early stop when even the optimistic
+      projection misses the cap
+- [x] `scripts/time-config.py`: one config, model-agnostic depth grid
+- [ ] Decide the sweep's 64k depth cap (above)
 - [ ] Measured on hardware: cold vs cached load of a large model, and a
       streamed vs non-streamed rate on the same config

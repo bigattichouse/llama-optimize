@@ -4401,6 +4401,8 @@ def build_server_args(cfg: Config, f: dict, port: int, n_ctx: int) -> list[str]:
 # past the deadline progress can carry it at most.
 LOAD_STALL_S = 90.0
 LOAD_HARD_CAP_FACTOR = 4.0
+# Prefill observed before its rate is trusted to project the finish (L5).
+PREFILL_PROJECT_MIN_S = 30.0
 
 
 def _wait_health(port: int, deadline: float, proc=None, progress=None,
@@ -5118,9 +5120,24 @@ def _completion(port: int, prompt, n_gen: int, timeout: int, cache: bool = False
                 if proc_ > done_pp:
                     done_pp, last_pp_at = proc_, now
                     rate = (proc_ - int(pg.get("cache") or 0)) / secs if secs > 0 else 0.0
+                    eta = (tot - proc_) / rate if rate > 0 and tot else 0.0
                     LIVE.set(phase=(f"prefill {100 * proc_ / tot:.0f}% "
-                                    f"({proc_}/{tot} tok)") if tot else "prefill",
-                             tokens=0, rate=rate)
+                                    f"({proc_}/{tot} tok, ~{fmt_dur(eta)} left)")
+                             if tot else "prefill", tokens=0, rate=rate)
+                    # Will it make the cap at all? Prefill slows as the context
+                    # fills, so this projection is OPTIMISTIC — when even it
+                    # misses the cap, stop now with the number that would be
+                    # needed, rather than spend the whole cap and fail anyway.
+                    cap = LOAD_HARD_CAP_FACTOR * timeout
+                    if (eta > 0 and el + eta > cap
+                            and (secs >= PREFILL_PROJECT_MIN_S
+                                 or proc_ >= 0.1 * tot)):
+                        raise TimeoutError(
+                            f"prefill of {tot} tokens needs at least "
+                            f"~{fmt_dur(el + eta)} at {rate:.0f} t/s, past the "
+                            f"{fmt_dur(cap)} cap ({LOAD_HARD_CAP_FACTOR:g} x "
+                            f"--timeout {timeout}s); raise --timeout to "
+                            f"measure this depth")
                 if prefill_judge is not None:
                     why = prefill_judge(proc_, tot, secs)
                     if why:
@@ -5911,7 +5928,9 @@ def request_error_text(e: BaseException) -> str:
             pass
         return f"HTTP {e.code}"
     if _timed_out(e):
-        return "timed out"
+        # our own TimeoutErrors say which phase and what it would have needed
+        msg = str(e) if isinstance(e, TimeoutError) else ""
+        return msg if msg and msg != "timed out" else "timed out"
     return f"{type(e).__name__}: {e}"[:300]
 
 
@@ -9465,6 +9484,20 @@ def selftest() -> bool:
                          pp_gap=0.075)
             _r = _completion(_port, "p", 3, 1)
             assert _r["client"]["n"] == 3, _r
+            _plan.update(pp=[], pp_gap=0.0)
+            # a prefill that cannot make the cap even at its current (still
+            # optimistic) rate stops as soon as that is clear, saying why
+            _plan.update(pp=[(i * 1000, 100000, i * 100) for i in range(1, 60)],
+                         pp_gap=0.02)
+            _t = time.time()
+            try:
+                _completion(_port, "p", 3, 1)
+                assert False, "a hopeless prefill ran on"
+            except TimeoutError as _e:
+                assert "raise --timeout" in str(_e), _e
+                assert request_error_text(_e) == str(_e)
+            assert time.time() - _t < 1.5
+            assert "left)" in str(LIVE.fields.get("phase")), LIVE.fields
             _plan.update(pp=[], pp_gap=0.0)
             # a prefill that goes SILENT is a stall: the read timeout ends it
             _plan.update(prefill=2.5)

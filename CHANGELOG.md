@@ -138,6 +138,14 @@ earlier.
   Measured on the user's Qwen3.6-27B config: the 131k-depth row needed ~30 min
   of prefill and was recorded TIMEOUT at 1200 s while working the whole time.
   `--min-pps` is now judged during prefill.
+- **Prefill shows an ETA, and a hopeless prefill stops early.** The live view
+  reads `prefill 43% (56320/132036 tok, ~13m25s left)`. Prefill slows as the
+  context fills, so a projection from the current rate is optimistic; when even
+  it cannot finish inside 4 × `--timeout`, the request stops with the time it
+  would need and the advice to raise `--timeout`, instead of running the whole
+  cap and failing anyway.
+- **`scripts/time-config.py`** times one config at a doubling grid of depths up
+  to the model's own native context, for any model, before a sweep is paid for.
 - **Something to watch.** `watch -n1 cat <results>.live` shows the current
   config, step, phase, tokens and rate; `tail -f <results>.server.log` shows
   the server's own log.

@@ -507,6 +507,22 @@ has to be before it tells you anything.
 
 ## Recommended workflow (staged / iterative refinement)
 
+**Already have a config you run? Time it first.** `scripts/time-config.py` runs
+one config — the sweep's factor names, one level each — at a doubling grid of
+depths up to the model's native context, and says how long it loads (cold and
+cached), how long each depth takes, and whether it fits `--timeout`:
+
+```bash
+scripts/time-config.py model.gguf --llama-cpp /path/to/llama.cpp/build/bin \
+    --factor ngl=99 --factor kv_type=q8_0 --factor ubatch=256
+# while it runs:  watch -n1 cat time-config.live   |   tail -f time-config.server.log
+```
+
+Long contexts take a long time to *prefill*, not to load: on a 27B model at
+~70 t/s a 131k-token context is ~30 minutes of prompt processing. The sweep now
+lets `--timeout` stretch while prefill visibly advances (up to 4×), and stops
+early — saying how long it would need — when even that cannot be enough.
+
 **Step 0 — check the setup before spending hours.** A full sweep on a 27B model is
 a couple of hours; almost every way it can be wasted is visible in the first
 minute.
