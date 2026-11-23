@@ -4528,6 +4528,9 @@ def calibrate_chars_per_token(prompt: str, prompt_n) -> float | None:
 # session's -c carries a fixed 256-token margin, so the error has to stay well
 # inside that at every depth, not just at the depth the ratio was measured at.
 PROMPT_SIZE_TOLERANCE = 0.005
+# ...and never more than half that margin in absolute tokens: 0.5% of a 64k
+# prompt is 330 tokens, which would overflow -c on its own.
+PROMPT_SIZE_MAX_ERR = 128
 
 
 def _token_count(port: int, text: str, timeout) -> int | None:
@@ -4555,7 +4558,8 @@ def resized_chars_per_token(prompt: str, n_tokens, target: int) -> float | None:
     and llama-server rejected every request of the sweep."""
     if not n_tokens or target <= 0:
         return None
-    if abs(n_tokens - target) <= target * PROMPT_SIZE_TOLERANCE:
+    if abs(n_tokens - target) <= min(target * PROMPT_SIZE_TOLERANCE,
+                                     PROMPT_SIZE_MAX_ERR):
         return None
     return calibrate_chars_per_token(prompt, n_tokens)
 
@@ -10785,6 +10789,37 @@ def selftest() -> bool:
             assert len(_sent) >= 3, _sent               # warm + reps
             assert {b["temperature"] for b in _sent} == {0.9}, \
                 {b["temperature"] for b in _sent}
+
+            # /tokenize answers: a prompt that counts off target is rebuilt at
+            # the measured ratio before it is sent, and the next config reuses
+            # that ratio without rebuilding again
+            class _Tok:
+                def __init__(self_, n): self_.n = n
+                def __enter__(self_): return self_
+                def __exit__(self_, *a): return False
+                def read(self_): return json.dumps({"tokens": [0] * self_.n}).encode()
+
+            def _cap2(req, timeout=None):
+                body = json.loads(req.data)
+                if req.full_url.endswith("/tokenize"):
+                    return _Tok(len(body["content"]) // 2)   # really 2 chars/token
+                _sent.append(body)
+                return _Resp()
+
+            urllib.request.urlopen = _cap2
+            _sess_t.cfg = SimpleNamespace(prefix_reuse=1.0, task=None,
+                                          temperature=None, min_pps=0.0)
+            _sess_t.cpt = 4.0
+            _sent.clear()
+            _sess_t.measure(4000, 8, 1, 1, 30)
+            assert abs(_sess_t.cpt - 2.0) < 0.1, _sess_t.cpt
+            assert abs(len(_sent[0]["prompt"]) // 2 - 4000) <= PROMPT_SIZE_MAX_ERR, \
+                len(_sent[0]["prompt"])
+            _cpt1 = _sess_t.cpt
+            _sent.clear()
+            _sess_t.measure(4000, 8, 1, 1, 30)
+            assert _sess_t.cpt == _cpt1                  # in tolerance: kept
+            assert abs(len(_sent[0]["prompt"]) // 2 - 4000) <= PROMPT_SIZE_MAX_ERR
         finally:
             urllib.request.urlopen = _real_urlopen
 
@@ -11506,6 +11541,9 @@ def selftest() -> bool:
         assert resized_chars_per_token("x" * 1000, 251, 250) is None
         assert resized_chars_per_token("x" * 1000, 260, 250) == 1000 / 260
         assert resized_chars_per_token("x" * 1000, None, 250) is None
+        # deep prompts: 0.5% of 67,584 is 338 tokens, past -c's 256 margin
+        assert resized_chars_per_token("x" * 271656, 67914, 67584) == 4.0
+        assert resized_chars_per_token("x" * 271656, 67700, 67584) is None
         assert _token_count(1, "hello", 1) is None     # no server: estimate stands
         assert calibrate_chars_per_token("x" * 400, 100) == 4.0
         assert calibrate_chars_per_token("x" * 250, 100) == 2.5   # code-ish
