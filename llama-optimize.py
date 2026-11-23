@@ -2253,22 +2253,53 @@ class Config:
     unswept: dict = field(default_factory=dict)
 
 
-def effective_tps(n_prompt: int, n_gen: int, pp: float, tg: float) -> float:
+def effective_tps(n_prompt: int, n_gen: int, pp: float, tg: float,
+                  n_charged: int | None = None) -> float:
     """Throughput for a representative request of n_prompt prompt + n_gen gen
-    tokens: total tokens / (prefill time + decode time)."""
+    tokens: total tokens / (prefill time + decode time). `n_charged`, when
+    given, is the prompt the request is credited with, so extra prefill work
+    (n_prompt > n_charged) costs time without counting as output."""
     if pp <= 0 or tg <= 0:
         return 0.0
-    return (n_prompt + n_gen) / (n_prompt / pp + n_gen / tg)
+    credit = n_prompt if n_charged is None else n_charged
+    return (credit + n_gen) / (n_prompt / pp + n_gen / tg)
 
 
-def objective_tps(cfg: Config, pp: float, tg: float) -> float:
+def objective_tps(cfg: Config, pp: float, tg: float, row=None) -> float:
     """The score a run contributes to fits/stats/picks (stored as eff_tps).
     Default (--score tg): pure generation speed — pp is still measured and
     reported, but a huge prefill number can't make a slow generator outrank a
-    fast one. --score eff blends both into effective request throughput."""
+    fast one. --score eff blends both into effective request throughput.
+
+    Under eff, a row whose server delivered less prefix reuse than the workload
+    asked for is charged for the history it re-read. Without that, a cache miss
+    WON: re-prefilling 18k tokens in one big batch posts a higher pp rate, and
+    the score charged it for only --n-prompt of them (Nemotron-Bolt, swa_full=0:
+    the 0%-hit rows outranked the 90%-hit ones that answer ~4x sooner)."""
     if cfg.score == "eff":
-        return effective_tps(cfg.n_prompt, cfg.n_gen, pp, tg)
+        return effective_tps(cfg.n_prompt + missed_prefill_tokens(cfg, row),
+                             cfg.n_gen, pp, tg, n_charged=cfg.n_prompt)
     return tg if tg > 0 else 0.0
+
+
+def missed_prefill_tokens(cfg, row) -> int:
+    """Prompt tokens a row re-prefilled that the workload expected served from
+    cache: (asked reuse - delivered reuse) x prompt size. 0 when either is
+    unknown, or the row delivered what was asked."""
+    def num(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+    if not row:
+        return 0
+    hit, tok = num(row.get("cache_hit")), num(row.get("prompt_tok"))
+    want = num(row.get("reuse"))
+    if want is None:
+        want = num(getattr(cfg, "prefix_reuse", None))
+    if hit is None or not tok or want is None:
+        return 0
+    return int(max(0.0, want - hit) * tok)
 
 
 def build_factors(cfg: Config):
@@ -5802,8 +5833,6 @@ class ServerSession:
         self._cache_warned = True
         print(f"\n!! prompt cache delivered {hit * 100:.0f}% reuse where the "
               f"workload asked for {want * 100:.0f}%.")
-        print("!! Reps are re-prefilling instead of decoding off a cache hit, so")
-        print("!! this measures a colder workload than the one being tuned for.")
         for line in cache_miss_advice(getattr(self.cfg, "hw", {}) or {}):
             print(f"!! {line}")
         print()
@@ -6343,7 +6372,7 @@ def measured_ok(rows: list[dict]) -> list[dict]:
 def pareto_frontier(rows: list[dict]) -> list[dict]:
     """Non-dominated set maximizing (context depth, objective score) among OK."""
     ok = measured_ok(rows)
-    frontier = []
+    frontier, seen = [], set()
     for r in ok:
         depth, s = int(r["n_depth"]), score_of(r)
         dominated = any(
@@ -6351,7 +6380,10 @@ def pareto_frontier(rows: list[dict]) -> list[dict]:
             and (int(o["n_depth"]) > depth or score_of(o) > s)
             for o in ok
         )
-        if not dominated:
+        # exact ties (verify gives rows sharing a config the same median)
+        # are one point, not two lines
+        if not dominated and (depth, s) not in seen:
+            seen.add((depth, s))
             frontier.append(r)
     return sorted(frontier, key=lambda r: int(r["n_depth"]))
 
@@ -7525,7 +7557,7 @@ def apply_verification(cfg: Config, rows: list[dict], verify: dict):
         if not v:
             continue
         r["tg_tps"], r["pp_tps"] = v["tg_tps"], v["pp_tps"]
-        r["eff_tps"] = objective_tps(cfg, r["pp_tps"], r["tg_tps"])
+        r["eff_tps"] = objective_tps(cfg, r["pp_tps"], r["tg_tps"], r)
         r["verify_n"], r["spread_pct"] = v["n"], v["spread_pct"]
 
 
@@ -8815,6 +8847,19 @@ def selftest() -> bool:
         assert abs(objective_tps(cfg_o, 1000.0, 100.0)
                    - effective_tps(512, 256, 1000.0, 100.0)) < 1e-9
         assert objective_tps(cfg_o, 0.0, 100.0) == 0.0    # blend needs both
+        # a row that missed the cache it was asked to use pays for the re-read
+        # history; one that delivered it, or a workload without reuse, does not
+        _hit = {"reuse": "0.9", "cache_hit": "0.9006", "prompt_tok": "18500"}
+        _miss = dict(_hit, cache_hit="0.0")
+        assert missed_prefill_tokens(cfg_o, _hit) == 0
+        assert missed_prefill_tokens(cfg_o, _miss) == 16650
+        assert missed_prefill_tokens(cfg_o, dict(_miss, reuse="0")) == 0
+        assert missed_prefill_tokens(cfg_o, dict(_miss, cache_hit="")) == 0
+        assert (objective_tps(cfg_o, 1000.0, 100.0, _hit)
+                == objective_tps(cfg_o, 1000.0, 100.0))
+        # Nemotron-Bolt: 0% hit at pp 4816 must now lose to 90% hit at pp 2034
+        assert (objective_tps(cfg_o, 4816.0, 77.9, _miss)
+                < objective_tps(cfg_o, 2034.0, 77.3, _hit))
 
         # --diff and --merge-results dedup (temp CSVs; offline, no binding)
         with tempfile.TemporaryDirectory() as td:
@@ -11955,7 +12000,7 @@ def merge_result_rows(cfg: Config, rows: list[dict],
             if not all(str(r.get(k, "")) != "" for k in cfg.factors):
                 continue               # foreign CSV missing a factor column
             # re-score under the CURRENT --score mode (same rule as --resume)
-            r["eff_tps"] = objective_tps(cfg, r["pp_tps"], r["tg_tps"])
+            r["eff_tps"] = objective_tps(cfg, r["pp_tps"], r["tg_tps"], r)
             r["run_id"] = f"{tag}:{r.get('run_id', '')}"
             k = key(r)
             if k in known and known[k] >= score_of(r):
@@ -12004,7 +12049,7 @@ def report_from_results(cfg: Config, args, ap):
                    for n in names}
     cfg.measure_vram = "vram_mib" in rows[0]
     for r in rows:      # re-score under the CURRENT --score mode
-        r["eff_tps"] = objective_tps(cfg, r["pp_tps"], r["tg_tps"])
+        r["eff_tps"] = objective_tps(cfg, r["pp_tps"], r["tg_tps"], r)
     all_rows = merge_result_rows(cfg, rows, args.merge_results)
     vf = verify_sidecar(path)
     if vf.exists():
@@ -12467,7 +12512,7 @@ def morris_screen(cfg: Config, args, ap, trajectories: int):
                 journal_write(journal, "TRY", "run", f"screen-{rid}", json.dumps(f))
                 res = with_ticker(prefix, args.timeout,
                                   lambda ff=f: drive_one(cfg, ff, args.timeout))
-                eff = objective_tps(cfg, res["pp_tps"], res["tg_tps"])
+                eff = objective_tps(cfg, res["pp_tps"], res["tg_tps"], res)
                 status = res["status"]
                 cache[ckey] = eff
                 print(f"{prefix} -> {status} {cfg.score}={eff:.1f} t/s", flush=True)
@@ -13448,7 +13493,7 @@ def main():
                         r[c] = 0.0
                 # re-score under the CURRENT --score mode, not whatever mode
                 # wrote the CSV — a resumed sweep must fit one objective
-                r["eff_tps"] = objective_tps(cfg, r["pp_tps"], r["tg_tps"])
+                r["eff_tps"] = objective_tps(cfg, r["pp_tps"], r["tg_tps"], r)
                 if r.get("run_id"):
                     rows.append(r)
                     done.add(str(r["run_id"]))
@@ -13625,7 +13670,7 @@ def main():
                                 cfg, ff, ss, args.timeout))
                     else:
                         res = run_with_progress(cfg, f, args.timeout, prefix)
-                    res["eff_tps"] = objective_tps(cfg, res["pp_tps"], res["tg_tps"])
+                    res["eff_tps"] = objective_tps(cfg, res["pp_tps"], res["tg_tps"], res)
                     # `temp_c` is the temperature the measured reps RAN at, not
                     # the one before them. In warm mode those differ by the whole
                     # preheat: a validation sweep recorded 45 °C and 89 °C for
@@ -13715,7 +13760,7 @@ def main():
         prefix = "confirm: " + " ".join(f"{k}={f[k]}" for k in cfg.factors)
         res = with_ticker(prefix, args.timeout,
                           lambda: drive_one(cfg, f, args.timeout))
-        actual = objective_tps(cfg, res["pp_tps"], res["tg_tps"])
+        actual = objective_tps(cfg, res["pp_tps"], res["tg_tps"], res)
         raw = (f"tg={res['tg_tps']:.1f} pp={res['pp_tps']:.1f}"
                if cfg.score == "eff" else f"pp={res['pp_tps']:.1f}")
         print(f"  predicted {cfg.score}: "
