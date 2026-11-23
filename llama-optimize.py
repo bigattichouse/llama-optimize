@@ -5779,20 +5779,34 @@ class ServerSession:
                     _pjudge(done, total, secs, par) if _pfloor > 0 else None)
 
         def _stopped(res):
-            return next((r["aborted"] for r in res if r.get("aborted")), None)
+            # A floor verdict any stream reached outranks a budget expiry in
+            # another: responses come back in slot order, not in the order the
+            # aborts happened, and SLOW vs TIMEOUT must not depend on that.
+            aborts = [r["aborted"] for r in res if r.get("aborted")]
+            return next((a for a in aborts if a != _over),
+                        aborts[0] if aborts else None)
 
-        def _cut(why):
+        def _cut(why, res=(), err_rate=0.0):
             # a floor says SLOW; a spent budget says unmeasured (TIMEOUT)
-            key = "no_result" if why == _over else "too_slow"
-            return {"pp": 0.0, "tg": 0.0, key: why, "problem": None,
-                    "draft": {}, "err_rate": 0.0, "reuse": self.last_reuse,
-                    "prompt_tok": 0}
+            if why == _over:
+                return {"pp": 0.0, "tg": 0.0, "no_result": why,
+                        "problem": None, "draft": {}, "err_rate": err_rate,
+                        "reuse": self.last_reuse, "prompt_tok": 0}
+            # Keep what the streams decoded before the floor stopped them, as
+            # the single-stream path does (SC2): concurrent streams' rates add
+            # up to the aggregate the floors are stated in.
+            tg = sum(max(0.0, (c.get("n", 0) - 1) / c["decode_s"])
+                     for c in ((r.get("client") or {}) for r in res)
+                     if c.get("decode_s"))
+            return {"pp": 0.0, "tg": tg, "too_slow": why, "problem": None,
+                    "draft": {}, "err_rate": err_rate,
+                    "reuse": self.last_reuse, "prompt_tok": 0}
 
         warm_res, _, _ = _measure_round(self.port, prompts, n_gen, par,
                                         _left(timeout, deadline), temp=_temp,
                                         judge=_cjudge, prefill_judge=_cpjudge)
         if _stopped(warm_res):
-            return _cut(_stopped(warm_res))
+            return _cut(_stopped(warm_res), warm_res)
         if warm_res:                            # warmup discarded, ratio kept
             self.cpt = (getattr(self, "cpt", None) or calibrate_chars_per_token(
                 prompts[0], warm_res[0].get("timings", {}).get("prompt_n")))
@@ -5805,12 +5819,15 @@ class ServerSession:
                                                _left(timeout, deadline),
                                                temp=_temp, judge=_cjudge,
                                                prefill_judge=_cpjudge)
-            if _stopped(res):
-                if tps:        # earlier rounds measured; keep them
-                    break
-                return _cut(_stopped(res))
+            # count the round before judging it, so a stopped round's
+            # request failures still reach err_rate
             n_err += failed
             n_sent += par
+            why = _stopped(res)
+            if why:
+                if why == _over and tps:   # budget ran out; earlier rounds stand
+                    break
+                return _cut(why, res, n_err / n_sent)
             timings.extend(r.get("timings", {}) for r in res)
             tg_tok = sum(r.get("timings", {}).get("predicted_n", 0) for r in res)
             pp_tok = sum(r.get("timings", {}).get("prompt_n", 0) for r in res)
@@ -5823,7 +5840,10 @@ class ServerSession:
         # not zero — same as the single-stream path above, which also refuses
         # to call a round that decoded nothing a 0 t/s measurement.
         tg = sum(tps) / len(tps) if tps else 0.0
-        no_result, eos = None, ended_at_eos(timings)
+        # one requested token decodes as predicted_n == 1, which is what an
+        # immediate EOS looks like too -- only ask when more were requested
+        no_result = None
+        eos = ended_at_eos(timings) if n_gen > 1 else None
         if not tps:
             no_result = _over
         elif eos or (tg <= 0 and n_sent > n_err):
@@ -11562,6 +11582,19 @@ def selftest() -> bool:
             assert _m["no_result"] and "budget" in _m["no_result"], _m
             _m = _ss.measure(100, 8, 2, 1, 60, deadline=time.time() + 60)
             assert _m["no_result"] is None and _m["tg"] == 16.0, _m
+            # --n-gen 1 decodes predicted_n == 1 without being an EOS
+            globals()["_measure_round"] = _fake([_tok(1)] * 2)
+            _m = _ss.measure(100, 1, 2, 1, 60, deadline=time.time() + 60)
+            assert _m["no_result"] is None and _m["tg"] == 2.0, _m
+            # a floor abort in one slot outranks a budget expiry in another,
+            # and keeps the rate the streams decoded before it
+            _slow = {"aborted": "too slow", "timings": {},
+                     "client": {"n": 11, "decode_s": 2.0}}
+            globals()["_measure_round"] = _fake([
+                {"aborted": "the budget expired before any round finished",
+                 "timings": {}}, _slow])
+            _m = _ss.measure(100, 8, 2, 1, 60, deadline=time.time() + 60)
+            assert _m.get("too_slow") == "too slow" and _m["tg"] == 5.0, _m
         finally:
             globals()["_measure_round"] = _real_round
 
