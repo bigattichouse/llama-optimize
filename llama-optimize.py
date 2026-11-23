@@ -6914,9 +6914,27 @@ def slow_skip_reason(factors, rows: list[dict], f: dict,
     the most expensive row in the design. The OK elsewhere is what makes it
     evidence about the level rather than about the box. Only rows where the
     factor could act count, and skipped rows are not evidence: one skip must not
-    beget the next."""
+    beget the next.
+
+    Nor is a level blamed when another factor explains the same SLOW rows just
+    as well — every one of them sits at a level of it that has never been OK.
+    Two rows are not the "several partners" balance relies on: a gpt-oss sweep
+    retired threads=12 and batch_ratio=4 because both their SLOW rows had
+    experts on the CPU (ncmoe>0), and 21 of 27 rows went unmeasured."""
     if min_rows <= 0:
         return None
+    ok_levels: dict = {}
+    for r in rows:
+        if measured_ok([r]):
+            for n in factors:
+                # an OK row where the factor could not act clears nothing
+                if n in r and is_active(n, r) and not is_inert(n, r):
+                    ok_levels.setdefault(n, set()).add(str(r[n]))
+
+    def explains(y: str, slow: list[dict]) -> bool:
+        return all(y in r and is_active(y, r) and not is_inert(y, r)
+                   and str(r[y]) not in ok_levels.get(y, ()) for r in slow)
+
     for name in factors:
         if name not in f or not is_active(name, f) or is_inert(name, f):
             continue
@@ -6927,11 +6945,12 @@ def slow_skip_reason(factors, rows: list[dict], f: dict,
                 continue
             if str(r[name]) == lvl:
                 if r.get("status") != "SKIP_SLOW":
-                    here.append(str(r.get("status", "")))
+                    here.append(r)
             elif measured_ok([r]):
                 ok_elsewhere = True
         if (len(here) >= min_rows and ok_elsewhere
-                and all(st == "SLOW" for st in here)):
+                and all(r.get("status") == "SLOW" for r in here)
+                and not any(explains(y, here) for y in factors if y != name)):
             return (f"{name}={lvl}: all {len(here)} earlier rows at this level "
                     f"were SLOW while another level was OK")
     return None
@@ -10004,6 +10023,20 @@ def selftest() -> bool:
         # --slow-skip 0 turns it off
         assert slow_skip_reason(_fx, _two_slow, {"ngl": "0", "kv_type": "f16"},
                                 min_rows=0) is None
+        # confounded: both SLOW rows at threads=12 also had ncmoe>0, never OK
+        # anywhere -- ncmoe explains them as well, so neither is blamed (the
+        # gpt-oss sweep that skipped 21/27 rows on exactly this)
+        _gx = {"threads": ["8", "12", "32"], "ncmoe": ["0", "12", "24"]}
+        _g = lambda t, n, st, tg=5.0: {"threads": t, "ncmoe": n, "status": st,
+                                       "tg_tps": tg, "eff_tps": tg}
+        _conf = [_g("32", "12", "SLOW"), _g("12", "12", "SLOW"),
+                 _g("8", "0", "OK", 95.0), _g("12", "24", "SLOW")]
+        assert slow_skip_reason(_gx, _conf, {"threads": "12", "ncmoe": "0"}) is None
+        assert slow_skip_reason(_gx, _conf, {"threads": "8", "ncmoe": "12"}) is None
+        # ...but once threads=12 and 32 have each been OK, ncmoe=12 is the cause
+        _clear = _conf + [_g("12", "0", "OK", 90.0), _g("32", "0", "OK", 90.0)]
+        _why = slow_skip_reason(_gx, _clear, {"threads": "8", "ncmoe": "12"})
+        assert _why and _why.startswith("ncmoe=12"), _why
         # ...and rows where the factor could not act carry nothing about it
         _cond = next(n for n, s_ in FACTORS.items() if s_.get("active_when"))
         _gate, _live = FACTORS[_cond]["active_when"]
