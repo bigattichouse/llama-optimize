@@ -2360,11 +2360,11 @@ def build_factors(cfg: Config):
         factors["spec_type"] = _spec_levels
     elif cfg.driver == "server" and cfg.emit_mtp and cfg.hw.get("n_nextn", 0) > 0:
         factors["mtp"] = ["1", "0"]
-        factors["spec_n_max"] = ["1", "2", "3", "4", "6"]
+        factors["spec_n_max"] = thin_to(["1", "2", "3", "4", "6"], nlv)
         # relative: n_min = floor(frac * n_max), so n_min <= n_max always. 0.0 is
         # llama.cpp's own default (common/common.h:326) and 1.0 pins them equal.
         factors["spec_n_min_frac"] = ["0.0", "0.5", "1.0"]
-        factors["spec_p_min"] = ["0.0", "0.25", "0.5", "0.75", "0.9"]
+        factors["spec_p_min"] = thin_to(["0.0", "0.25", "0.5", "0.75", "0.9"], nlv)
         factors["spec_p_split"] = ["0.1", "0.3", "0.5"]
     # llama.cpp toggles we were merely inheriting the defaults of. Each is a
     # documented behaviour switch with no universal answer -- whether repacking
