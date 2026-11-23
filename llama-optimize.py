@@ -5168,7 +5168,9 @@ def _completion(port: int, prompt, n_gen: int, timeout: int, cache: bool = False
     return out
 
 
-def _measure_round(port: int, prompts, n_gen: int, par: int, timeout: int, cache=False):
+def _measure_round(port: int, prompts, n_gen: int, par: int, timeout: int,
+                   cache=False, judge=None, prefill_judge=None,
+                   temp: float = DEFAULT_TEMPERATURE):
     """One round of `par` concurrent completions.
 
     Returns (responses, n_failed, wall_s) — responses only for requests that
@@ -5185,7 +5187,8 @@ def _measure_round(port: int, prompts, n_gen: int, par: int, timeout: int, cache
     ok, failed = [], 0
 
     def one(i):
-        return _completion(port, prompts[i % len(prompts)], n_gen, timeout, cache)
+        return _completion(port, prompts[i % len(prompts)], n_gen, timeout, cache,
+                           temp=temp, judge=judge, prefill_judge=prefill_judge)
 
     with ThreadPoolExecutor(max_workers=par) as ex:
         w0 = time.time()
@@ -5498,6 +5501,30 @@ class ServerSession:
         self.last_reuse = achieved_reuse(prompts)
         prompt = prompts[0]
         n_err = 0
+        # L3: judge a request WHILE it decodes. After --tgs-timeout seconds of
+        # decode the average rate is a real measurement, and a config below
+        # --min-tgs has answered the question — however long --n-gen is. Not
+        # under speculation, for C3b's reason. `k` scales one stream's rate to
+        # the aggregate the floors are stated in: concurrent slots share the
+        # GPU, so each sees about 1/par of it.
+        _floor = float(getattr(self.cfg, "min_tgs", 0.0) or 0.0)
+        _grace = float(getattr(self.cfg, "slow_grace", 60) or 60)
+
+        def _judge(n, dec_s, k=1):
+            if dec_s >= _grace and n > 1 and k * (n - 1) / dec_s < _floor:
+                return (f"decoded {n} tokens in {dec_s:.0f}s after prefill "
+                        f"({k * (n - 1) / dec_s:.1f} t/s), under --min-tgs "
+                        f"{_floor:.1f}; stopped there")
+            return None
+        _pfloor = float(getattr(self.cfg, "min_pps", 0.0) or 0.0)
+
+        def _pjudge(done, total, secs, k=1):
+            # --min-pps answered DURING prefill, after the same grace
+            if secs >= _grace and done > 0 and k * done / secs < _pfloor:
+                return (f"prefilled {done}/{total} tokens in {secs:.0f}s "
+                        f"({k * done / secs:.1f} t/s), under --min-pps "
+                        f"{_pfloor:.1f}; stopped there")
+            return None
         if par == 1:
             # Single stream: the warm request prefills (real pp + primes the KV
             # cache), then each rep sends the NEXT prompt in the battery. At
@@ -5516,28 +5543,6 @@ class ServerSession:
             warm_tg = 0.0
             overhead = 0.0
             warm = None
-            # L3: judge the warm request WHILE it decodes. After --tgs-timeout
-            # seconds of decode the average rate is a real measurement, and a
-            # config below --min-tgs has answered the question — however long
-            # --n-gen is. Not under speculation, for C3b's reason.
-            _floor = float(getattr(self.cfg, "min_tgs", 0.0) or 0.0)
-            _grace = float(getattr(self.cfg, "slow_grace", 60) or 60)
-
-            def _judge(n, dec_s):
-                if dec_s >= _grace and n > 1 and (n - 1) / dec_s < _floor:
-                    return (f"decoded {n} tokens in {dec_s:.0f}s after prefill "
-                            f"({(n - 1) / dec_s:.1f} t/s), under --min-tgs "
-                            f"{_floor:.1f}; stopped there")
-                return None
-            _pfloor = float(getattr(self.cfg, "min_pps", 0.0) or 0.0)
-
-            def _pjudge(done, total, secs):
-                # --min-pps answered DURING prefill, after the same grace
-                if secs >= _grace and done > 0 and done / secs < _pfloor:
-                    return (f"prefilled {done}/{total} tokens in {secs:.0f}s "
-                            f"({done / secs:.1f} t/s), under --min-pps "
-                            f"{_pfloor:.1f}; stopped there")
-                return None
             try:
                 _w0 = time.time()
                 LIVE.set(force=True, step="warm-up request")
@@ -5758,8 +5763,36 @@ class ServerSession:
         # the streams. Warmup once, then average per-round throughput over reps.
         # These rates are computed from our own wall clock already, so they
         # cannot exceed it by construction — no cross-check needed.
+        #
+        # The floors and the config deadline are judged per stream while the
+        # requests run. Without them a slow concurrent config ran on for up to
+        # LOAD_HARD_CAP_FACTOR x --timeout of prefill plus a decode timeout per
+        # request (27 minutes on a --timeout 600 run), floors or not.
+        _over = "the budget expired before any round finished"
+
+        def _cjudge(n, dec_s):
+            return (_over if _expired(deadline) else
+                    _judge(n, dec_s, par) if _floor > 0 and not spec else None)
+
+        def _cpjudge(done, total, secs):
+            return (_over if _expired(deadline) else
+                    _pjudge(done, total, secs, par) if _pfloor > 0 else None)
+
+        def _stopped(res):
+            return next((r["aborted"] for r in res if r.get("aborted")), None)
+
+        def _cut(why):
+            # a floor says SLOW; a spent budget says unmeasured (TIMEOUT)
+            key = "no_result" if why == _over else "too_slow"
+            return {"pp": 0.0, "tg": 0.0, key: why, "problem": None,
+                    "draft": {}, "err_rate": 0.0, "reuse": self.last_reuse,
+                    "prompt_tok": 0}
+
         warm_res, _, _ = _measure_round(self.port, prompts, n_gen, par,
-                                        _left(timeout, deadline))
+                                        _left(timeout, deadline), temp=_temp,
+                                        judge=_cjudge, prefill_judge=_cpjudge)
+        if _stopped(warm_res):
+            return _cut(_stopped(warm_res))
         if warm_res:                            # warmup discarded, ratio kept
             self.cpt = (getattr(self, "cpt", None) or calibrate_chars_per_token(
                 prompts[0], warm_res[0].get("timings", {}).get("prompt_n")))
@@ -5769,7 +5802,13 @@ class ServerSession:
             if _expired(deadline):
                 break
             res, failed, wall = _measure_round(self.port, prompts, n_gen, par,
-                                               _left(timeout, deadline))
+                                               _left(timeout, deadline),
+                                               temp=_temp, judge=_cjudge,
+                                               prefill_judge=_cpjudge)
+            if _stopped(res):
+                if tps:        # earlier rounds measured; keep them
+                    break
+                return _cut(_stopped(res))
             n_err += failed
             n_sent += par
             timings.extend(r.get("timings", {}) for r in res)
@@ -5780,7 +5819,17 @@ class ServerSession:
             # for having done less work.
             tps.append(tg_tok / wall if wall > 0 else 0.0)
             pps.append(pp_tok / wall if wall > 0 else 0.0)
-        return {"pp": sum(pps) / len(pps), "tg": sum(tps) / len(tps),
+        # The warmup can spend the whole budget; then no round ran. Unmeasured,
+        # not zero — same as the single-stream path above, which also refuses
+        # to call a round that decoded nothing a 0 t/s measurement.
+        tg = sum(tps) / len(tps) if tps else 0.0
+        no_result, eos = None, ended_at_eos(timings)
+        if not tps:
+            no_result = _over
+        elif eos or (tg <= 0 and n_sent > n_err):
+            no_result = eos or "every round reported 0 t/s"
+        return {"pp": sum(pps) / len(pps) if pps else 0.0,
+                "tg": tg, "no_result": no_result,
                 "problem": None, "draft": _draft_totals(timings),
                 "err_rate": n_err / n_sent if n_sent else 0.0,
                 "reuse": self.last_reuse,
@@ -11480,6 +11529,41 @@ def selftest() -> bool:
         assert PROFILES["single"]["prefix_reuse"] == 0.0
         assert PROFILES["multi"]["prefix_reuse"] == 0.0
         assert PROFILES["agents"]["prefix_reuse"] == 0.9
+
+        # --- concurrent server path: floors stop it, a spent budget and an
+        # all-EOS round are not measurements (it crashed, overran, or wrote
+        # OK/0 t/s on each of these) ---
+        _real_round = _measure_round
+        _ss = object.__new__(ServerSession)
+        _ss.cfg = Config(model=Path("m.gguf"), llama_bench=Path("b"),
+                         llama_server=Path("s"), array="auto", ctx_floor=0,
+                         driver="server")
+        _ss.cfg.min_tgs = 10.0
+        _ss.port, _ss.calibrate = 0, lambda _t: None
+        _seen = {}
+
+        def _fake(resps):
+            def _round(*_a, **kw):
+                _seen.update(kw)
+                return resps, 0, 1.0
+            return _round
+        _tok = lambda n: {"timings": {"predicted_n": n, "prompt_n": 100}}
+        try:
+            globals()["_measure_round"] = _fake([{"aborted": "too slow",
+                                                  "timings": {}}] * 2)
+            _m = _ss.measure(100, 8, 2, 1, 60, deadline=time.time() + 60)
+            assert _m.get("too_slow") == "too slow", _m
+            assert _seen.get("judge") and _seen.get("prefill_judge"), _seen
+            globals()["_measure_round"] = _fake([_tok(1)] * 2)
+            _m = _ss.measure(100, 8, 2, 1, 60, deadline=time.time() + 60)
+            assert _m["no_result"] and "EOS" in _m["no_result"], _m
+            globals()["_measure_round"] = _fake([_tok(8)] * 2)
+            _m = _ss.measure(100, 8, 2, 1, 60, deadline=time.time() - 1)
+            assert _m["no_result"] and "budget" in _m["no_result"], _m
+            _m = _ss.measure(100, 8, 2, 1, 60, deadline=time.time() + 60)
+            assert _m["no_result"] is None and _m["tg"] == 16.0, _m
+        finally:
+            globals()["_measure_round"] = _real_round
 
         # --- concurrency / kv_unified (docs/concurrency-kv-design.md) ---
         # llama.cpp couples these: auto means 4 slots AND unified KV, and ANY
