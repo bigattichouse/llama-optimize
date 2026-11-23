@@ -38,6 +38,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -155,6 +156,7 @@ def find_taguchi_binding() -> Path:
 
 
 def find_robust_binary(name: str) -> Path:
+    name += EXE_SUFFIX                      # MinGW/MSYS2 builds emit .exe
     p = SUBMODULE_DIR / "build" / "bin" / name
     if p.exists():
         return p
@@ -274,8 +276,38 @@ def detect_physical_cores() -> int:
             return len(pairs)
     except OSError:
         pass
-    # Fallback: assume 2 threads/core
+    win = _windows_physical_cores()
+    if win:
+        return win
+    # Fallback: assume 2 threads/core. Wrong on hybrid CPUs (E-cores have no
+    # SMT), which is why Windows asks the OS above instead.
     return max(1, detect_logical_cores() // 2)
+
+
+def _windows_physical_cores() -> int | None:
+    """Core count from GetLogicalProcessorInformationEx(RelationProcessorCore):
+    one variable-size record per physical core, P- and E-cores alike."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        n = ctypes.c_ulong(0)
+        k32.GetLogicalProcessorInformationEx(0, None, ctypes.byref(n))
+        if not n.value:
+            return None
+        buf = ctypes.create_string_buffer(n.value)
+        if not k32.GetLogicalProcessorInformationEx(0, buf, ctypes.byref(n)):
+            return None
+        raw, count, off = buf.raw, 0, 0
+        while off + 8 <= n.value:            # {DWORD Relationship, DWORD Size, ...}
+            size = int.from_bytes(raw[off + 4:off + 8], "little")
+            if size <= 0:
+                break
+            count, off = count + 1, off + size
+        return count or None
+    except (AttributeError, OSError, ValueError):
+        return None
 
 
 def detect_numa_nodes() -> int:
@@ -392,7 +424,7 @@ def cpu_model_name() -> str | None:
     A plain file read, no subprocess. `lscpu` would be tidier and is one more
     thing to be missing in a container."""
     try:
-        for line in Path("/proc/cpuinfo").read_text().splitlines():
+        for line in Path("/proc/cpuinfo").read_text(encoding="utf-8").splitlines():
             if line.startswith(("model name", "Model name")):
                 return line.split(":", 1)[1].strip() or None
             # aarch64 has no "model name"; this is the closest stable analogue
@@ -408,11 +440,31 @@ def system_ram_mib() -> int | None:
     CPU-resident layers can do, so a row that offloads to host memory is not
     comparable across machines without it."""
     try:
-        for line in Path("/proc/meminfo").read_text().splitlines():
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
             if line.startswith("MemTotal:"):
                 return int(line.split()[1]) // 1024
     except (OSError, IndexError, ValueError):
         pass
+    try:                                   # macOS / other POSIX
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") // 2**20
+    except (AttributeError, OSError, ValueError):
+        pass
+    if os.name == "nt":                    # no /proc, no sysconf
+        import ctypes
+
+        class _MemStatus(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong)] + [
+                (n, ctypes.c_ulonglong) for n in (
+                    "ullTotalPhys", "ullAvailPhys", "ullTotalPageFile",
+                    "ullAvailPageFile", "ullTotalVirtual", "ullAvailVirtual",
+                    "ullAvailExtendedVirtual")]
+        st = _MemStatus(dwLength=ctypes.sizeof(_MemStatus))
+        try:
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                return int(st.ullTotalPhys) // 2**20
+        except (AttributeError, OSError):
+            pass
     return None
 
 
@@ -435,7 +487,7 @@ def backend_version(backend: str) -> str | None:
             # written by the ROCm installer; a plain file read, no subprocess
             for path in ("/opt/rocm/.info/version", "/opt/rocm/.info/version-dev"):
                 if Path(path).exists():
-                    ver = Path(path).read_text().strip().split("-")[0] or None
+                    ver = Path(path).read_text(encoding="utf-8").strip().split("-")[0] or None
                     break
         elif key == "cuda":
             # nvidia-smi's header carries the CUDA runtime the driver supports,
@@ -4207,7 +4259,7 @@ class LiveStatus:
             line = self.summary() + "\n"
         try:
             tmp = Path(str(self.path) + ".tmp")
-            tmp.write_text(line)
+            tmp.write_text(line, encoding="utf-8")
             os.replace(tmp, self.path)
         except OSError:
             pass                      # a status file is a courtesy, not data
@@ -5953,7 +6005,7 @@ def _drain_lines(stream, sink, marks: dict | None = None) -> None:
     tee = None
     if marks is not None and SERVER_LOG_PATH is not None:
         try:
-            tee = open(SERVER_LOG_PATH, "a")
+            tee = open(SERVER_LOG_PATH, "a", encoding="utf-8")
             tee.write(f"\n===== server start {time.strftime('%H:%M:%S')} =====\n")
         except OSError:
             tee = None
@@ -6064,7 +6116,7 @@ def disk_read_mib_s(path, mib: int = 1024, chunk_mib: int = 16) -> float | None:
 
 def load_rates(path: Path | None = None) -> dict:
     try:
-        got = json.loads((path or LOAD_RATES_PATH).read_text())
+        got = json.loads((path or LOAD_RATES_PATH).read_text(encoding="utf-8"))
         return {**LOAD_RATE_PRIORS, **{k: v for k, v in got.items()
                                        if k in LOAD_RATE_PRIORS}}
     except (OSError, ValueError):
@@ -6138,7 +6190,7 @@ def read_journal(path: Path):
     tried_load, ok_load, tried_run = {}, set(), {}
     if not path.exists():
         return tried_load, ok_load, tried_run
-    for line in path.read_text().splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         p = line.split("\t")
         if len(p) >= 3 and p[0] == "TRY" and p[1] == "load":
             try:
@@ -6655,7 +6707,7 @@ def write_fingerprint(cfg: Config, results: Path) -> Path | None:
     should not be failed by a metadata file."""
     path = fingerprint_path(results)
     try:
-        path.write_text(json.dumps(fingerprint(cfg), indent=2) + "\n")
+        path.write_text(json.dumps(fingerprint(cfg), indent=2) + "\n", encoding="utf-8")
     except OSError:
         return None
     return path
@@ -7262,7 +7314,7 @@ th{{color:#888;font-weight:600}} tr.bad{{opacity:.5}}
 <table><tr>{par_head}</tr>{par_rows}</table>
 <h2>All runs</h2><table><tr>{head}</tr>{body}</table>
 """
-    path.write_text(doc)
+    path.write_text(doc, encoding="utf-8")
     print(f"\nwrote HTML report: {path}")
 
 
@@ -8823,7 +8875,7 @@ def selftest() -> bool:
 
             def wcsv(name, rws):
                 p = Path(td) / name
-                with open(p, "w", newline="") as fh:
+                with open(p, "w", newline="", encoding="utf-8") as fh:
                     w = csv.DictWriter(fh, fieldnames=cols)
                     w.writeheader()
                     w.writerows(rws)
@@ -9234,7 +9286,7 @@ def selftest() -> bool:
         with tempfile.TemporaryDirectory() as _td:
             _rel = Path(_td) / "build" / "bin" / "Release"
             _rel.mkdir(parents=True)
-            (_rel / "llama-server.exe").write_text("")
+            (_rel / "llama-server.exe").write_text("", encoding="utf-8")
             assert resolve_binary("llama-server", None, Path(_td),
                                   exe=".exe") == _rel / "llama-server.exe"
             # and nothing changes where there is no suffix to add
@@ -9366,7 +9418,7 @@ def selftest() -> bool:
             save_load_rates(_r2, _lp)
             assert round(load_rates(_lp)["disk_mib_s"], 3) == round(
                 _r2["disk_mib_s"], 3)
-            _lp.write_text("not json")
+            _lp.write_text("not json", encoding="utf-8")
             assert load_rates(_lp) == LOAD_RATE_PRIORS
             # the page cache, asked of a real file
             _f = Path(_td) / "blob"
@@ -9524,12 +9576,12 @@ def selftest() -> bool:
             _lv.set(force=True, config="run 3: ngl=99", step="rep 2/3",
                     phase="decoding", tokens=57, rate=17.84,
                     started=time.time() - 75)
-            _txt = (Path(_td) / "r.csv.live").read_text()
+            _txt = (Path(_td) / "r.csv.live").read_text(encoding="utf-8")
             assert _txt.startswith("run 3: ngl=99 | rep 2/3 | decoding | "
                                    "57 tok | 17.8 t/s | 1m1"), _txt
             # throttled: a burst of per-token updates is not a burst of writes
             _lv.set(tokens=58)
-            assert "57 tok" in (Path(_td) / "r.csv.live").read_text()
+            assert "57 tok" in (Path(_td) / "r.csv.live").read_text(encoding="utf-8")
             assert _lv.fields["tokens"] == 58      # ...but the ticker sees it
             # no path: feeds the ticker only, writes nothing
             LiveStatus().set(force=True, phase="x")
@@ -9541,7 +9593,7 @@ def selftest() -> bool:
                              collections.deque(), {})
             finally:
                 SERVER_LOG_PATH = _saved
-            _sl = (Path(_td) / "r.server.log").read_text()
+            _sl = (Path(_td) / "r.server.log").read_text(encoding="utf-8")
             assert "===== server start" in _sl and "constructing" in _sl
             # the disk probe: real throughput, or None where O_DIRECT cannot
             _blob = Path(_td) / "blob"
@@ -11447,6 +11499,13 @@ def selftest() -> bool:
         # the category mix is drawn from the banks, and the weights sum to 1
         assert abs(sum(w for _, w, _ in PROMPT_BANKS) - 1.0) < 1e-9
 
+        assert system_ram_mib(), "total RAM must be readable on this OS"
+        # physical cores come from the whole machine (/proc/cpuinfo, Windows
+        # API); detect_logical_cores() is this process's affinity set, which
+        # taskset or a container can make smaller -- compare like with like
+        assert 0 < detect_physical_cores() <= (os.cpu_count() or 1)
+        assert detect_logical_cores() > 0
+
         # --- constants that were ours, now derived (docs/constants-audit.md) ---
         # C-B: chars-per-token is measured from llama.cpp's own prompt_n, not
         # assumed to be 4. Getting this wrong means the sweep tests a different
@@ -11675,12 +11734,14 @@ def selftest() -> bool:
             hp = Path(td) / "r.html"
             with contextlib.redirect_stdout(io.StringIO()):
                 write_html_report(cfg_pv, pv_rows, hp, pv_probe)
-                h = hp.read_text()
+                h = hp.read_text(encoding="utf-8")
                 assert "Probed ceiling" in h and "262,144" in h
                 write_html_report(cfg_pv, pv_rows, hp)
-            assert "Probed ceiling" not in hp.read_text()
+            assert "Probed ceiling" not in hp.read_text(encoding="utf-8")
     except AssertionError as e:
-        print(f"selftest FAILED: {e}")
+        # bare asserts stringify to "", so say WHERE (the traceback's last
+        # frame) or a failure is unlocatable without a debugger
+        print(f"selftest FAILED: {e}", traceback.format_exc(limit=-1), sep="\n")
         return False
 
     # --- OOM pruning: the fit verdict itself ---
@@ -11690,7 +11751,7 @@ def selftest() -> bool:
     # now rides on the same verdict to shape the ngl grid.
     with tempfile.TemporaryDirectory() as _td:
         _fp = Path(_td) / "llama-fit-params"
-        _fp.write_text("#!/bin/sh\n")
+        _fp.write_text("#!/bin/sh\n", encoding="utf-8")
         cfg_fit = Config(model=Path("m.gguf"), llama_bench=Path("b"),
                          llama_server=Path("s"), array="auto", ctx_floor=8192,
                          driver="server", fit_params=_fp,
@@ -11879,7 +11940,9 @@ def selftest() -> bool:
             fit_params = Path("fp")
         assert _fit_cache_key(_FC, base, "bench") != _fit_cache_key(_FC2, base, "bench")
     except AssertionError as e:
-        print(f"selftest FAILED: {e}")
+        # bare asserts stringify to "", so say WHERE (the traceback's last
+        # frame) or a failure is unlocatable without a debugger
+        print(f"selftest FAILED: {e}", traceback.format_exc(limit=-1), sep="\n")
         return False
 
     print("selftest: all checks passed")
@@ -11901,7 +11964,7 @@ def load_results_csv(path: Path, factors: dict) -> list[dict]:
     rows = []
     if not path.exists():
         return rows
-    with open(path, newline="") as fh:
+    with open(path, newline="", encoding="utf-8") as fh:
         for r in csv.DictReader(fh):
             for c in ("pp_tps", "tg_tps", "eff_tps", "secs"):
                 try:
@@ -12009,7 +12072,7 @@ def report_from_results(cfg: Config, args, ap):
     vf = verify_sidecar(path)
     if vf.exists():
         try:
-            apply_verification(cfg, all_rows, json.loads(vf.read_text()))
+            apply_verification(cfg, all_rows, json.loads(vf.read_text(encoding="utf-8")))
             print(f"applied pick-verification medians from {vf.name}")
         except (json.JSONDecodeError, OSError) as e:
             print(f"(ignoring unreadable {vf.name}: {e})")
@@ -12017,7 +12080,7 @@ def report_from_results(cfg: Config, args, ap):
     pf = probe_sidecar(path)
     if pf.exists():
         try:
-            probe = json.loads(pf.read_text())
+            probe = json.loads(pf.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as e:
             print(f"(ignoring unreadable {pf.name}: {e})")
     print(f"report-only: {len(rows)} row(s) from {path} (no GPU used)"
@@ -12424,7 +12487,7 @@ def morris_screen(cfg: Config, args, ap, trajectories: int):
             lines.append(f"  {name}: {lo:g}, {hi:g}")
     seed = args.seed if args.seed is not None else 42
     lines += [f"trajectories: {trajectories}", "grid_levels: 4", f"seed: {seed}"]
-    space_path.write_text("\n".join(lines) + "\n")
+    space_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     out = subprocess.run([str(morris), "sample", str(space_path)],
                          capture_output=True, text=True)
@@ -12449,8 +12512,8 @@ def morris_screen(cfg: Config, args, ap, trajectories: int):
         return f
 
     cache, rows = {}, []
-    journal = open(journal_path, "a")
-    fh = open(res_path, "w", newline="")
+    journal = open(journal_path, "a", encoding="utf-8")
+    fh = open(res_path, "w", newline="", encoding="utf-8")
     w = csv.writer(fh)
     w.writerow(["run_id", "eff_tps"])
     fh.flush()
@@ -13111,14 +13174,21 @@ def main():
     # settle for that whole pass.
     resolve_thermal_baseline(args)
 
+    # Before any probe launches it (the FA probe, ctx-scan, screen all do), or a
+    # missing binary surfaces as a raw FileNotFoundError traceback.
+    needed = cfg.llama_server if cfg.driver == "server" else cfg.llama_bench
+    if args.run and not needed.exists():
+        ap.error(
+            f"{needed.name} not found (looked at: {needed}).\n"
+            "  Need the path to your llama.cpp build. Pass --llama-cpp "
+            "/path/to/llama.cpp\n  (its build/bin dir), set $LLAMA_CPP, put it on "
+            f"$PATH, or pass --{needed.stem} directly.")
+
     # --ctx-scan: probe the physical ceiling first, then make the context axis
     # fractions of it, so the sweep spans the full usable range on THIS hardware.
     if args.ctx_scan and not (os.environ.get("LLAMA_OPTIMIZE_CHILD")):
         if not args.run:
             ap.error("--ctx-scan needs --run")
-        needed = cfg.llama_server if cfg.driver == "server" else cfg.llama_bench
-        if not needed.exists():
-            ap.error(f"{needed.name} not found ({needed}); pass --llama-cpp")
         # base config = full offload + most context-efficient allowed KV (lossiest
         # allowed = smallest KV = furthest reach) + first level of the rest
         base = {k: v[0] for k, v in cfg.factors.items()}
@@ -13379,13 +13449,6 @@ def main():
             print("Not run. Copy the command above when you are ready.")
         return
 
-    needed = cfg.llama_server if cfg.driver == "server" else cfg.llama_bench
-    if not needed.exists():
-        ap.error(
-            f"{needed.name} not found (looked at: {needed}).\n"
-            "  Need the path to your llama.cpp build. Pass --llama-cpp "
-            "/path/to/llama.cpp\n  (its build/bin dir), set $LLAMA_CPP, put it on "
-            f"$PATH, or pass --{needed.name} directly.")
 
     # preflight: confirm the binary actually runs (catches missing GPU libs / a
     # wrong build) in a couple of seconds, instead of failing deep in the sweep.
@@ -13439,7 +13502,7 @@ def main():
     # Assumes resume uses the same factors/array so run_ids line up.
     rows, done = [], set()
     if args.resume and args.results.exists():
-        with open(args.results, newline="") as fh:
+        with open(args.results, newline="", encoding="utf-8") as fh:
             for r in csv.DictReader(fh):
                 for c in ("pp_tps", "tg_tps", "eff_tps", "secs"):
                     try:
@@ -13489,7 +13552,7 @@ def main():
                       f"cache bypassed) — {(_pc[1] - _pc[0]) / 1024:.1f} GiB of "
                       f"the model is not cached, ~{(_pc[1] - _pc[0]) / _d:.0f}s "
                       f"to read")
-    fh = open(args.results, "w" if fresh else "a", newline="")
+    fh = open(args.results, "w" if fresh else "a", newline="", encoding="utf-8")
     writer = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
     if fresh:
         writer.writeheader()
@@ -13524,7 +13587,7 @@ def main():
                   "on a prior run — suspected machine crash/hang.")
             print(f"   Marked CRASH and NOT retrying: runs {ids}")
             print("   (use --retry-crashed to attempt them again once addressed)")
-    journal = open(journal_path, "w" if fresh else "a")
+    journal = open(journal_path, "w" if fresh else "a", encoding="utf-8")
 
     # Execution plan. The server driver groups configs that share load-time
     # params (only the request — prompt length via n_depth — differs) so one
@@ -13685,7 +13748,7 @@ def main():
         verify = verify_picks(cfg, all_rows, args.verify_picks, args.timeout,
                               thermal_baseline)
         if verify:
-            verify_sidecar(args.results).write_text(json.dumps(verify, indent=1))
+            verify_sidecar(args.results).write_text(json.dumps(verify, indent=1), encoding="utf-8")
             apply_verification(cfg, all_rows, verify)
 
     # Stage-2 probe runs BEFORE the report so its ceiling appears alongside
@@ -13695,7 +13758,7 @@ def main():
     if not args.no_probe and args.ctx_size is None:
         probe = run_probe_stage(cfg, all_rows, args.timeout, thermal_baseline)
         if probe:
-            probe_sidecar(args.results).write_text(json.dumps(probe, indent=1))
+            probe_sidecar(args.results).write_text(json.dumps(probe, indent=1), encoding="utf-8")
 
     report(cfg, all_rows, probe)
     opt, predicted = taguchi_effects(cfg, exp, rows)
