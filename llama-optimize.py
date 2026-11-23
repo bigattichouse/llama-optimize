@@ -4524,6 +4524,42 @@ def calibrate_chars_per_token(prompt: str, prompt_n) -> float | None:
     return ratio if 1.0 <= ratio <= 20.0 else None
 
 
+# How far a built prompt may miss its token target before it is rebuilt. The
+# session's -c carries a fixed 256-token margin, so the error has to stay well
+# inside that at every depth, not just at the depth the ratio was measured at.
+PROMPT_SIZE_TOLERANCE = 0.005
+
+
+def _token_count(port: int, text: str, timeout) -> int | None:
+    """Tokens `text` becomes on this server (llama-server /tokenize), or None
+    when the endpoint is missing or fails -- the estimate then stands."""
+    body = json.dumps({"content": text, "add_special": True}).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/tokenize", data=body,
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=max(1, int(timeout or 30))) as r:
+            toks = json.loads(r.read()).get("tokens")
+        return len(toks) if isinstance(toks, list) and toks else None
+    except (urllib.error.URLError, OSError, ValueError, AttributeError):
+        return None
+
+
+def resized_chars_per_token(prompt: str, n_tokens, target: int) -> float | None:
+    """chars-per-token measured on a prompt the battery actually built, when
+    that prompt missed `target` by more than PROMPT_SIZE_TOLERANCE; else None.
+
+    `calibrate` measures the ratio on a 4 kB probe and the battery extrapolates
+    it to the full prompt. On gpt-oss-20b at depth 32768 that came out 1.7%
+    long (35,402 tokens for a 34,816 target), past the 256-token margin in -c,
+    and llama-server rejected every request of the sweep."""
+    if not n_tokens or target <= 0:
+        return None
+    if abs(n_tokens - target) <= target * PROMPT_SIZE_TOLERANCE:
+        return None
+    return calibrate_chars_per_token(prompt, n_tokens)
+
+
 # A fixed corpus cannot fill a long prompt without repeating itself, and n-gram
 # speculation feeds on that repetition. The literal banks above total ~1.5k
 # characters; the `agents` profile asks for 32k-character prompts, so every one
@@ -5495,6 +5531,17 @@ class ServerSession:
         prompts = prompt_battery(prompt_len, n_req, reuse,
                                  chars_per_token=getattr(self, "cpt", None),
                                  task=getattr(self.cfg, "task", None))
+        # The probe's ratio, extrapolated to a deep prompt, drifts by a percent
+        # or two -- more than -c's margin at 32k. Count the real prompt once and
+        # rebuild at the measured ratio, which later configs then inherit.
+        _cpt = resized_chars_per_token(
+            prompts[0], _token_count(self.port, prompts[0],
+                                     _left(timeout, deadline)), prompt_len)
+        if _cpt:
+            self.cpt = _cpt
+            prompts = prompt_battery(prompt_len, n_req, reuse,
+                                     chars_per_token=_cpt,
+                                     task=getattr(self.cfg, "task", None))
         self.last_reuse = achieved_reuse(prompts)
         prompt = prompts[0]
         n_err = 0
@@ -10714,7 +10761,8 @@ def selftest() -> bool:
 
         try:
             def _cap(req, timeout=None):
-                _sent.append(json.loads(req.data))
+                if req.full_url.endswith("/completion"):   # not /tokenize
+                    _sent.append(json.loads(req.data))
                 return _Resp()
 
             urllib.request.urlopen = _cap
@@ -11452,6 +11500,13 @@ def selftest() -> bool:
         # assumed to be 4. Getting this wrong means the sweep tests a different
         # n_depth than the column claims, on any model whose tokenizer is not
         # English prose.
+        # a built prompt that misses its target by more than the tolerance
+        # is re-measured; within it, the estimate stands
+        assert resized_chars_per_token("x" * 1000, 250, 250) is None
+        assert resized_chars_per_token("x" * 1000, 251, 250) is None
+        assert resized_chars_per_token("x" * 1000, 260, 250) == 1000 / 260
+        assert resized_chars_per_token("x" * 1000, None, 250) is None
+        assert _token_count(1, "hello", 1) is None     # no server: estimate stands
         assert calibrate_chars_per_token("x" * 400, 100) == 4.0
         assert calibrate_chars_per_token("x" * 250, 100) == 2.5   # code-ish
         assert calibrate_chars_per_token("x" * 900, 100) == 9.0   # CJK-ish
