@@ -11500,7 +11500,11 @@ def selftest() -> bool:
         assert abs(sum(w for _, w, _ in PROMPT_BANKS) - 1.0) < 1e-9
 
         assert system_ram_mib(), "total RAM must be readable on this OS"
-        assert detect_physical_cores() <= detect_logical_cores()
+        # physical cores come from the whole machine (/proc/cpuinfo, Windows
+        # API); detect_logical_cores() is this process's affinity set, which
+        # taskset or a container can make smaller -- compare like with like
+        assert 0 < detect_physical_cores() <= (os.cpu_count() or 1)
+        assert detect_logical_cores() > 0
 
         # --- constants that were ours, now derived (docs/constants-audit.md) ---
         # C-B: chars-per-token is measured from llama.cpp's own prompt_n, not
