@@ -2562,14 +2562,18 @@ def moe_cache_headroom_mib(cfg, depths: list, kv_levels: list,
     on_cpu = [int(v) for v in (ncmoe_levels or [])
               if str(v).isdigit() and int(v) > 0]
     worst = min([n_layers] + on_cpu)
-    probe = {"ngl": str(n_layers), "ncmoe": str(worst),
-             "n_depth": str(max(int(d) for d in depths) if depths else 0),
-             "kv_type": str(kv_levels[0]) if kv_levels else "f16",
-             "nkvo": "0"}
-    used = predict_footprint_mib(cfg, probe, cfg.driver)
-    if used is None:
-        return None
-    return int(vram - cfg.fit_headroom_mib - used)
+    # every swept KV type, not the first one listed: `--factor kv_type=q8_0,f16`
+    # would otherwise size the cache for q8_0 and OOM it in the f16 rows
+    used = []
+    for kv in (kv_levels or ["f16"]):
+        probe = {"ngl": str(n_layers), "ncmoe": str(worst),
+                 "n_depth": str(max(int(d) for d in depths) if depths else 0),
+                 "kv_type": str(kv), "nkvo": "0"}
+        u = predict_footprint_mib(cfg, probe, cfg.driver)
+        if u is None:
+            return None
+        used.append(u)
+    return int(vram - cfg.fit_headroom_mib - max(used))
 
 
 # Orthogonal-array capacity: name -> number of columns (factors) it holds.
@@ -8007,6 +8011,13 @@ def selftest() -> bool:
                 assert _seen_fp[0] == {"ngl": "40", "ncmoe": "40",
                                        "n_depth": "65536", "kv_type": "f16",
                                        "nkvo": "0"}, _seen_fp
+                # every KV level is priced, and the largest footprint sets it
+                assert [f["kv_type"] for f in _seen_fp] == ["f16", "q8_0"]
+                globals()["predict_footprint_mib"] = lambda c, f, d: (
+                    _seen_fp.append(dict(f)),
+                    3000 if f["kv_type"] == "f16" else 2000)[1]
+                assert moe_cache_headroom_mib(_hc, ["0"], ["q8_0", "f16"],
+                                              40) == 12288 - 512 - 3000
                 # a swept -ncmoe prices the fewest-on-CPU level, not all
                 _seen_fp.clear()
                 moe_cache_headroom_mib(_hc, ["0"], ["f16"], 40,
@@ -13050,17 +13061,6 @@ def main():
         cfg.factors[name] = levels
         cfg.pinned_factors.add(name)
 
-    # moe_cache was sized against the default ncmoe/depth/kv levels; re-price
-    # it against the overridden ones, and drop it when nothing fits.
-    if "moe_cache" in cfg.factors and "moe_cache" not in _named:
-        _mc = _moe_cache_for(cfg, cfg.factors)
-        if len(_mc) > 1:
-            cfg.factors["moe_cache"] = _mc
-        else:
-            del cfg.factors["moe_cache"]
-            print("not swept : moe_cache — no VRAM left for an expert cache at "
-                  "the swept ncmoe levels")
-
     # Overrides can pin a gate to a value that makes its knobs inert -- most of
     # all `--factor mtp=0`, which turns speculation off while leaving four
     # speculative-tuning columns sweeping full level sets (issue #11).
@@ -13127,6 +13127,18 @@ def main():
         if dropped:
             print(f"KV quality floor --min-kv {args.min_kv}: dropping {dropped} "
                   f"(keeping {kept})")
+
+    # moe_cache was sized against the default ncmoe/depth/kv levels; re-price
+    # it against the final ones (after --factor, the fa filter and the
+    # --min-kv floor), and drop it when nothing fits.
+    if "moe_cache" in cfg.factors and "moe_cache" not in _named:
+        _mc = _moe_cache_for(cfg, cfg.factors)
+        if len(_mc) > 1:
+            cfg.factors["moe_cache"] = _mc
+        else:
+            del cfg.factors["moe_cache"]
+            print("not swept : moe_cache — no VRAM left for an expert cache at "
+                  "the swept ncmoe levels")
 
     # --fingerprint: print the box's identity and exit. Before --report-only,
     # because it is the cheaper question and answers without a CSV.
