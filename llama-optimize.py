@@ -12584,8 +12584,11 @@ def main():
                          "n_depth axis to fractions of it (0, ¼, ½, ¾, 0.9×) so the "
                          "sweep/Pareto span your full usable context range")
     ap.add_argument("--ctx-size", "-c", type=int, default=None,
-                    help="tune at a FIXED context size (like llama.cpp -c): "
-                         "shorthand for --min-context N --max-context N")
+                    help="tune at a FIXED context DEPTH: N tokens of history "
+                         "before each prompt, so every request is N + --n-prompt "
+                         "tokens and the emitted -c is larger than N (unlike "
+                         "llama.cpp -c). Shorthand for --min-context N "
+                         "--max-context N")
     ap.add_argument("--diff", nargs=2, type=Path, metavar=("OLD.csv", "NEW.csv"),
                     help="compare two results CSVs (e.g. before/after a llama.cpp "
                          "upgrade): per-config tg deltas over the factor columns "
