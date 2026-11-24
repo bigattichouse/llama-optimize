@@ -2451,10 +2451,7 @@ def build_factors(cfg: Config):
     if cfg.driver == "bench" and supports_flag(cfg.llama_bench, "--repack"):
         add_if_free(cfg, factors, "repack", ["0", "1"])
     if cfg.driver == "server" and "ncmoe" in factors:
-        _mc = moe_cache_levels(cfg.hw.get("vram"), nlv,
-                               headroom_mib=moe_cache_headroom_mib(
-                                   cfg, depths, kv_lv, n_layers),
-                               cap_mib=_file_mib(cfg.model) or None)
+        _mc = _moe_cache_for(cfg, factors, depths, kv_lv)
         if _mc and supports_flag(cfg.llama_server, "--moe-cache-mib"):
             add_if_free(cfg, factors, "moe_cache", _mc)
     # How the weights are loaded, where experts live in system RAM. We pin mmap
@@ -2506,6 +2503,22 @@ MOE_CACHE_MAX_VRAM_FRACTION = 0.25
 MOE_CACHE_STEP_MIB = 256
 
 
+def _moe_cache_for(cfg, factors: dict, depths=None, kv_lv=None) -> list[str]:
+    """moe_cache levels priced against `factors` as they stand. Called again
+    after --factor overrides: sized against the DEFAULT ncmoe/depth/kv levels,
+    a `--factor ncmoe=12,14,16` sweep got cache sizes only the defaults' deeper
+    offload had room for, and the OOM prune then skipped every row using them."""
+    nlv = max(2, int(getattr(cfg, "levels", 5)))
+    return moe_cache_levels(
+        cfg.hw.get("vram"), nlv,
+        headroom_mib=moe_cache_headroom_mib(
+            cfg, depths or factors.get("n_depth") or [],
+            kv_lv or factors.get("kv_type") or ["f16"],
+            cfg.hw.get("n_layers"), factors.get("ncmoe"),
+            factors.get("nkvo")),
+        cap_mib=_file_mib(cfg.model) or None)
+
+
 def moe_cache_levels(vram_mib, levels: int = 5, headroom_mib: int | None = None,
                      cap_mib: int | None = None) -> list[str]:
     """`--moe-cache-mib` levels: off, then halvings of a ceiling, in 256 MiB steps.
@@ -2529,7 +2542,9 @@ def moe_cache_levels(vram_mib, levels: int = 5, headroom_mib: int | None = None,
 
 
 def moe_cache_headroom_mib(cfg, depths: list, kv_levels: list,
-                           n_layers: int | None) -> int | None:
+                           n_layers: int | None,
+                           ncmoe_levels: list | None = None,
+                           nkvo_levels: list | None = None) -> int | None:
     """VRAM left for an expert cache at the design's worst all-experts-on-CPU
     cell, or None when the estimator cannot say (C4).
 
@@ -2537,18 +2552,33 @@ def moe_cache_headroom_mib(cfg, depths: list, kv_levels: list,
     KV on the GPU — but with every expert on the CPU, which is the only shape
     the cache serves. Sized there, the top level fits in every row it lands in;
     sized at a shallow cell it would be pruned from exactly the deep rows the
-    other factors need."""
+    other factors need.
+
+    When the design sweeps -ncmoe, the worst cell the cache acts in is the
+    FEWEST experts on the CPU (smallest nonzero level), not all of them: a
+    `--factor ncmoe=10,14,18` sweep never reaches all-on-CPU, and sizing there
+    made every cache level but 0 an OOM the predictor then skipped."""
     vram = cfg.hw.get("vram")
     if not getattr(cfg, "oom_prune", False) or not n_layers or not vram:
         return None
-    probe = {"ngl": str(n_layers), "ncmoe": str(n_layers),
-             "n_depth": str(max(int(d) for d in depths) if depths else 0),
-             "kv_type": str(kv_levels[0]) if kv_levels else "f16",
-             "nkvo": "0"}
-    used = predict_footprint_mib(cfg, probe, cfg.driver)
-    if used is None:
-        return None
-    return int(vram - cfg.fit_headroom_mib - used)
+    on_cpu = [int(v) for v in (ncmoe_levels or [])
+              if str(v).isdigit() and int(v) > 0]
+    worst = min([n_layers] + on_cpu)
+    # every swept KV type, not the first one listed: `--factor kv_type=q8_0,f16`
+    # would otherwise size the cache for q8_0 and OOM it in the f16 rows
+    # KV on the GPU unless every swept row pins it to the CPU (`nkvo=1`):
+    # pricing GPU-resident KV there would drop a cache those rows have room for
+    nkvo = "1" if nkvo_levels and all(str(v) == "1" for v in nkvo_levels) else "0"
+    used = []
+    for kv in (kv_levels or ["f16"]):
+        probe = {"ngl": str(n_layers), "ncmoe": str(worst),
+                 "n_depth": str(max(int(d) for d in depths) if depths else 0),
+                 "kv_type": str(kv), "nkvo": nkvo}
+        u = predict_footprint_mib(cfg, probe, cfg.driver)
+        if u is None:
+            return None
+        used.append(u)
+    return int(vram - cfg.fit_headroom_mib - max(used))
 
 
 # Orthogonal-array capacity: name -> number of columns (factors) it holds.
@@ -7986,6 +8016,26 @@ def selftest() -> bool:
                 assert _seen_fp[0] == {"ngl": "40", "ncmoe": "40",
                                        "n_depth": "65536", "kv_type": "f16",
                                        "nkvo": "0"}, _seen_fp
+                # every KV level is priced, and the largest footprint sets it
+                assert [f["kv_type"] for f in _seen_fp] == ["f16", "q8_0"]
+                globals()["predict_footprint_mib"] = lambda c, f, d: (
+                    _seen_fp.append(dict(f)),
+                    3000 if f["kv_type"] == "f16" else 2000)[1]
+                assert moe_cache_headroom_mib(_hc, ["0"], ["q8_0", "f16"],
+                                              40) == 12288 - 512 - 3000
+                # a swept -ncmoe prices the fewest-on-CPU level, not all
+                _seen_fp.clear()
+                moe_cache_headroom_mib(_hc, ["0"], ["f16"], 40,
+                                       ["0", "10", "14", "18"])
+                assert _seen_fp[0]["ncmoe"] == "10", _seen_fp
+                # KV pinned to the CPU in every row is priced that way...
+                _seen_fp.clear()
+                moe_cache_headroom_mib(_hc, ["0"], ["f16"], 40, None, ["1"])
+                assert _seen_fp[0]["nkvo"] == "1", _seen_fp
+                # ...but any GPU-KV row keeps the GPU-KV worst case
+                _seen_fp.clear()
+                moe_cache_headroom_mib(_hc, ["0"], ["f16"], 40, None, ["0", "1"])
+                assert _seen_fp[0]["nkvo"] == "0", _seen_fp
                 globals()["predict_footprint_mib"] = lambda c, f, d: None
                 assert moe_cache_headroom_mib(_hc, ["0"], ["f16"], 40) is None
                 _hc.oom_prune = False        # --no-oom-prune: do not trust it
@@ -13090,6 +13140,18 @@ def main():
         if dropped:
             print(f"KV quality floor --min-kv {args.min_kv}: dropping {dropped} "
                   f"(keeping {kept})")
+
+    # moe_cache was sized against the default ncmoe/depth/kv levels; re-price
+    # it against the final ones (after --factor, the fa filter and the
+    # --min-kv floor), and drop it when nothing fits.
+    if "moe_cache" in cfg.factors and "moe_cache" not in _named:
+        _mc = _moe_cache_for(cfg, cfg.factors)
+        if len(_mc) > 1:
+            cfg.factors["moe_cache"] = _mc
+        else:
+            del cfg.factors["moe_cache"]
+            print("not swept : moe_cache — no VRAM left for an expert cache at "
+                  "the swept ncmoe levels")
 
     # --fingerprint: print the box's identity and exit. Before --report-only,
     # because it is the cheaper question and answers without a CSV.
