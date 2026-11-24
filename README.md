@@ -735,7 +735,11 @@ python3 llama-optimize.py MODEL.gguf [options]
                      when no temp sensor is readable (default: 0)
   --ctx-scan         probe the ceiling FIRST, then set the n_depth axis to fractions
                      of it (0, ¼, ½, ¾, 0.9×) so the Pareto spans your full range
-  --ctx-size N, -c N tune at a FIXED context (like llama.cpp -c) = min==max==N
+  --ctx-size N, -c N tune at a FIXED context DEPTH = min==max==N: N tokens of
+                     history before each prompt, so requests are N + --n-prompt
+                     tokens. Not llama.cpp's -c: the emitted -c adds the prompt
+                     (as delivered with --driver server, as requested with
+                     bench), generation and a margin
   --diff OLD.csv NEW.csv  compare two sweeps of the same factor space (llama.cpp
                      upgrade, driver update, quant swap): per-config tg deltas,
                      status changes (OOM -> OK, ...), and whether the old winner
