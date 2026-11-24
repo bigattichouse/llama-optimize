@@ -5793,25 +5793,31 @@ class ServerSession:
                         "problem": None, "draft": {}, "err_rate": err_rate,
                         "reuse": self.last_reuse, "prompt_tok": 0}
             # Keep what the streams decoded before the floor stopped them, as
-            # the single-stream path does (SC2): concurrent streams' rates add
-            # up to the aggregate the floors are stated in.
-            tg = sum(max(0.0, (c.get("n", 0) - 1) / c["decode_s"])
-                     for c in ((r.get("client") or {}) for r in res)
-                     if c.get("decode_s"))
+            # the single-stream path does (SC2): every stream's tokens over the
+            # longest decode window, the aggregate the floors are stated in.
+            # Summing per-stream rates instead credits a stream that finished
+            # fast for the whole round (100 tok in 2 s + 11 in 100 s is 1.1
+            # t/s, not 49.6).
+            cl = [c for c in ((r.get("client") or {}) for r in res)
+                  if c.get("decode_s")]
+            win = max((c["decode_s"] for c in cl), default=0.0)
+            tg = (sum(max(0, c.get("n", 0) - 1) for c in cl) / win
+                  if win > 0 else 0.0)
             return {"pp": 0.0, "tg": tg, "too_slow": why, "problem": None,
                     "draft": {}, "err_rate": err_rate,
                     "reuse": self.last_reuse, "prompt_tok": 0}
 
-        warm_res, _, _ = _measure_round(self.port, prompts, n_gen, par,
-                                        _left(timeout, deadline), temp=_temp,
-                                        judge=_cjudge, prefill_judge=_cpjudge)
+        warm_res, warm_failed, _ = _measure_round(
+            self.port, prompts, n_gen, par, _left(timeout, deadline),
+            temp=_temp, judge=_cjudge, prefill_judge=_cpjudge)
         if _stopped(warm_res):
-            return _cut(_stopped(warm_res), warm_res)
+            return _cut(_stopped(warm_res), warm_res, warm_failed / par)
         if warm_res:                            # warmup discarded, ratio kept
             self.cpt = (getattr(self, "cpt", None) or calibrate_chars_per_token(
                 prompts[0], warm_res[0].get("timings", {}).get("prompt_n")))
         pps, tps, timings = [], [], []
         n_sent = 0
+        eos = None
         for _ in range(max(1, reps)):
             if _expired(deadline):
                 break
@@ -5828,6 +5834,15 @@ class ServerSession:
                 if why == _over and tps:   # budget ran out; earlier rounds stand
                     break
                 return _cut(why, res, n_err / n_sent)
+            # EOS is judged per round, before averaging: an EOS-only round
+            # is not a slow round, and averaging it in would halve a real one.
+            # One requested token decodes as predicted_n == 1, which is what
+            # an immediate EOS looks like too -- only ask when more were asked.
+            _eos = (ended_at_eos([r.get("timings", {}) for r in res])
+                    if n_gen > 1 else None)
+            if _eos:
+                eos = _eos
+                continue
             timings.extend(r.get("timings", {}) for r in res)
             tg_tok = sum(r.get("timings", {}).get("predicted_n", 0) for r in res)
             pp_tok = sum(r.get("timings", {}).get("prompt_n", 0) for r in res)
@@ -5840,14 +5855,11 @@ class ServerSession:
         # not zero — same as the single-stream path above, which also refuses
         # to call a round that decoded nothing a 0 t/s measurement.
         tg = sum(tps) / len(tps) if tps else 0.0
-        # one requested token decodes as predicted_n == 1, which is what an
-        # immediate EOS looks like too -- only ask when more were requested
         no_result = None
-        eos = ended_at_eos(timings) if n_gen > 1 else None
         if not tps:
-            no_result = _over
-        elif eos or (tg <= 0 and n_sent > n_err):
-            no_result = eos or "every round reported 0 t/s"
+            no_result = eos or _over
+        elif tg <= 0 and n_sent > n_err:
+            no_result = "every round reported 0 t/s"
         return {"pp": sum(pps) / len(pps) if pps else 0.0,
                 "tg": tg, "no_result": no_result,
                 "problem": None, "draft": _draft_totals(timings),
@@ -6224,6 +6236,15 @@ def read_journal(path: Path):
     return tried_load, ok_load, tried_run
 
 
+def no_result_status(why: str, budget, timeout) -> str:
+    """Status of a row that measured nothing. SLOW only when the budget that
+    ran out was the one --min-tgs tightened: an immediate EOS or a 0 t/s
+    report was not cut short by a floor, and a SLOW row is evidence for
+    slow-skip retiring the levels it used."""
+    expired = str(why).startswith("the budget expired")
+    return "SLOW" if expired and budget < timeout else "TIMEOUT"
+
+
 def ended_at_eos(timings: list) -> str | None:
     """Did the model stop immediately rather than generate? Returns a reason.
 
@@ -6239,10 +6260,11 @@ def ended_at_eos(timings: list) -> str | None:
     empty content, with `truncated=0` — so it is not context overflow. Deep
     prompts made only of filler give the model nothing to continue, and it says
     so. A `--task` block ends the prompt with an instruction instead."""
-    if not timings:
-        return None
-    decoded = [t.get("predicted_n", 0) or 0 for t in timings]
-    if any(n > 1 for n in decoded):
+    # only counts the server reported: a failed request's empty timings say
+    # nothing about what the model would have generated
+    decoded = [t["predicted_n"] for t in (timings or ())
+               if isinstance(t, dict) and isinstance(t.get("predicted_n"), int)]
+    if not decoded or any(n > 1 for n in decoded):
         return None
     return ("the model emitted EOS as its first token — the prompt gave it "
             "nothing to continue, which deep prompts of filler alone tend to "
@@ -6346,7 +6368,7 @@ def measure_in_session(cfg: Config, f: dict, session, timeout: int) -> dict:
     # Named the same way the bench driver names it: SLOW when the budget was
     # deliberately tightened by --min-tgs, TIMEOUT when it simply ran out.
     if status == "OK" and m.get("no_result"):
-        status = "SLOW" if budget < timeout else "TIMEOUT"
+        status = no_result_status(m["no_result"], budget, timeout)
         res.update(status=status, too_slow=m["no_result"])
         print(f"  !! no measurement: {m['no_result']} — recorded {status}, not OK")
     slow = m.get("too_slow") or (too_slow_reason(cfg, pp, tg)
@@ -11562,12 +11584,17 @@ def selftest() -> bool:
         _ss.port, _ss.calibrate = 0, lambda _t: None
         _seen = {}
 
-        def _fake(resps):
+        def _fake(resps, failed=0):
             def _round(*_a, **kw):
                 _seen.update(kw)
-                return resps, 0, 1.0
+                return resps, failed, 1.0
             return _round
+
+        def _fake_seq(*rounds):                  # warm-up, then one per rep
+            it = iter(rounds)
+            return lambda *_a, **kw: (next(it), 0, 1.0)
         _tok = lambda n: {"timings": {"predicted_n": n, "prompt_n": 100}}
+        _over_msg = "the budget expired before any round finished"
         try:
             globals()["_measure_round"] = _fake([{"aborted": "too slow",
                                                   "timings": {}}] * 2)
@@ -11595,6 +11622,29 @@ def selftest() -> bool:
                  "timings": {}}, _slow])
             _m = _ss.measure(100, 8, 2, 1, 60, deadline=time.time() + 60)
             assert _m.get("too_slow") == "too slow" and _m["tg"] == 5.0, _m
+            # streams' tokens over the longest window, not their rates summed
+            globals()["_measure_round"] = _fake([
+                dict(_slow, client={"n": 100, "decode_s": 2.0}),
+                dict(_slow, client={"n": 11, "decode_s": 100.0})])
+            _m = _ss.measure(100, 8, 2, 1, 60, deadline=time.time() + 60)
+            assert abs(_m["tg"] - 109 / 100) < 1e-9, _m
+            # a warm-up stream that failed while another aborted is counted
+            globals()["_measure_round"] = _fake([_slow, {"timings": {}}], 1)
+            _m = _ss.measure(100, 8, 2, 1, 60, deadline=time.time() + 60)
+            assert _m["err_rate"] == 0.5, _m
+            # an EOS-only round is dropped, not averaged into a real one...
+            globals()["_measure_round"] = _fake_seq(
+                [_tok(8)] * 2, [_tok(8)] * 2, [_tok(1)] * 2)
+            _m = _ss.measure(100, 8, 2, 2, 60, deadline=time.time() + 60)
+            assert _m["no_result"] is None and _m["tg"] == 16.0, _m
+            # ...and missing counts are not an EOS
+            assert ended_at_eos([{}, {"predicted_n": None}]) is None
+            assert ended_at_eos([{}, {"predicted_n": 1}])
+            # only a --min-tgs budget that ran out makes an empty row SLOW
+            assert no_result_status(_over_msg, 30, 60) == "SLOW"
+            assert no_result_status(_over_msg, 60, 60) == "TIMEOUT"
+            assert no_result_status(ended_at_eos([{"predicted_n": 1}]),
+                                    30, 60) == "TIMEOUT"
         finally:
             globals()["_measure_round"] = _real_round
 
