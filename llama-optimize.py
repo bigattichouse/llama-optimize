@@ -12586,9 +12586,10 @@ def main():
     ap.add_argument("--ctx-size", "-c", type=int, default=None,
                     help="tune at a FIXED context DEPTH: N tokens of history "
                          "before each prompt, so every request is N + --n-prompt "
-                         "tokens. The emitted -c is sized for the prompt actually "
-                         "delivered plus generation and a margin, so it differs "
-                         "from N (unlike llama.cpp -c). Shorthand for --min-context N "
+                         "tokens. The emitted -c is N plus the prompt (as delivered "
+                         "with --driver server, as requested with bench) plus "
+                         "generation and a margin, so it differs from N (unlike "
+                         "llama.cpp -c). Shorthand for --min-context N "
                          "--max-context N")
     ap.add_argument("--diff", nargs=2, type=Path, metavar=("OLD.csv", "NEW.csv"),
                     help="compare two results CSVs (e.g. before/after a llama.cpp "
