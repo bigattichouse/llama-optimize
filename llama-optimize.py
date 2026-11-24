@@ -2514,7 +2514,8 @@ def _moe_cache_for(cfg, factors: dict, depths=None, kv_lv=None) -> list[str]:
         headroom_mib=moe_cache_headroom_mib(
             cfg, depths or factors.get("n_depth") or [],
             kv_lv or factors.get("kv_type") or ["f16"],
-            cfg.hw.get("n_layers"), factors.get("ncmoe")),
+            cfg.hw.get("n_layers"), factors.get("ncmoe"),
+            factors.get("nkvo")),
         cap_mib=_file_mib(cfg.model) or None)
 
 
@@ -2542,7 +2543,8 @@ def moe_cache_levels(vram_mib, levels: int = 5, headroom_mib: int | None = None,
 
 def moe_cache_headroom_mib(cfg, depths: list, kv_levels: list,
                            n_layers: int | None,
-                           ncmoe_levels: list | None = None) -> int | None:
+                           ncmoe_levels: list | None = None,
+                           nkvo_levels: list | None = None) -> int | None:
     """VRAM left for an expert cache at the design's worst all-experts-on-CPU
     cell, or None when the estimator cannot say (C4).
 
@@ -2564,11 +2566,14 @@ def moe_cache_headroom_mib(cfg, depths: list, kv_levels: list,
     worst = min([n_layers] + on_cpu)
     # every swept KV type, not the first one listed: `--factor kv_type=q8_0,f16`
     # would otherwise size the cache for q8_0 and OOM it in the f16 rows
+    # KV on the GPU unless every swept row pins it to the CPU (`nkvo=1`):
+    # pricing GPU-resident KV there would drop a cache those rows have room for
+    nkvo = "1" if nkvo_levels and all(str(v) == "1" for v in nkvo_levels) else "0"
     used = []
     for kv in (kv_levels or ["f16"]):
         probe = {"ngl": str(n_layers), "ncmoe": str(worst),
                  "n_depth": str(max(int(d) for d in depths) if depths else 0),
-                 "kv_type": str(kv), "nkvo": "0"}
+                 "kv_type": str(kv), "nkvo": nkvo}
         u = predict_footprint_mib(cfg, probe, cfg.driver)
         if u is None:
             return None
@@ -8023,6 +8028,14 @@ def selftest() -> bool:
                 moe_cache_headroom_mib(_hc, ["0"], ["f16"], 40,
                                        ["0", "10", "14", "18"])
                 assert _seen_fp[0]["ncmoe"] == "10", _seen_fp
+                # KV pinned to the CPU in every row is priced that way...
+                _seen_fp.clear()
+                moe_cache_headroom_mib(_hc, ["0"], ["f16"], 40, None, ["1"])
+                assert _seen_fp[0]["nkvo"] == "1", _seen_fp
+                # ...but any GPU-KV row keeps the GPU-KV worst case
+                _seen_fp.clear()
+                moe_cache_headroom_mib(_hc, ["0"], ["f16"], 40, None, ["0", "1"])
+                assert _seen_fp[0]["nkvo"] == "0", _seen_fp
                 globals()["predict_footprint_mib"] = lambda c, f, d: None
                 assert moe_cache_headroom_mib(_hc, ["0"], ["f16"], 40) is None
                 _hc.oom_prune = False        # --no-oom-prune: do not trust it
